@@ -94,7 +94,7 @@ impl ConnectionForm {
 
 type Files = (Map<String, Value>, Map<String, Value>);
 
-fn read_map(path: &Path) -> Result<Map<String, Value>, String> {
+pub(crate) fn read_map(path: &Path) -> Result<Map<String, Value>, String> {
     match std::fs::read_to_string(path) {
         Ok(t) if t.trim().is_empty() => Ok(Map::new()),
         Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{}: invalid JSON, not touched: {e}", path.display())),
@@ -257,7 +257,7 @@ pub fn delete_global(dir: &Path, name: &str) -> Result<bool, String> {
     Ok(found)
 }
 
-fn write_atomic(path: &Path, map: &Map<String, Value>, private: bool) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, map: &Map<String, Value>, private: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(err)?;

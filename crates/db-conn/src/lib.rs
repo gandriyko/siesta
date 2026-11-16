@@ -15,7 +15,9 @@ use serde_json::{Map, Value};
 
 mod global;
 pub mod secrets;
+mod workspace;
 pub use global::{ConnectionForm,delete_global, global_names, read_global_form, save_global};
+pub use workspace::{WorkspacePassword, add_to_gitignore, password_override, private_file_of, set_workspace_password, workspace_def_file};
 
 /// `${keychain}` is `Some(None)` (the account is the connection name), `${keychain:ACCOUNT}` is
 /// `Some(Some(ACCOUNT))`; anything else is not a marker.

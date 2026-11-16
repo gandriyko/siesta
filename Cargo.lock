@@ -1385,6 +1385,7 @@ name = "db-conn"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "ignore",
  "keyring",
  "keyring-core",
  "serde_json",

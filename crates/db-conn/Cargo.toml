@@ -9,6 +9,7 @@ serde_json = "1"
 dotenvy = "0.15"
 keyring = "4.2.0"
 keyring-core = "1"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

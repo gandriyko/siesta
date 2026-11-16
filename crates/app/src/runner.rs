@@ -366,6 +366,13 @@ impl Siesta {
         keys.into_iter().filter_map(|k| self.slots.remove(&k)).map(|slot| close_slot(slot, finish)).collect()
     }
 
+    /// Close the sessions of connection `name` in every file (its credentials changed); an open
+    /// transaction goes with the session.
+    pub(crate) fn close_connection_sessions(&mut self, name: &str) -> Vec<tokio::task::JoinHandle<()>> {
+        let keys: Vec<_> = self.slots.keys().filter(|(_, n)| n == name).cloned().collect();
+        keys.into_iter().filter_map(|k| self.slots.remove(&k)).map(|slot| close_slot(slot, None)).collect()
+    }
+
     /// Paths with an open transaction in any session.
     pub(crate) fn paths_in_tx(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self.slots.iter().filter(|(_, s)| s.in_tx).map(|((p, _), _)| p.clone()).collect();

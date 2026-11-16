@@ -1817,6 +1817,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn team_connection_gets_a_personal_password(tcx: &mut TestAppContext) {
+        db_conn::secrets::use_memory_store();
+        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let team = std::fs::read_to_string(ws.path().join("siesta.json")).unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.config_dir = Some(cfg.path().to_path_buf());
+                this.open_conn_form(Some("dev".into()), window, cx);
+            })
+        });
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        cx.update(|window, cx| {
+            form.update(cx, |f, cx| {
+                f.password.update(cx, |s, cx| s.set_value("mine", window, cx));
+                f.save_password(window, cx);
+            })
+        });
+        let account = format!("{}/dev", ws.path().file_name().unwrap().to_string_lossy());
+        let private: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ws.path().join("siesta.private.json")).unwrap()).unwrap();
+        assert_eq!(private, serde_json::json!({"dev": {"password": format!("${{keychain:{account}}}")}}));
+        assert_eq!(db_conn::secrets::get(&account).as_deref(), Ok("mine"));
+        assert_eq!(std::fs::read_to_string(ws.path().join("siesta.json")).unwrap(), team);
+        // Connections were reloaded: the connection now resolves its password from the keychain.
+        let kc = cx.update(|_, cx| app.read(cx).docs[0].conns.connections["dev"].keychain.clone());
+        assert_eq!(kc.as_deref(), Some(account.as_str()));
+    }
+
+    #[gpui::test]
     fn connections_page_lists_edits_and_deletes_without_touching_picks(tcx: &mut TestAppContext) {
         use crate::connections_page::{ConnectionsPage, PasswordKind, build_groups, raw_password_kind};
         db_conn::secrets::use_memory_store();

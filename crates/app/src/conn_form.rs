@@ -71,6 +71,23 @@ pub(crate) struct ConnForm {
     test: Test,
     /// A connection of a team file: where it is defined (highest priority last), and what it resolves to.
     locked: Option<(Vec<PathBuf>, String)>,
+    /// For a locked connection: what the personal "My password" field needs (`None`: no `siesta.json` found).
+    pub(crate) team: Option<Team>,
+}
+
+/// A team connection's personal password: where the private file goes and what could make it moot.
+pub(crate) struct Team {
+    pub name: String,
+    /// The `siesta.json` that defines it; `siesta.private.json` lives next to it.
+    pub def_file: PathBuf,
+    /// `def_file` relative to the workspace root, for the hint.
+    pub rel: String,
+    /// The account of the effective `${keychain}` marker, reused on save.
+    pub account: Option<String>,
+    /// A later file that sets this connection's password (the saved one would not take effect).
+    pub overridden_by: Option<PathBuf>,
+    /// What Test connects with (the password field replaces its password).
+    pub conn: Option<db_conn::Connection>,
 }
 
 impl ConnForm {
@@ -109,6 +126,7 @@ impl ConnForm {
             error: None,
             test: Test::Idle,
             locked,
+            team: None,
         }
     }
 
@@ -161,7 +179,17 @@ impl ConnForm {
 
     /// A throwaway session with the form's values; the result is shown in the form, nothing is saved.
     pub fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let conn = match self.collect(cx).to_connection(&self.dir) {
+        let conn = match self.team.as_ref().map(|t| t.conn.clone().ok_or("this connection has errors, see the list".to_string())) {
+            Some(c) => c.map(|mut c| {
+                let pw = self.password.read(cx).value().to_string();
+                if !pw.is_empty() {
+                    (c.password, c.keychain) = (Some(pw), None);
+                }
+                c
+            }),
+            None => self.collect(cx).to_connection(&self.dir),
+        };
+        let conn = match conn {
             Ok(c) => c,
             Err(e) => {
                 self.test = Test::Failed(e);
@@ -243,8 +271,63 @@ impl ConnForm {
             .child(v_flex().gap_1().children(files))
             .child(div().text_xs().text_color(muted).child("As Siesta reads it (passwords hidden):"))
             .child(div().p_2().rounded_md().border_1().border_color(cx.theme().border).font_family(cx.theme().mono_font_family.clone()).text_xs().child(resolved.to_string()))
+            .children(self.team.as_ref().map(|t| self.password_section(t, cx)))
             .child(h_flex().justify_end().child(Button::new("conn-close").label("Close").on_click(|_, window, cx| window.close_dialog(cx))))
             .into_any_element()
+    }
+
+    fn status(&self, cx: &App) -> Option<Div> {
+        let (muted, danger, success) = (cx.theme().muted_foreground, cx.theme().danger, cx.theme().success);
+        match &self.test {
+            Test::Idle => None,
+            Test::Running => Some(div().text_sm().text_color(muted).child("Connecting…")),
+            Test::Ok(t) => Some(div().text_sm().text_color(success).child(t.clone())),
+            Test::Failed(e) => Some(div().text_sm().text_color(danger).child(e.clone())),
+        }
+    }
+
+    /// "My password": a personal password for a team connection, kept in the keychain with a reference in `siesta.private.json`.
+    fn password_section(&self, t: &Team, cx: &mut Context<Self>) -> Div {
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+        let hint = format!("Stored in your system keychain; siesta.private.json next to {} gets a `${{keychain:…}}` reference. The team's siesta.json is not changed.", t.rel);
+        v_flex()
+            .gap_1()
+            .child(Self::field("My password", muted, Input::new(&self.password).mask_toggle()))
+            .child(div().text_xs().text_color(muted).child(hint))
+            .children(t.overridden_by.as_ref().map(|p| div().text_xs().text_color(danger).child(format!("The password saved here will not take effect: {} sets it later in the chain.", p.display()))))
+            .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))
+            .children(self.status(cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(div().flex_1())
+                    .child(Button::new("conn-test").label("Test").on_click(cx.listener(|this, _, window, cx| this.test(window, cx))))
+                    .child(Button::new("conn-save-pw").label("Save password").primary().on_click(cx.listener(|this, _, window, cx| this.save_password(window, cx)))),
+            )
+    }
+
+    /// Stores the personal password; the dialog closes and the app reloads connections and drops their sessions.
+    pub fn save_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = &self.team else { return };
+        let password = self.password.read(cx).value().to_string();
+        if password.is_empty() {
+            return window.close_dialog(cx); // empty = keep
+        }
+        match db_conn::set_workspace_password(&t.def_file, &t.name, &password, t.account.as_deref()) {
+            Err(e) => {
+                self.error = Some(e);
+                cx.notify();
+            }
+            Ok(out) => {
+                let name = t.name.clone();
+                window.close_dialog(cx);
+                if let Some(w) = out.warning {
+                    window.push_notification(w, cx);
+                }
+                self.app.update(cx, |app, cx| app.workspace_password_saved(name, out.gitignore, window, cx)).ok();
+            }
+        }
     }
 }
 
@@ -253,8 +336,8 @@ impl Render for ConnForm {
         if let Some((paths, resolved)) = self.locked.clone() {
             return self.locked_view(&paths, &resolved, cx);
         }
-        let (muted, danger, success) = (cx.theme().muted_foreground, cx.theme().danger, cx.theme().success);
-        let field = |label: &str, input: &Entity<InputState>| Self::field(label, muted, Input::new(input));
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+        let field =|label: &str, input: &Entity<InputState>| Self::field(label, muted, Input::new(input));
 
         let driver_ix = DRIVERS.iter().position(|(_, d)| Some(*d) == self.driver).unwrap_or(0);
         let driver = DRIVERS.iter().fold(
@@ -284,12 +367,7 @@ impl Render for ConnForm {
                 cx.notify();
             }))
         };
-        let status = match &self.test {
-            Test::Idle => None,
-            Test::Running => Some(div().text_sm().text_color(muted).child("Connecting…")),
-            Test::Ok(t) => Some(div().text_sm().text_color(success).child(t.clone())),
-            Test::Failed(e) => Some(div().text_sm().text_color(danger).child(e.clone())),
-        };
+        let status = self.status(cx);
         let editing = self.original.is_some();
         v_flex()
             .gap_2()
@@ -339,7 +417,7 @@ impl Siesta {
         };
         let conns = self.conns_for_page().0;
         let mut data = ConnectionForm { driver: Some(Driver::Postgres), ..Default::default() };
-        let (mut original, mut locked) = (None, None);
+        let (mut original, mut locked, mut team_pw) = (None, None, None);
         if let Some(name) = &edit {
             let globals = [dir.join("connections.json"), dir.join("connections.private.json")];
             let team: Vec<PathBuf> = conns.sources.get(name).into_iter().flatten().filter(|p| !globals.contains(p)).cloned().collect();
@@ -349,6 +427,17 @@ impl Siesta {
                     (None, Some(e)) => format!("error: {e}"),
                     _ => String::new(),
                 };
+                if let Some(def_file) = db_conn::workspace_def_file(&team).map(PathBuf::from) {
+                    let root = self.root_of(&def_file);
+                    team_pw = Some(Team {
+                        name: name.clone(),
+                        rel: def_file.strip_prefix(&root).unwrap_or(&def_file).display().to_string(),
+                        overridden_by: db_conn::password_override(conns.sources.get(name).map_or(&[], Vec::as_slice), &def_file, name),
+                        account: conns.connections.get(name).and_then(|c| c.keychain.clone()),
+                        conn: conns.connections.get(name).cloned(),
+                        def_file,
+                    });
+                }
                 locked = Some((team, resolved));
             } else if let Some(f) = db_conn::read_global_form(&dir, name) {
                 if duplicate {
@@ -368,6 +457,7 @@ impl Siesta {
         };
         let app = cx.entity().downgrade();
         let form = cx.new(|cx| ConnForm::new(app, dir, target, original, data, locked, window, cx));
+        form.update(cx, |f, _| f.team = team_pw);
         self.conn_form = Some(form.clone());
         let name_input = form.read(cx).name.clone();
         window.open_dialog(cx, move |dialog, _, _| dialog.w(px(560.)).title(title.clone()).child(form.clone()));
@@ -382,6 +472,26 @@ impl Siesta {
             self.pick_for(&target, Some(name), window, cx);
         }
         self.conn_form = None;
+    }
+
+    /// A personal password was saved for the team connection `name`: reload, drop its live sessions
+    /// (the next run reconnects with the new password), and offer to git-ignore `siesta.private.json`.
+    pub(crate) fn workspace_password_saved(&mut self, name: String, gitignore: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_connections(window, cx);
+        self.conns_seen = Some(self.conns_stamp());
+        self.conn_form = None;
+        self.close_connection_sessions(&name);
+        cx.notify();
+        let Some(gitignore) = gitignore else { return };
+        let answer = window.prompt(PromptLevel::Info, "siesta.private.json is not in .gitignore. Add it?", Some(&format!("It is appended to {}.", gitignore.display())), &["Add", "Not now"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0)
+                && let Err(e) = db_conn::add_to_gitignore(&gitignore)
+            {
+                this.update_in(cx, |_, window, cx| window.push_notification(e, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     /// Deletes a global connection (and its keychain entry) from the Connections page.
