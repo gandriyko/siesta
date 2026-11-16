@@ -246,7 +246,6 @@ impl Siesta {
                         this.toggle(&q);
                         cx.notify();
                     }));
-                let conn = siesta_workspace::is_conn_file(path);
                 let meta = match (dirty, sql) {
                     (true, _) => "●".to_string(),
                     (false, false) => String::new(),
@@ -254,7 +253,7 @@ impl Siesta {
                 };
                 base.when(current, |r| r.bg(active))
                     .map(|r| if sql { r.child(toggle) } else { r.child(spacer()) })
-                    .child(icon(if conn { IconName::Globe } else { IconName::FileText }, if current { t.foreground } else { muted }))
+                    .child(icon(IconName::FileText, if current { t.foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
                     .children(path.parent().map(|d| self.add_button(ix, d.to_path_buf(), cx)))
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))

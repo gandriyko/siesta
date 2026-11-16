@@ -1,4 +1,4 @@
-//! GUI-free workspace pieces: the file index (`.sql` and `siesta*.json`) and the UI state that
+//! GUI-free workspace pieces: the file index (`.sql` files) and the UI state that
 //! survives a restart (`~/.siesta/state.json`: open files, cursors, connection picked per file).
 //!
 //! Change watching is not here: the app polls mtimes (as Respite does), which needs no extra crate.
@@ -13,20 +13,11 @@ pub fn base_dir() -> Option<PathBuf> {
     Some(std::env::home_dir()?.join(".siesta"))
 }
 
-/// `siesta.json`, `siesta.private.json`, `siesta-dev.json` …
-pub fn is_conn_file(p: &Path) -> bool {
-    p.file_name().is_some_and(|n| {
-        let n = n.to_string_lossy();
-        n.starts_with("siesta") && n.ends_with(".json")
-    })
-}
-
 pub fn is_sql(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql"))
 }
 
-/// `.sql` and connection files under `root` (every file with `all`), respecting `.gitignore`.
-/// Private connection files are usually git-ignored, so they are added back.
+/// `.sql` files under `root` (every file with `all`), respecting `.gitignore`.
 pub fn scan(root: &Path, all: bool) -> Vec<PathBuf> {
     // ponytail: depth cap guards against a root like $HOME; raise if real projects nest deeper.
     let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
@@ -34,18 +25,8 @@ pub fn scan(root: &Path, all: bool) -> Vec<PathBuf> {
         .build()
         .flatten()
         .map(|e| e.into_path())
-        .filter(|p| p.is_file() && (all || is_sql(p) || is_conn_file(p)))
+        .filter(|p| p.is_file() && (all || is_sql(p)))
         .collect();
-    let dirs: std::collections::BTreeSet<PathBuf> =
-        files.iter().filter_map(|f| f.parent().map(Path::to_path_buf)).chain([root.to_path_buf()]).collect();
-    for d in dirs {
-        for p in std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()) {
-            let private = p.file_name().is_some_and(|n| n.to_string_lossy().contains(".private."));
-            if private && is_conn_file(&p) && p.is_file() && !files.contains(&p) {
-                files.push(p);
-            }
-        }
-    }
     files.sort();
     files
 }
@@ -108,19 +89,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_filters_and_private_files() {
+    fn scan_filters() {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         for d in ["api/v2", "ignored", ".hidden"] {
             std::fs::create_dir_all(r.join(d)).unwrap();
         }
-        for f in ["a.sql", "api/v2/b.SQL", "api/notes.txt", "ignored/c.sql", ".hidden/e.sql", "package.json", "siesta.json", "siesta.private.json"] {
+        for f in ["a.sql", "api/v2/b.SQL", "api/notes.txt", "ignored/c.sql", ".hidden/e.sql", "package.json"] {
             std::fs::write(r.join(f), "").unwrap();
         }
-        std::fs::write(r.join(".gitignore"), "ignored/\n*.private.*\n").unwrap();
+        std::fs::write(r.join(".gitignore"), "ignored/\n").unwrap();
         std::fs::create_dir(r.join(".git")).unwrap(); // .gitignore applies inside a git repo
         let rel = |all| -> Vec<String> { scan(r, all).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect() };
-        assert_eq!(rel(false), ["a.sql", "api/v2/b.SQL", "siesta.json", "siesta.private.json"]);
+        assert_eq!(rel(false), ["a.sql", "api/v2/b.SQL"]);
         assert!(rel(true).contains(&"api/notes.txt".to_string()) && rel(true).contains(&"package.json".to_string()));
     }
 

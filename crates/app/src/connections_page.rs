@@ -1,14 +1,8 @@
-//! The Connections page (a window, like Settings): every connection of the current file's chain
-//! and every global one, grouped by the file that defines it, with Edit / Test / Duplicate / Delete.
-//! Edit, Duplicate and Delete run in the main window (the form is a dialog there) and never
-//! change a file's pick.
+//! The Connections page (a window, like Settings): a flat list of every connection, with
+//! Edit / Test / Duplicate / Delete. Edit, Duplicate and Delete run in the main window (the form is
+//! a dialog there) and never change a file's pick.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use db_conn::{Connection, Connections, Driver};
 use db_exec::Session;
@@ -23,27 +17,6 @@ use gpui_component::{
 
 use crate::{CloseTab, Siesta, format::parse_color, runner::RT};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PasswordKind {
-    None,
-    Keychain,
-    Env,
-    File,
-    Url,
-}
-
-impl PasswordKind {
-    fn label(self) -> Option<&'static str> {
-        match self {
-            PasswordKind::None => None,
-            PasswordKind::Keychain => Some("keychain"),
-            PasswordKind::Env => Some("env"),
-            PasswordKind::File => Some("file"),
-            PasswordKind::Url => Some("in URL"),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct ConnRow {
     pub name: String,
@@ -53,20 +26,12 @@ pub(crate) struct ConnRow {
     pub color: Option<String>,
     pub prod: bool,
     pub read_only: bool,
-    pub password: PasswordKind,
+    /// A password is in the keychain (or in the URL).
+    pub password: bool,
     /// The current file's connection.
     pub used: bool,
     /// The connection could not be built.
     pub error: Option<String>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ConnGroup {
-    pub title: String,
-    /// The file to open for this group (the public global file for the global group).
-    pub file: PathBuf,
-    pub global: bool,
-    pub rows: Vec<ConnRow>,
 }
 
 fn target_of(c: &Connection) -> String {
@@ -86,36 +51,15 @@ fn target_of(c: &Connection) -> String {
     }
 }
 
-/// How `name` keeps its password in `file` (read from the raw file: the loaded connection no longer knows).
-pub(crate) fn raw_password_kind(file: &Path, name: &str) -> PasswordKind {
-    let raw = std::fs::read_to_string(file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-    let field = |k: &str| raw.as_ref().and_then(|v| v.get(name)?.get(k)?.as_str());
-    password_kind(field("password"), field("url"))
-}
-
-/// An explicit `password` wins over one inside the `url` (as when connecting).
-fn password_kind(password: Option<&str>, url: Option<&str>) -> PasswordKind {
-    let kind = |p: &str, plain| match p.trim() {
-        "" => PasswordKind::None,
-        p if p.starts_with("${keychain") => PasswordKind::Keychain,
-        p if p.contains("${") => PasswordKind::Env,
-        _ => plain,
-    };
-    match kind(password.unwrap_or_default(), PasswordKind::File) {
-        PasswordKind::None => url.and_then(|u| db_conn::url_passwords(u).into_iter().map(|r| kind(&u[r], PasswordKind::Url)).find(|k| *k != PasswordKind::None)).unwrap_or(PasswordKind::None),
-        k => k,
-    }
-}
-
-/// The page's rows: the global group first, then one group per workspace file (path relative to `root`);
-/// a connection is listed in every file that defines it. `filter` is matched against name, driver and target.
-pub(crate) fn build_groups(c: &Connections, global_files: &[PathBuf], root: &Path, current: Option<&str>, filter: &str, kind: &dyn Fn(&Path, &str) -> PasswordKind) -> Vec<ConnGroup> {
+/// The page's rows, sorted by name. `filter` is matched against name, driver and target;
+/// `has_password` says whether the keychain holds a password for a name.
+pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str, has_password: &dyn Fn(&str) -> bool) -> Vec<ConnRow> {
     let filter = filter.trim().to_lowercase();
-    let mut groups: BTreeMap<(bool, String), ConnGroup> = BTreeMap::new();
-    for (name, files) in &c.sources {
-        let row = |files_here: &[&PathBuf]| {
+    let names: std::collections::BTreeSet<&String> = c.connections.keys().chain(c.errors.keys()).collect();
+    names
+        .into_iter()
+        .map(|name| {
             let conn = c.connections.get(name);
-            let password = files_here.iter().map(|f| kind(f, name)).rfind(|k| *k != PasswordKind::None).unwrap_or(PasswordKind::None);
             ConnRow {
                 name: name.clone(),
                 driver: conn.map(|c| c.driver),
@@ -123,47 +67,26 @@ pub(crate) fn build_groups(c: &Connections, global_files: &[PathBuf], root: &Pat
                 color: conn.and_then(|c| c.display_color().map(str::to_string)),
                 prod: conn.is_some_and(|c| c.prod),
                 read_only: conn.is_some_and(|c| c.read_only),
-                password,
+                password: conn.is_some_and(|c| c.has_password()) || has_password(name),
                 used: current == Some(name.as_str()),
                 error: c.errors.get(name).cloned(),
             }
-        };
-        let matches = |r: &ConnRow| {
+        })
+        .filter(|r| {
             let driver = match r.driver {
                 Some(Driver::Postgres) => "postgres",
                 Some(Driver::MySql) => "mysql mariadb",
                 None => "",
             };
             filter.is_empty() || [r.name.as_str(), driver, r.target.as_str()].iter().any(|s| s.to_lowercase().contains(&filter))
-        };
-        let global: Vec<&PathBuf> = files.iter().filter(|f| global_files.contains(f)).collect();
-        if !global.is_empty() {
-            let r = row(&global);
-            if matches(&r) {
-                let title = format!("Global ({})", global_files[0].display());
-                groups.entry((false, String::new())).or_insert_with(|| ConnGroup { title, file: global_files[0].clone(), global: true, rows: vec![] }).rows.push(r);
-            }
-        }
-        for f in files.iter().filter(|f| !global_files.contains(f)) {
-            let r = row(&[f]);
-            if matches(&r) {
-                let rel = f.strip_prefix(root).unwrap_or(f).display().to_string();
-                groups.entry((true, rel.clone())).or_insert_with(|| ConnGroup { title: rel, file: f.clone(), global: false, rows: vec![] }).rows.push(r);
-            }
-        }
-    }
-    groups.into_values().collect()
+        })
+        .collect()
 }
 
 impl Siesta {
-    /// What the page shows: the current file's connections (they include the global ones), else the
-    /// workspace's and the global ones alone. Also the current file's connection and the workspace root.
-    pub(crate) fn conns_for_page(&self) -> (Arc<Connections>, Option<String>, PathBuf) {
-        if let Some(d) = self.doc().filter(|d| d.sql) {
-            return (d.conns.clone(), d.connection().map(str::to_string), self.root_of(&d.path));
-        }
-        let probe = self.root.join("untitled.sql");
-        (Arc::new(self.load_connections(&probe)), None, self.root.clone())
+    /// What the page shows: the connections, and the current file's connection.
+    pub(crate) fn conns_for_page(&self) -> (Arc<Connections>, Option<String>) {
+        (self.conns.clone(), self.doc().filter(|d| d.sql).and_then(|d| d.connection().map(str::to_string)))
     }
 
     /// Bring the Connections window forward, opening it if it is not open.
@@ -208,6 +131,8 @@ pub(crate) struct ConnectionsPage {
     focus: FocusHandle,
     filter: Entity<InputState>,
     tests: HashMap<String, Test>,
+    /// Which names have a keychain password, read once per loaded `Connections` (a read can be slow).
+    passwords: (usize, HashMap<String, bool>),
     _subs: Vec<Subscription>,
 }
 
@@ -225,7 +150,7 @@ impl ConnectionsPage {
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Self { app, main, focus, filter, tests: HashMap::new(), _subs }
+        Self { app, main, focus, filter, tests: HashMap::new(), passwords: (0, HashMap::new()), _subs }
     }
 
     /// Runs `f` on `Siesta` in the main window, which comes forward (the form is a dialog there).
@@ -245,7 +170,6 @@ impl ConnectionsPage {
         self.tests.insert(name.clone(), Test::Running);
         let handle = RT.spawn(async move {
             let t = Instant::now();
-            let conn = conn.resolve_password()?;
             let s = Session::open(&conn).await.map_err(|e| e.to_string())?;
             s.close().await;
             Ok::<_, String>(t.elapsed())
@@ -271,7 +195,7 @@ impl ConnectionsPage {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete connection '{name}'?"),
-            Some("It is removed from connections.json and connections.private.json; its password is deleted from the system keychain."),
+            Some("The connection file is removed and its password is deleted from the system keychain."),
             &["Delete", "Cancel"],
             cx,
         );
@@ -279,12 +203,12 @@ impl ConnectionsPage {
             if answer.await != Ok(0) {
                 return;
             }
-            this.update(cx, |this, cx| this.with_app(cx, move |app, window, cx| app.delete_global_connection(&name, window, cx))).ok();
+            this.update(cx, |this, cx| this.with_app(cx, move |app, window, cx| app.delete_connection(&name, window, cx))).ok();
         })
         .detach();
     }
 
-    fn render_row(&self, ix: usize, r: &ConnRow, global: bool, file: &Path, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, ix: usize, r: &ConnRow, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let (muted, fs) = (t.muted_foreground, t.font_size);
         let dot = r.color.as_deref().and_then(parse_color).unwrap_or(muted.opacity(0.6));
@@ -297,7 +221,6 @@ impl ConnectionsPage {
         let name = r.name.clone();
         let button = |id: &'static str, label: &'static str| Button::new((id, ix)).label(label).small();
         let (n_edit, n_test, n_dup, n_del) = (name.clone(), name.clone(), name.clone(), name.clone());
-        let file = file.to_path_buf();
         let status = match self.tests.get(&r.name) {
             None => None,
             Some(Test::Running) => Some(div().text_xs().text_color(muted).child("Connecting…")),
@@ -328,20 +251,12 @@ impl ConnectionsPage {
                     })))
                     .when(r.error.is_none(), |el| {
                         el.child(button("conn-test", "Test").on_click(cx.listener(move |this, _, window, cx| this.test(n_test.clone(), window, cx))))
+                            .child(button("conn-dup", "Duplicate").on_click(cx.listener(move |this, _, _, cx| {
+                                let n = n_dup.clone();
+                                this.with_app(cx, move |app, window, cx| app.open_conn_form_for(Some(n), true, false, window, cx));
+                            })))
                     })
-                    .when(global, |el| {
-                        el.child(button("conn-dup", "Duplicate").on_click(cx.listener(move |this, _, _, cx| {
-                            let n = n_dup.clone();
-                            this.with_app(cx, move |app, window, cx| app.open_conn_form_for(Some(n), true, false, window, cx));
-                        })))
-                        .child(button("conn-del", "Delete").danger().on_click(cx.listener(move |this, _, window, cx| this.delete(n_del.clone(), window, cx))))
-                    })
-                    .when(!global, |el| {
-                        el.child(button("conn-open", "Open file").on_click(cx.listener(move |this, _, _, cx| {
-                            let p = file.clone();
-                            this.with_app(cx, move |app, window, cx| _ = app.open(p, None, window, cx));
-                        })))
-                    }),
+                    .child(button("conn-del", "Delete").danger().on_click(cx.listener(move |this, _, window, cx| this.delete(n_del.clone(), window, cx)))),
             )
             .child(
                 h_flex()
@@ -349,10 +264,7 @@ impl ConnectionsPage {
                     .text_xs()
                     .text_color(muted)
                     .child(div().min_w_0().truncate().child(r.target.clone()))
-                    .child(div().child(match r.password.label() {
-                        Some(k) => format!("password: {k}"),
-                        None => "no password".to_string(),
-                    })),
+                    .child(div().child(if r.password { "password set" } else { "no password" })),
             )
             .children(r.error.clone().map(|e| div().text_xs().text_color(t.danger).child(e)))
             .children(status)
@@ -363,35 +275,22 @@ impl ConnectionsPage {
 impl Render for ConnectionsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(app) = self.app.upgrade() else { return div().into_any_element() };
-        let (conns, current, root) = app.read(cx).conns_for_page();
-        let dir = app.read(cx).config_dir.clone();
-        let global_files: Vec<PathBuf> = dir.iter().flat_map(|d| [d.join("connections.json"), d.join("connections.private.json")]).collect();
+        let (conns, current) = app.read(cx).conns_for_page();
         let query = self.filter.read(cx).value().to_string();
-        let groups = build_groups(&conns, &global_files, &root, current.as_deref(), &query, &raw_password_kind);
-        let (muted, warning, danger) = (cx.theme().muted_foreground, cx.theme().warning, cx.theme().danger);
-
-        let notes = conns
-            .warnings
-            .iter()
-            .map(|w| div().text_xs().text_color(warning).child(w.clone()))
-            .chain(conns.errors.iter().map(|(n, e)| div().text_xs().text_color(danger).child(format!("'{n}': {e}"))));
-        let mut ix = 0;
-        let mut body = v_flex();
-        for g in &groups {
-            body = body.child(
-                h_flex()
-                    .px_3()
-                    .pt_4()
-                    .pb_1()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(muted).child(g.title.clone())),
-            );
-            for r in &g.rows {
-                body = body.child(self.render_row(ix, r, g.global, &g.file, cx));
-                ix += 1;
-            }
+        let id = Arc::as_ptr(&conns) as usize;
+        if self.passwords.0 != id {
+            self.passwords = (id, conns.connections.keys().map(|n| (n.clone(), db_conn::secrets::get(n).is_ok())).collect());
         }
-        if groups.is_empty() {
+        let stored = &self.passwords.1;
+        let rows = build_rows(&conns, current.as_deref(), &query, &|n| stored.get(n).copied().unwrap_or(false));
+        let (muted, warning) = (cx.theme().muted_foreground, cx.theme().warning);
+
+        let notes = conns.warnings.iter().map(|w| div().text_xs().text_color(warning).child(w.clone()));
+        let mut body = v_flex();
+        for (ix, r) in rows.iter().enumerate() {
+            body = body.child(self.render_row(ix, r, cx));
+        }
+        if rows.is_empty() {
             body = body.child(div().px_3().pt_4().text_sm().text_color(muted).child(if query.trim().is_empty() { "No connections yet" } else { "Nothing matches" }));
         }
         v_flex()
@@ -421,9 +320,8 @@ impl Render for ConnectionsPage {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{PasswordKind, build_groups, password_kind};
+    use super::build_rows;
     use db_conn::{Connection, Connections, Driver};
-    use std::path::{Path, PathBuf};
 
     fn conn(name: &str, prod: bool, ro: bool) -> Connection {
         Connection {
@@ -435,7 +333,6 @@ mod tests {
             database: Some("d".into()),
             user: None,
             password: None,
-            keychain: None,
             ssl: Default::default(),
             read_only: ro,
             prod,
@@ -446,42 +343,20 @@ mod tests {
     }
 
     #[test]
-    fn rows_group_by_file_and_carry_badges() {
-        let global = vec![PathBuf::from("/cfg/connections.json"), PathBuf::from("/cfg/connections.private.json")];
-        let ws = PathBuf::from("/ws/siesta.json");
+    fn rows_are_flat_and_carry_badges() {
         let mut c = Connections::default();
-        for (n, prod, ro, files) in [("a", false, false, vec![global[0].clone()]), ("b", true, true, vec![ws.clone()]), ("c", false, false, vec![global[0].clone(), ws.clone()])] {
+        for (n, prod, ro) in [("b", true, true), ("a", false, false)] {
             c.connections.insert(n.into(), conn(n, prod, ro));
-            c.sources.insert(n.into(), files);
         }
+        c.connections.get_mut("a").unwrap().url = Some("postgres://u:secret@h/d".into());
         c.errors.insert("broken".into(), "no driver".into());
-        c.sources.insert("broken".into(), vec![ws.clone()]);
-        let kind = |_: &Path, n: &str| if n == "a" { PasswordKind::Keychain } else { PasswordKind::None };
-        let g = build_groups(&c, &global, Path::new("/ws"), Some("b"), "", &kind);
-        assert_eq!(g.len(), 2);
-        assert!(g[0].global && g[0].title.starts_with("Global (/cfg/connections.json"));
-        assert_eq!(g[0].rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["a", "c"]);
-        assert_eq!((g[0].rows[0].password, g[0].rows[0].target.as_str()), (PasswordKind::Keychain, "h:5432/d"));
-        assert_eq!(g[1].title, "siesta.json");
-        let names: Vec<_> = g[1].rows.iter().map(|r| (r.name.as_str(), r.prod, r.read_only, r.used, r.error.is_some())).collect();
-        assert_eq!(names, [("b", true, true, true, false), ("broken", false, false, false, true), ("c", false, false, false, false)]);
-        // The filter matches names.
-        let g = build_groups(&c, &global, Path::new("/ws"), None, "BRO", &kind);
-        assert_eq!((g.len(), g[0].rows[0].name.as_str()), (1, "broken"));
-    }
-
-    #[test]
-    fn password_kind_looks_at_the_url() {
-        use PasswordKind::{Env, File, Keychain, Url};
-        let k = password_kind;
-        assert_eq!(k(None, Some("postgres://u:secret@h/d")), Url);
-        assert_eq!(k(None, Some("postgres://h/d?sslmode=x&password=secret")), Url);
-        assert_eq!(k(None, Some("postgres://u:${env:X}@h/d")), Env);
-        assert_eq!(k(None, Some("postgres://h/d?password=${keychain}")), Keychain);
-        assert_eq!(k(None, Some("postgres://u@h/d")), PasswordKind::None);
-        assert_eq!(k(Some("${keychain}"), Some("postgres://u:secret@h/d")), Keychain);
-        assert_eq!(k(Some("pw"), Some("postgres://u:${env:X}@h/d")), File);
-        assert_eq!(k(Some(""), Some("postgres://u:secret@h/d")), Url);
-        assert_eq!(k(None, None), PasswordKind::None);
+        let stored = |n: &str| n == "b";
+        let rows = build_rows(&c, Some("b"), "", &stored);
+        let seen: Vec<_> = rows.iter().map(|r| (r.name.as_str(), r.prod, r.read_only, r.used, r.error.is_some(), r.password)).collect();
+        assert_eq!(seen, [("a", false, false, false, false, true), ("b", true, true, true, false, true), ("broken", false, false, false, true, false)]);
+        assert_eq!((rows[0].target.as_str(), rows[1].target.as_str()), ("postgres://u:***@h/d", "h:5432/d"));
+        // The filter matches names, drivers and targets.
+        assert_eq!(build_rows(&c, None, "BRO", &stored).iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["broken"]);
+        assert_eq!(build_rows(&c, None, "postgres", &stored).len(), 2);
     }
 }

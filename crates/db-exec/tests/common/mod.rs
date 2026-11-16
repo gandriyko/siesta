@@ -18,7 +18,6 @@ pub fn connection(driver: Driver) -> Connection {
         database: None,
         user: None,
         password: None,
-        keychain: None,
         ssl: Ssl::default(),
         read_only: false,
         prod: false,
@@ -26,6 +25,16 @@ pub fn connection(driver: Driver) -> Connection {
         init_sql: None,
         color: None,
     }
+}
+
+/// A rejected login without any password says where to set one (the keychain is the in-memory mock).
+pub async fn rejected_login_names_the_fix(driver: Driver) {
+    db_conn::secrets::use_memory_store();
+    let mut c = connection(driver);
+    c.name = "test-no-password".into();
+    c.url = c.url.map(|u| u.replacen(":siesta@", "@", 1));
+    let e = Session::open(&c).await.err().expect("login without a password is rejected");
+    assert!(e.message.contains("No password is stored for `test-no-password`") && e.message.contains("set-password"), "{e}");
 }
 
 pub async fn open(driver: Driver) -> Session {

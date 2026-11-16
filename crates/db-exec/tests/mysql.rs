@@ -16,6 +16,12 @@ async fn open_my() -> Session {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn rejected_login_names_the_fix_my() {
+    rejected_login_names_the_fix(MY).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn every_value_type() {
     let mut s = open_my().await;
     run(

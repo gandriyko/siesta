@@ -281,10 +281,18 @@ fn sql_str(s: &str) -> sqlx::SqlStr {
 impl Session {
     /// Connects and applies `schema`, `read_only` and `init_sql`.
     pub async fn open(c: &Connection) -> Result<Session, DbError> {
-        // The one place a `${keychain}` password is read (also on reconnect: `spec` keeps the resolved copy).
+        // The one place the keychain password is read (also on reconnect: `spec` keeps the resolved copy).
         let resolved = c.resolve_password().map_err(DbError::msg)?;
         let c = &resolved;
-        let e = |e| DbError::from_sqlx(e, 0, 0);
+        let e = |e| {
+            let mut e = DbError::from_sqlx(e, 0, 0);
+            // SQLSTATE class 28: invalid authorization (Postgres 28P01 / 28000, MySQL 28000).
+            if !c.has_password() && e.code.as_deref().is_some_and(|code| code.starts_with("28")) {
+                // In the message, not the hint: connect errors are shown as plain text everywhere.
+                e.message = format!("{}. No password is stored for `{1}`: set it in the connection form or with `siesta connections set-password {1}`", e.message, c.name);
+            }
+            e
+        };
         let (conn, opts) = match c.driver {
             Driver::Postgres => {
                 let o = pg_options(c)?;

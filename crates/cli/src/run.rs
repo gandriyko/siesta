@@ -16,15 +16,12 @@ use crate::{CliError, runtime};
 /// Default row limit of the CLI (the GUI pages; an agent rarely wants more).
 const DEFAULT_MAX_ROWS: usize = 100;
 
-/// `-c` and the extra connection files; shared by `run`, `exec`, `schema` and `connections`.
+/// `-c`; shared by `run`, `exec` and `schema`.
 #[derive(Args, Clone, Default)]
 pub struct ConnArgs {
     /// Connection name (overrides `-- @connection`)
     #[arg(short = 'c', long)]
     pub connection: Option<String>,
-    /// Extra connection file above the siesta*.json chain (repeatable)
-    #[arg(long = "connections-file", value_name = "PATH")]
-    pub connections_files: Vec<PathBuf>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -72,16 +69,19 @@ pub(crate) struct Env {
 }
 
 impl Env {
-    /// `probe` only decides the folder chain: the real `.sql` file, or `<cwd>/_.sql`.
-    pub fn load(probe: &Path, extra: &[PathBuf]) -> Env {
+    /// `probe` only decides which workspace settings apply: the real `.sql` file, or `<cwd>/_.sql`.
+    pub fn load(probe: &Path) -> Env {
+        Self::load_in(probe, db_conn::global_dir().as_deref())
+    }
+
+    /// Like `load`, with the connections read from the config dir `config`.
+    pub fn load_in(probe: &Path, config: Option<&Path>) -> Env {
         let root = db_conn::workspace_root(probe);
         let loaded = siesta_settings::Loaded::load(Some(&root));
         for e in &loaded.errors {
             eprintln!("{} {e}", paint("warning:", YELLOW, true));
         }
-        let mut files = loaded.settings.connection_files(&root);
-        files.extend(extra.iter().cloned());
-        let conns = Connections::load(probe, &root, &files, db_conn::global_dir().as_deref());
+        let conns = config.map(Connections::load).unwrap_or_default();
         for w in &conns.warnings {
             eprintln!("{} {w}", paint("warning:", YELLOW, true));
         }
@@ -96,7 +96,7 @@ impl Env {
             return Err(CliError::new("invalid_connection", format!("connection '{name}': {e}"), 3));
         }
         let known = self.conns.names();
-        let hint = if known.is_empty() { "no siesta.json found; see `siesta connections`".to_string() } else { format!("available: {}", known.join(", ")) };
+        let hint = if known.is_empty() { "no connections yet: create one in the Siesta app, or see `siesta connections`".to_string() } else { format!("available: {}", known.join(", ")) };
         Err(CliError::new("unknown_connection", format!("no connection '{name}'"), 3).hint(hint))
     }
 
@@ -316,7 +316,7 @@ pub(crate) fn run(a: RunArgs, out: &mut dyn Write) -> Result<u8, CliError> {
     let format = Format::resolve(a.opts.output);
     let src = std::fs::read_to_string(&a.file).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&a.file, None))?;
     let path = std::path::absolute(&a.file).unwrap_or_else(|_| a.file.clone());
-    let env = Env::load(&path, &a.opts.conn.connections_files);
+    let env = Env::load(&path);
     // The directive is the same in both dialects; the real dialect needs the connection.
     let directive = sql_split::split(&src, Dialect::Postgres).connection;
     let conn = env.resolve(a.opts.conn.connection.as_deref(), directive.as_deref()).map_err(|e| e.at(&a.file, None))?;
@@ -352,7 +352,7 @@ pub(crate) fn exec(a: ExecArgs, out: &mut dyn Write) -> Result<u8, CliError> {
         }
     };
     let probe = std::env::current_dir().unwrap_or_default().join("_.sql");
-    let env = Env::load(&probe, &a.opts.conn.connections_files);
+    let env = Env::load(&probe);
     let conn = env.resolve(a.opts.conn.connection.as_deref(), None)?;
     let file = sql_split::split(&sql, dialect_of(conn.driver));
     check_parse(&sql, &file, None)?;
@@ -409,11 +409,10 @@ mod tests {
     }
 
     fn conn(name: &str, read_only: bool, prod: bool) -> Connection {
-        let s = format!(r#"{{"driver":"postgres","host":"h","prod":{prod}}}"#);
         let dir = std::env::temp_dir().join(format!("siesta-cli-unit-{}-{}", std::process::id(), name));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("siesta.json"), format!("{{\"{name}\": {s}}}")).unwrap();
-        let mut c = Connections::load(&dir.join("a.sql"), &dir, &[], None).connections.remove(name).unwrap();
+        std::fs::create_dir_all(dir.join("connections")).unwrap();
+        std::fs::write(dir.join(format!("connections/{name}.json")), format!(r#"{{"driver":"postgres","host":"h","prod":{prod}}}"#)).unwrap();
+        let mut c = Connections::load(&dir).connections.remove(name).unwrap();
         c.read_only = read_only;
         std::fs::remove_dir_all(&dir).ok();
         c

@@ -21,6 +21,12 @@ fn other(ty: &str, text: &str) -> Value {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn rejected_login_names_the_fix_pg() {
+    rejected_login_names_the_fix(PG).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn every_value_type() {
     let mut s = open_pg().await;
     run(&mut s, "CREATE TYPE pg_temp.siesta_mood AS ENUM ('sad', 'happy')").await;

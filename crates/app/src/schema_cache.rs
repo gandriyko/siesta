@@ -27,8 +27,8 @@ pub struct Cache {
 pub type Shared = Rc<RefCell<Cache>>;
 
 /// The cache key of a connection, in memory and on disk: its name plus a hash of what it points at
-/// (driver, url, host, port, database, user), so the same name in two `siesta.json` files of a
-/// monorepo keeps two schemas.
+/// (driver, url, host, port, database, user), so a connection recreated
+/// under the same name but pointing elsewhere does not reuse the old schema.
 pub fn key(c: &db_conn::Connection) -> String {
     format!("{}-{:016x}", c.name, c.fingerprint())
 }
@@ -73,7 +73,6 @@ mod tests {
             database: Some("app".into()),
             user: None,
             password: None,
-            keychain: None,
             ssl: Default::default(),
             read_only: false,
             prod: false,

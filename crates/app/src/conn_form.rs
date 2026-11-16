@@ -1,9 +1,6 @@
-//! New / Edit connection form (a dialog): reached from the connection picker and the DB tab.
-//!
-//! It edits the GLOBAL connection files only (`~/.config/siesta/connections.json`; the password
-//! goes to the system keychain, or to `connections.private.json` when that is unavailable); the reading, merging and writing is `db_conn::global`.
-//! A connection that a workspace `siesta.json` (or an extra file) defines belongs to the team's
-//! files: the dialog shows where it lives and offers to open that file instead.
+//! New / Edit connection form (a dialog): reached from the connection picker, the DB tab and the
+//! Connections page. One form for every connection; it writes `<config dir>/connections/<name>.json`
+//! and keeps the password only in the system keychain (reading and writing is `db_conn::global`).
 
 use std::{path::PathBuf, time::Instant};
 
@@ -49,10 +46,10 @@ pub(crate) struct ConnForm {
     target: Option<PathBuf>,
     /// The connection being edited (`None`: a new one).
     original: Option<String>,
-    /// Keys of the entry the form does not show (kept on save).
+    /// Keys of the file the form does not show (kept on save).
     base: serde_json::Map<String, serde_json::Value>,
-    /// The keychain account of the stored password (an empty password field keeps it).
-    keychain: Option<String>,
+    /// The keychain holds a password (an empty password field keeps it).
+    has_password: bool,
     pub name: Entity<InputState>,
     url: Entity<InputState>,
     pub host: Entity<InputState>,
@@ -69,41 +66,20 @@ pub(crate) struct ConnForm {
     prod: bool,
     error: Option<String>,
     test: Test,
-    /// A connection of a team file: where it is defined (highest priority last), and what it resolves to.
-    locked: Option<(Vec<PathBuf>, String)>,
-    /// For a locked connection: what the personal "My password" field needs (`None`: no `siesta.json` found).
-    pub(crate) team: Option<Team>,
-}
-
-/// A team connection's personal password: where the private file goes and what could make it moot.
-pub(crate) struct Team {
-    pub name: String,
-    /// The `siesta.json` that defines it; `siesta.private.json` lives next to it.
-    pub def_file: PathBuf,
-    /// `def_file` relative to the workspace root, for the hint.
-    pub rel: String,
-    /// The account of the effective `${keychain}` marker, reused on save.
-    pub account: Option<String>,
-    /// A later file that sets this connection's password (the saved one would not take effect).
-    pub overridden_by: Option<PathBuf>,
-    /// What Test connects with (the password field replaces its password).
-    pub conn: Option<db_conn::Connection>,
 }
 
 impl ConnForm {
-    #[allow(clippy::too_many_arguments)]
-    fn new(app: WeakEntity<Siesta>, dir: PathBuf, target: Option<PathBuf>, original: Option<String>, f: ConnectionForm, locked: Option<(Vec<PathBuf>, String)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(app: WeakEntity<Siesta>, dir: PathBuf, target: Option<PathBuf>, original: Option<String>, f: ConnectionForm, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |placeholder: &str, value: &str, window: &mut Window, cx: &mut Context<Self>| {
             let (placeholder, value) = (placeholder.to_string(), value.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
         };
         let password = {
-            let value = f.password.clone();
-            let hint = if f.keychain.is_some() { "Leave empty to keep the password in the system keychain" } else { "Stored in the system keychain" };
-            cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true).default_value(value))
+            let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored in the system keychain" };
+            cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true))
         };
         Self {
-            keychain: f.keychain.clone(),
+            has_password: f.has_password,
             app,
             dir,
             target,
@@ -125,15 +101,7 @@ impl ConnForm {
             base: f.base,
             error: None,
             test: Test::Idle,
-            locked,
-            team: None,
         }
-    }
-
-    /// The files of a read-only (team) connection, for tests.
-    #[cfg(test)]
-    pub fn locked_paths(&self) -> Option<Vec<PathBuf>> {
-        self.locked.as_ref().map(|(p, _)| p.clone())
     }
 
     /// What the fields hold now.
@@ -154,42 +122,39 @@ impl ConnForm {
             color: v(&self.color),
             read_only: self.read_only,
             prod: self.prod,
-            keychain: self.keychain.clone(),
+            has_password: self.has_password,
             base: self.base.clone(),
         }
     }
 
-    /// Writes the global files; on success the dialog closes and the file it was opened for picks the connection.
+    /// Writes the file and the keychain entry; on success the dialog closes and the file it was
+    /// opened for picks the connection. If only the password could not be stored, the connection
+    /// is saved, every file sees it, and the form stays open with the error.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let form = self.collect(cx);
-        let warning = match db_conn::save_global(&self.dir, &form, self.original.as_deref()) {
-            Ok(w) => w,
+        let name = form.name.trim().to_string();
+        let password_error = match db_conn::save(&self.dir, &form, self.original.as_deref()) {
+            Ok(e) => e,
             Err(e) => {
                 self.error = Some(e);
                 return cx.notify();
             }
         };
-        let (name, target) = (form.name.trim().to_string(), self.target.clone());
-        window.close_dialog(cx);
-        if let Some(w) = warning {
-            window.push_notification(w, cx);
+        if let Some(e) = password_error {
+            // The file is written: a second Save is an edit of it.
+            self.original = Some(name);
+            self.error = Some(format!("Saved, but the password was not: {e}"));
+            self.app.update(cx, |this, cx| this.connection_changed(window, cx)).ok();
+            return cx.notify();
         }
+        let target = self.target.clone();
+        window.close_dialog(cx);
         self.app.update(cx, |this, cx| this.connection_saved(target, name, window, cx)).ok();
     }
 
     /// A throwaway session with the form's values; the result is shown in the form, nothing is saved.
     pub fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let conn = match self.team.as_ref().map(|t| t.conn.clone().ok_or("this connection has errors, see the list".to_string())) {
-            Some(c) => c.map(|mut c| {
-                let pw = self.password.read(cx).value().to_string();
-                if !pw.is_empty() {
-                    (c.password, c.keychain) = (Some(pw), None);
-                }
-                c
-            }),
-            None => self.collect(cx).to_connection(&self.dir),
-        };
-        let conn = match conn {
+        let conn = match self.collect(cx).to_connection(&self.dir, self.original.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 self.test = Test::Failed(e);
@@ -224,7 +189,7 @@ impl ConnForm {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete connection '{name}'?"),
-            Some("It is removed from connections.json and connections.private.json; its password is deleted from the system keychain."),
+            Some("The connection file is removed and its password is deleted from the system keychain."),
             &["Delete", "Cancel"],
             cx,
         );
@@ -232,7 +197,7 @@ impl ConnForm {
             if answer.await != Ok(0) {
                 return;
             }
-            this.update_in(cx, |this, window, cx| match db_conn::delete_global(&this.dir, &name) {
+            this.update_in(cx, |this, window, cx| match db_conn::delete(&this.dir, &name) {
                 Ok(_) => {
                     window.close_dialog(cx);
                     this.app.update(cx, |app, cx| app.connection_deleted(&name, window, cx)).ok();
@@ -251,31 +216,6 @@ impl ConnForm {
         v_flex().gap_1().child(div().text_xs().text_color(muted).child(label.to_string())).child(control)
     }
 
-    fn locked_view(&self, paths: &[PathBuf], resolved: &str, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let files = paths.iter().enumerate().map(|(i, p)| {
-            let path = p.clone();
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(div().flex_1().min_w_0().truncate().text_sm().child(p.display().to_string()))
-                .child(Button::new(("open-conn-file", i)).label("Open file").small().on_click(cx.listener(move |this, _, window, cx| {
-                    let path = path.clone();
-                    window.close_dialog(cx);
-                    this.app.update(cx, |app, cx| _ = app.open(path, None, window, cx)).ok();
-                })))
-        });
-        v_flex()
-            .gap_3()
-            .child(div().text_sm().child("This connection is defined in a project file, which is shared with the team. Edit it there:"))
-            .child(v_flex().gap_1().children(files))
-            .child(div().text_xs().text_color(muted).child("As Siesta reads it (passwords hidden):"))
-            .child(div().p_2().rounded_md().border_1().border_color(cx.theme().border).font_family(cx.theme().mono_font_family.clone()).text_xs().child(resolved.to_string()))
-            .children(self.team.as_ref().map(|t| self.password_section(t, cx)))
-            .child(h_flex().justify_end().child(Button::new("conn-close").label("Close").on_click(|_, window, cx| window.close_dialog(cx))))
-            .into_any_element()
-    }
-
     fn status(&self, cx: &App) -> Option<Div> {
         let (muted, danger, success) = (cx.theme().muted_foreground, cx.theme().danger, cx.theme().success);
         match &self.test {
@@ -285,59 +225,12 @@ impl ConnForm {
             Test::Failed(e) => Some(div().text_sm().text_color(danger).child(e.clone())),
         }
     }
-
-    /// "My password": a personal password for a team connection, kept in the keychain with a reference in `siesta.private.json`.
-    fn password_section(&self, t: &Team, cx: &mut Context<Self>) -> Div {
-        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
-        let hint = format!("Stored in your system keychain; siesta.private.json next to {} gets a `${{keychain:…}}` reference. The team's siesta.json is not changed.", t.rel);
-        v_flex()
-            .gap_1()
-            .child(Self::field("My password", muted, Input::new(&self.password).mask_toggle()))
-            .child(div().text_xs().text_color(muted).child(hint))
-            .children(t.overridden_by.as_ref().map(|p| div().text_xs().text_color(danger).child(format!("The password saved here will not take effect: {} sets it later in the chain.", p.display()))))
-            .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))
-            .children(self.status(cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .pt_1()
-                    .child(div().flex_1())
-                    .child(Button::new("conn-test").label("Test").on_click(cx.listener(|this, _, window, cx| this.test(window, cx))))
-                    .child(Button::new("conn-save-pw").label("Save password").primary().on_click(cx.listener(|this, _, window, cx| this.save_password(window, cx)))),
-            )
-    }
-
-    /// Stores the personal password; the dialog closes and the app reloads connections and drops their sessions.
-    pub fn save_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(t) = &self.team else { return };
-        let password = self.password.read(cx).value().to_string();
-        if password.is_empty() {
-            return window.close_dialog(cx); // empty = keep
-        }
-        match db_conn::set_workspace_password(&t.def_file, &t.name, &password, t.account.as_deref()) {
-            Err(e) => {
-                self.error = Some(e);
-                cx.notify();
-            }
-            Ok(out) => {
-                let name = t.name.clone();
-                window.close_dialog(cx);
-                if let Some(w) = out.warning {
-                    window.push_notification(w, cx);
-                }
-                self.app.update(cx, |app, cx| app.workspace_password_saved(name, out.gitignore, window, cx)).ok();
-            }
-        }
-    }
 }
 
 impl Render for ConnForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some((paths, resolved)) = self.locked.clone() {
-            return self.locked_view(&paths, &resolved, cx);
-        }
         let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
-        let field =|label: &str, input: &Entity<InputState>| Self::field(label, muted, Input::new(input));
+        let field = |label: &str, input: &Entity<InputState>| Self::field(label, muted, Input::new(input));
 
         let driver_ix = DRIVERS.iter().position(|(_, d)| Some(*d) == self.driver).unwrap_or(0);
         let driver = DRIVERS.iter().fold(
@@ -369,6 +262,7 @@ impl Render for ConnForm {
         };
         let status = self.status(cx);
         let editing = self.original.is_some();
+        let location = format!("Saved to {}; the password is kept only in the system keychain.", db_conn::connections_dir(&self.dir).display());
         v_flex()
             .gap_2()
             .child(field("Name", &self.name))
@@ -381,7 +275,7 @@ impl Render for ConnForm {
             .child(field("Schema (search_path)", &self.schema))
             .child(field("Init SQL", &self.init_sql))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))
-            .child(div().text_xs().text_color(muted).child("Saved to connections.json; the password goes to the system keychain. A project's siesta.json overrides a connection of the same name."))
+            .child(div().text_xs().text_color(muted).child(location))
             .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))
             .children(status)
             .child(
@@ -394,7 +288,6 @@ impl Render for ConnForm {
                     .child(Button::new("conn-cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("conn-save").label("Save").primary().on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))),
             )
-            .into_any_element()
     }
 }
 
@@ -415,98 +308,61 @@ impl Siesta {
         } else {
             None
         };
-        let conns = self.conns_for_page().0;
         let mut data = ConnectionForm { driver: Some(Driver::Postgres), ..Default::default() };
-        let (mut original, mut locked, mut team_pw) = (None, None, None);
+        let mut original = None;
         if let Some(name) = &edit {
-            let globals = [dir.join("connections.json"), dir.join("connections.private.json")];
-            let team: Vec<PathBuf> = conns.sources.get(name).into_iter().flatten().filter(|p| !globals.contains(p)).cloned().collect();
-            if !team.is_empty() {
-                let resolved = match (conns.connections.get(name), conns.errors.get(name)) {
-                    (Some(c), _) => serde_json::to_string_pretty(&db_conn::masked(c)).unwrap_or_default(),
-                    (None, Some(e)) => format!("error: {e}"),
-                    _ => String::new(),
-                };
-                if let Some(def_file) = db_conn::workspace_def_file(&team).map(PathBuf::from) {
-                    let root = self.root_of(&def_file);
-                    team_pw = Some(Team {
-                        name: name.clone(),
-                        rel: def_file.strip_prefix(&root).unwrap_or(&def_file).display().to_string(),
-                        overridden_by: db_conn::password_override(conns.sources.get(name).map_or(&[], Vec::as_slice), &def_file, name),
-                        account: conns.connections.get(name).and_then(|c| c.keychain.clone()),
-                        conn: conns.connections.get(name).cloned(),
-                        def_file,
-                    });
-                }
-                locked = Some((team, resolved));
-            } else if let Some(f) = db_conn::read_global_form(&dir, name) {
-                if duplicate {
-                    data = ConnectionForm { name: format!("{name}-copy"), password: String::new(), keychain: None, ..f };
-                } else {
-                    (original, data) = (Some(name.clone()), f);
-                }
+            let Some(f) = db_conn::read_form(&dir, name) else {
+                return window.push_notification(format!("Connection '{name}' could not be read"), cx);
+            };
+            if duplicate {
+                data = ConnectionForm { name: format!("{name}-copy"), has_password: false, ..f };
             } else {
-                return window.push_notification(format!("'{name}' is not in a file Siesta can edit"), cx);
+                (original, data) = (Some(name.clone()), f);
             }
         }
-        let edit = edit.filter(|_| !duplicate);
-        let title = match (&edit, &locked) {
-            (None, _) => "New connection".to_string(),
-            (Some(n), Some(_)) => format!("Connection {n}"),
-            (Some(n), None) => format!("Edit connection {n}"),
+        let title = match &original {
+            None => "New connection".to_string(),
+            Some(n) => format!("Edit connection {n}"),
         };
         let app = cx.entity().downgrade();
-        let form = cx.new(|cx| ConnForm::new(app, dir, target, original, data, locked, window, cx));
-        form.update(cx, |f, _| f.team = team_pw);
+        let form = cx.new(|cx| ConnForm::new(app, dir, target, original, data, window, cx));
         self.conn_form = Some(form.clone());
         let name_input = form.read(cx).name.clone();
         window.open_dialog(cx, move |dialog, _, _| dialog.w(px(560.)).title(title.clone()).child(form.clone()));
         name_input.update(cx, |s, cx| s.focus(window, cx));
     }
 
-    /// The form saved `name`: every open file sees it; only `target` (the file the form was opened for) picks it.
-    pub(crate) fn connection_saved(&mut self, target: Option<PathBuf>, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A connection file changed through the form: every open file sees it, and live sessions of
+    /// connections that were edited reconnect on the next run.
+    pub(crate) fn connection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_connections(window, cx);
         self.conns_seen = Some(self.conns_stamp());
+    }
+
+    /// The form saved `name`: every open file sees it; only `target` (the file the form was opened for) picks it.
+    pub(crate) fn connection_saved(&mut self, target: Option<PathBuf>, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection_changed(window, cx);
+        // The next run reconnects with the saved values and password.
+        self.close_connection_sessions(&name);
         if let Some(target) = target {
             self.pick_for(&target, Some(name), window, cx);
         }
         self.conn_form = None;
     }
 
-    /// A personal password was saved for the team connection `name`: reload, drop its live sessions
-    /// (the next run reconnects with the new password), and offer to git-ignore `siesta.private.json`.
-    pub(crate) fn workspace_password_saved(&mut self, name: String, gitignore: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload_connections(window, cx);
-        self.conns_seen = Some(self.conns_stamp());
-        self.conn_form = None;
-        self.close_connection_sessions(&name);
-        cx.notify();
-        let Some(gitignore) = gitignore else { return };
-        let answer = window.prompt(PromptLevel::Info, "siesta.private.json is not in .gitignore. Add it?", Some(&format!("It is appended to {}.", gitignore.display())), &["Add", "Not now"], cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0)
-                && let Err(e) = db_conn::add_to_gitignore(&gitignore)
-            {
-                this.update_in(cx, |_, window, cx| window.push_notification(e, cx)).ok();
-            }
-        })
-        .detach();
-    }
-
-    /// Deletes a global connection (and its keychain entry) from the Connections page.
-    pub(crate) fn delete_global_connection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Deletes a connection (file and keychain entry) from the Connections page.
+    pub(crate) fn delete_connection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = self.config_dir.clone() else { return };
-        match db_conn::delete_global(&dir, name) {
+        match db_conn::delete(&dir, name) {
             Ok(_) => self.connection_deleted(name, window, cx),
             Err(e) => window.push_notification(e, cx),
         }
     }
 
-    /// A global connection was deleted: files that had picked it are left with "No connection".
+    /// A connection was deleted: files that had picked it are left with "No connection".
     pub(crate) fn connection_deleted(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload_connections(window, cx);
-        self.conns_seen = Some(self.conns_stamp());
+        self.connection_changed(window, cx);
+        self.close_connection_sessions(name);
         let paths: Vec<PathBuf> = self.docs.iter().filter(|d| d.picked.as_deref() == Some(name)).map(|d| (*d.path).clone()).collect();
         for p in paths {
             self.pick_for(&p, None, window, cx);

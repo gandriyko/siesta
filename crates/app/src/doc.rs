@@ -18,7 +18,7 @@ pub struct Doc {
     /// The split of the current text, refreshed after every edit.
     pub file: Arc<SqlFile>,
     pub dialect: Dialect,
-    /// Connections visible from this file's `siesta*.json` chain.
+    /// The connections of the config dir.
     pub conns: Arc<Connections>,
     /// The picker's choice for this file; `-- @connection` in the text wins over it.
     pub picked: Option<String>,

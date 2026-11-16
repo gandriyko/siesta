@@ -54,8 +54,6 @@ actions!(
 
 /// Shown in an empty workspace (not written until saved).
 const SAMPLE: &str = "-- @connection local\nSELECT 1;\n";
-const CONN_TEMPLATE: &str =
-    "{\n  \"local\": {\n    \"driver\": \"postgres\",\n    \"host\": \"localhost\",\n    \"database\": \"postgres\",\n    \"user\": \"postgres\"\n  }\n}\n";
 #[cfg(target_os = "macos")]
 const RUN_KEY: &str = "Cmd+Enter";
 #[cfg(not(target_os = "macos"))]
@@ -83,8 +81,10 @@ pub(crate) enum SideTab {
 type Stamp = Vec<(PathBuf, Option<std::time::SystemTime>)>;
 
 pub(crate) struct Siesta {
-    /// The workspace folder: root of the file tree, of `siesta*.json` chains and of saved state.
+    /// The workspace folder: root of the file tree and of saved state.
     root: PathBuf,
+    /// The connections of the config dir, shared by every open file.
+    conns: Arc<Connections>,
     /// Where `state.json` lives (`~/.siesta`); `None` = nothing is saved.
     base: Option<PathBuf>,
     docs: Vec<Doc>,
@@ -112,7 +112,7 @@ pub(crate) struct Siesta {
     result_open: bool,
     /// The connection picked per file (`None` = "No connection" chosen); persisted.
     picks: BTreeMap<PathBuf, Option<String>>,
-    /// `siesta*.json` files of the open tabs' chains at the last check; a change reloads connections.
+    /// The connection files at the last check; a change reloads connections.
     conns_seen: Option<Stamp>,
     /// A dirty tab whose close was requested once; the next close discards it.
     close_armed: Option<PathBuf>,
@@ -133,7 +133,7 @@ pub(crate) struct Siesta {
     settings: siesta_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     connections_window: Option<WindowHandle<Root>>,
-    /// `~/.config/siesta`: the global connection files live here; `None` = no global connections.
+    /// `~/.config/siesta`: `connections/<name>.json` live here; `None` = no connections.
     config_dir: Option<PathBuf>,
     /// The open New / Edit connection form.
     conn_form: Option<Entity<conn_form::ConnForm>>,
@@ -208,8 +208,10 @@ impl Siesta {
                 }
             }),
         ];
+        let conns = Arc::new(config_dir.as_deref().map(Connections::load).unwrap_or_default());
         let mut this = Self {
             root: root.clone(),
+            conns,
             base,
             docs: vec![],
             current: None,
@@ -246,6 +248,7 @@ impl Siesta {
             default_mono: cx.theme().mono_font_family.clone(),
             _subs,
         };
+        this.report_connections(&this.conns, window, cx);
         this.load_workspace(open, window, cx);
         this.apply_settings(window, cx);
         this
@@ -364,28 +367,10 @@ impl Siesta {
         self.conns_seen = Some(conns);
     }
 
-    /// Where the connection chain of `path` may have files: `siesta.json` / `siesta.private.json`
-    /// from the root down to its folder, plus `connections.files`.
-    fn conn_candidates(&self, path: &Path) -> Vec<PathBuf> {
-        let root = self.root_of(path);
-        let dir = path.parent().unwrap_or(&root);
-        let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| d.starts_with(&root)).collect();
-        dirs.reverse();
-        let mut out: Vec<PathBuf> = dirs.iter().flat_map(|d| [d.join("siesta.json"), d.join("siesta.private.json")]).collect();
-        out.extend(self.settings.settings.connection_files(&root));
-        out
-    }
-
+    /// The connection files of the config dir with their mtimes; a change reloads connections.
     fn conns_stamp(&self) -> Stamp {
-        let global = self.config_dir.iter().flat_map(|d| [d.join("connections.json"), d.join("connections.private.json")]);
-        let mut out: Stamp = global.chain(self.docs.iter().flat_map(|d| self.conn_candidates(&d.path))).map(|p| (p.clone(), doc::mtime(&p))).collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    fn load_connections(&self, path: &Path) -> Connections {
-        Connections::load(path, &self.root_of(path), &self.settings.settings.connection_files(&self.root_of(path)), self.config_dir.as_deref())
+        let Some(dir) = &self.config_dir else { return vec![] };
+        db_conn::names(dir).into_iter().map(|n| dir.join("connections").join(format!("{n}.json"))).map(|p| (p.clone(), doc::mtime(&p))).collect()
     }
 
     /// Surface what `Connections::load` found wrong, the way Respite does for env files.
@@ -399,13 +384,12 @@ impl Siesta {
     }
 
     fn reload_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for ix in 0..self.docs.len() {
-            let c = self.load_connections(&self.docs[ix].path.clone());
-            if ix == self.current.unwrap_or(0) {
-                self.report_connections(&c, window, cx);
-            }
-            self.docs[ix].conns = Arc::new(c);
-            self.docs[ix].reparse(cx);
+        let c = Arc::new(self.config_dir.as_deref().map(Connections::load).unwrap_or_default());
+        self.report_connections(&c, window, cx);
+        self.conns = c.clone();
+        for d in &mut self.docs {
+            d.conns = c.clone();
+            d.reparse(cx);
         }
         cx.notify();
     }
@@ -529,10 +513,8 @@ impl Siesta {
                         cx.notify();
                     }),
                 ];
-                let conns = self.load_connections(&path);
-                self.report_connections(&conns, window, cx);
                 let picked = self.picks.get(&path).cloned().flatten();
-                self.docs.push(Doc::new(path.clone(), editor, Arc::new(conns), picked, self.schemas.clone(), subs, cx));
+                self.docs.push(Doc::new(path.clone(), editor, self.conns.clone(), picked, self.schemas.clone(), subs, cx));
                 let ix = self.docs.len() - 1;
                 if let Some(key) = self.docs[ix].schema_key() {
                     self.load_cached_schema(&key);
@@ -550,11 +532,6 @@ impl Siesta {
         self.docs[ix].editor.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
         Some(ix)
-    }
-
-    /// Root of `path`'s connection chain: the workspace, or (for a file outside it) its own repo.
-    fn root_of(&self, path: &Path) -> PathBuf {
-        if path.starts_with(&self.root) { self.root.clone() } else { db_conn::workspace_root(path) }
     }
 
     fn doc(&self) -> Option<&Doc> {
@@ -645,11 +622,6 @@ impl Siesta {
                 self.outlines.remove(&path);
                 // A new file (e.g. the untitled sample) shows up in the tree.
                 self.rescan();
-                if siesta_workspace::is_conn_file(&path) {
-                    // New connections apply to every open file right away.
-                    self.reload_connections(window, cx);
-                    self.conns_seen = Some(self.conns_stamp());
-                }
                 self.remember(cx);
                 cx.notify();
                 true
@@ -828,13 +800,12 @@ impl Siesta {
         })
     }
 
-    /// Top-right connection picker: the connections of the current file's chain, "No connection",
-    /// and the connection files to edit. The dot is grey until sessions exist (green / red later).
+    /// Top-right connection picker: the connections, "No connection", and the form / page entries. The dot is grey until sessions exist (green / red later).
     fn connection_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
         let current = d.connection().map(str::to_string);
         let forced = d.locked().is_some();
-        // A directive naming a connection that is not in the chain: shown in red.
+        // A directive naming a connection that does not exist: shown in red.
         let unknown = d.locked().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
         let conn_of = |n: &str| d.conns.connections.get(n);
@@ -873,25 +844,6 @@ impl Siesta {
                         let view = view.clone();
                         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                             view.update(cx, |this, cx| this.select_connection(name.clone(), window, cx)).ok();
-                        }
-                    };
-                    // Open a connection file in a tab; `template` creates it first.
-                    let edit = |path: PathBuf, template: Option<&'static str>| {
-                        let view = view.clone();
-                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            if let Some(t) = template
-                                && let Err(e) = std::fs::write(&path, t)
-                            {
-                                window.push_notification(format!("{}: {e}", path.display()), cx);
-                                return;
-                            }
-                            view.update(cx, |this, cx| {
-                                if template.is_some() {
-                                    this.rescan();
-                                }
-                                this.open(path.clone(), None, window, cx);
-                            })
-                            .ok();
                         }
                     };
                     let row = |label: String, name: Option<String>| {
@@ -941,20 +893,6 @@ impl Siesta {
                         .separator()
                         .item(hook("Test connection", can_test, Siesta::test_connection))
                         .item(hook("Disconnect", can_disconnect, Siesta::disconnect));
-                    let chain = view.upgrade().and_then(|v| {
-                        let this = v.read(cx);
-                        this.doc().map(|d| (this.conn_candidates(&d.path), this.root.clone()))
-                    });
-                    let Some((candidates, root)) = chain else { return menu };
-                    menu = menu.separator();
-                    for p in candidates.iter().filter(|p| p.is_file()) {
-                        let shown = p.strip_prefix(&root).unwrap_or(p).display().to_string();
-                        menu = menu.item(PopupMenuItem::new(format!("Edit {shown}")).on_click(edit(p.clone(), None)));
-                    }
-                    let public = root.join("siesta.json");
-                    if !public.exists() {
-                        menu = menu.item(PopupMenuItem::new("Create siesta.json in the workspace").on_click(edit(public, Some(CONN_TEMPLATE))));
-                    }
                     menu
                 })
                 .into_any_element(),
@@ -1359,18 +1297,22 @@ mod tests {
         assert_eq!(parse_target("/no/such/q.sql:x"), (PathBuf::from("/no/such/q.sql:x"), None));
     }
 
-    /// A workspace with two connections (`dev` Postgres, `my` MySQL) and a few files.
+    /// The config dir inside a test workspace (hidden, so the file tree skips it).
+    const CONFIG: &str = ".cfg";
+
+    /// A workspace with three connections in its config dir (`dev` Postgres, `my` MySQL, `live` prod) and a few files.
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         // Nothing listens on port 1: a picked connection tries to load its schema and fails at once.
-        std::fs::write(
-            r.join("siesta.json"),
-            r#"{"dev": {"driver": "postgres", "url": "postgres://nobody@127.0.0.1:1/d"},
-                "my": {"driver": "mysql", "read_only": true, "url": "mysql://nobody@127.0.0.1:1/d"},
-                "live": {"driver": "postgres", "prod": true, "url": "postgres://nobody@127.0.0.1:1/p"}}"#,
-        )
-        .unwrap();
+        std::fs::create_dir_all(r.join(CONFIG).join("connections")).unwrap();
+        for (name, json) in [
+            ("dev", r#"{"driver": "postgres", "url": "postgres://nobody@127.0.0.1:1/d"}"#),
+            ("my", r#"{"driver": "mysql", "read_only": true, "url": "mysql://nobody@127.0.0.1:1/d"}"#),
+            ("live", r#"{"driver": "postgres", "prod": true, "url": "postgres://nobody@127.0.0.1:1/p"}"#),
+        ] {
+            std::fs::write(r.join(CONFIG).join(format!("connections/{name}.json")), json).unwrap();
+        }
         std::fs::write(r.join("a.sql"), "SELECT 1;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n").unwrap();
         std::fs::write(r.join("b.sql"), "SELECT 'b';\n").unwrap();
         std::fs::write(r.join("c.sql"), "-- @connection my\nSELECT 'c';\n").unwrap();
@@ -1381,11 +1323,13 @@ mod tests {
         if !cx.update(|cx| cx.has_global::<gpui_component::Theme>()) {
             cx.update(gpui_component::init);
         }
+        // Opening a session reads the keychain: never the real one.
+        db_conn::secrets::use_memory_store();
         let mut view = None;
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 let settings = siesta_settings::Loaded::load_from(None, None);
-                let v = cx.new(|cx| Siesta::new(root.to_path_buf(), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, None, window, cx));
+                let v = cx.new(|cx| Siesta::new(root.to_path_buf(), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, Some(root.join(CONFIG)), window, cx));
                 view = Some(v.clone());
                 cx.new(|cx| Root::new(v, window, cx))
             })
@@ -1775,17 +1719,16 @@ mod tests {
                 f.save(window, cx);
             })
         });
-        let read = |name: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap();
-        assert_eq!(read("connections.json")["fresh"], serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1, "password": "${keychain}"}));
-        assert!(read("connections.private.json").get("fresh").is_none());
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("connections/fresh.json")).unwrap()).unwrap();
+        assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1}));
         assert_eq!(db_conn::secrets::get("fresh").as_deref(), Ok("pw"));
         // Every open file sees the connection; only `a.sql` (the file the form was opened for) picked it.
-        let (pa, pb, pw) = cx.update(|_, cx| {
+        let (pa, pb, known) = cx.update(|_, cx| {
             let this = app.read(cx);
             let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
-            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections["fresh"].keychain.clone())
+            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections.contains_key("fresh"))
         });
-        assert_eq!((pa.as_deref(), pb, pw.as_deref()), (Some("fresh"), None, Some("fresh")));
+        assert_eq!((pa.as_deref(), pb, known), (Some("fresh"), None, true));
         let state = siesta_workspace::load_state(base.path(), ws.path());
         assert_eq!((state.connections[&a].as_deref(), state.connections.get(&b)), (Some("fresh"), None));
         // Edit: the same dialog on the saved connection, then Delete clears the pick.
@@ -1802,79 +1745,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn team_connections_are_read_only_in_the_form(tcx: &mut TestAppContext) {
-        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
-        cx.update(|window, cx| {
-            app.update(cx, |this, cx| {
-                this.config_dir = Some(cfg.path().to_path_buf());
-                this.open_conn_form(Some("dev".into()), window, cx);
-            })
-        });
-        let locked = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.read(cx).locked_paths()));
-        assert_eq!(locked, Some(vec![ws.path().join("siesta.json")]));
-        assert!(!cfg.path().join("connections.json").exists());
-    }
-
-    #[gpui::test]
-    fn team_connection_gets_a_personal_password(tcx: &mut TestAppContext) {
-        db_conn::secrets::use_memory_store();
-        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let team = std::fs::read_to_string(ws.path().join("siesta.json")).unwrap();
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
-        cx.update(|window, cx| {
-            app.update(cx, |this, cx| {
-                this.config_dir = Some(cfg.path().to_path_buf());
-                this.open_conn_form(Some("dev".into()), window, cx);
-            })
-        });
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
-        cx.update(|window, cx| {
-            form.update(cx, |f, cx| {
-                f.password.update(cx, |s, cx| s.set_value("mine", window, cx));
-                f.save_password(window, cx);
-            })
-        });
-        let account = format!("{}/dev", ws.path().file_name().unwrap().to_string_lossy());
-        let private: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ws.path().join("siesta.private.json")).unwrap()).unwrap();
-        assert_eq!(private, serde_json::json!({"dev": {"password": format!("${{keychain:{account}}}")}}));
-        assert_eq!(db_conn::secrets::get(&account).as_deref(), Ok("mine"));
-        assert_eq!(std::fs::read_to_string(ws.path().join("siesta.json")).unwrap(), team);
-        // Connections were reloaded: the connection now resolves its password from the keychain.
-        let kc = cx.update(|_, cx| app.read(cx).docs[0].conns.connections["dev"].keychain.clone());
-        assert_eq!(kc.as_deref(), Some(account.as_str()));
-    }
-
-    #[gpui::test]
     fn connections_page_lists_edits_and_deletes_without_touching_picks(tcx: &mut TestAppContext) {
-        use crate::connections_page::{ConnectionsPage, PasswordKind, build_groups, raw_password_kind};
-        db_conn::secrets::use_memory_store();
+        use crate::connections_page::{ConnectionsPage, build_rows};
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (a, dir) = (ws.path().join("a.sql"), cfg.path().to_path_buf());
-        std::fs::write(dir.join("connections.json"), r#"{"gl": {"driver": "postgres", "host": "h", "port": 5, "database": "d", "password": "${keychain}"}}"#).unwrap();
-        db_conn::secrets::set("gl", "pw").unwrap();
+        std::fs::create_dir_all(dir.join("connections")).unwrap();
+        std::fs::write(dir.join("connections/gl.json"), r#"{"driver": "postgres", "host": "h", "port": 5, "database": "d"}"#).unwrap();
+        std::fs::write(dir.join("connections/other.json"), r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1}"#).unwrap();
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        db_conn::secrets::set("gl", "pw").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.config_dir = Some(dir.clone());
                 this.reload_connections(window, cx);
-                this.pick_for(&a, Some("dev".into()), window, cx);
+                this.pick_for(&a, Some("other".into()), window, cx);
             })
         });
-        // The page shows both groups; the global one is not the current file's.
-        let groups = cx.update(|_, cx| {
-            let this = app.read(cx);
-            let (conns, current, root) = this.conns_for_page();
-            let files = [dir.join("connections.json"), dir.join("connections.private.json")];
-            build_groups(&conns, &files, &root, current.as_deref(), "", &raw_password_kind)
+        // The page is one flat list with a "password set" mark.
+        let rows = cx.update(|_, cx| {
+            let (conns, current) = app.read(cx).conns_for_page();
+            build_rows(&conns, current.as_deref(), "", &|n| db_conn::secrets::get(n).is_ok())
         });
-        assert_eq!(groups.len(), 2);
-        assert!(groups[0].global);
-        let gl = &groups[0].rows[0];
-        assert_eq!((gl.name.as_str(), gl.password, gl.used, gl.target.as_str()), ("gl", PasswordKind::Keychain, false, "h:5/d"));
-        assert_eq!(groups[1].title, "siesta.json");
-        let flags: Vec<_> = groups[1].rows.iter().map(|r| (r.name.as_str(), r.prod, r.read_only, r.used)).collect();
-        assert_eq!(flags, [("dev", false, false, true), ("live", true, false, false), ("my", false, true, false)]);
+        assert_eq!(rows.iter().map(|r| (r.name.as_str(), r.password, r.used, r.target.as_str())).collect::<Vec<_>>(), [("gl", true, false, "h:5/d"), ("other", false, true, "127.0.0.1:1")]);
         // The page itself renders.
         let (weak, main) = (app.downgrade(), cx.update(|window, _| window.window_handle()));
         let page = tcx.update(|cx| cx.open_window(Default::default(), |w, cx| cx.new(|cx| ConnectionsPage::new(weak, main, w, cx))).unwrap());
@@ -1883,25 +1775,26 @@ mod tests {
         cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), true, false, window, cx)));
         let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
         let f = cx.update(|_, cx| form.read(cx).collect(cx));
-        assert_eq!((f.name.as_str(), f.host.as_str(), f.password.as_str()), ("gl-copy", "h", ""));
-        // Edit a connection the file did not pick: the pick stays.
+        assert_eq!((f.name.as_str(), f.host.as_str(), f.password.as_str(), f.has_password), ("gl-copy", "h", "", false));
+        // Edit a connection the file did not pick: the pick stays; the stored password is announced, not shown.
         cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), false, false, window, cx)));
         let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
-        assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).name), "gl");
+        let f = cx.update(|_, cx| form.read(cx).collect(cx));
+        assert_eq!((f.name.as_str(), f.password.as_str(), f.has_password), ("gl", "", true));
         cx.update(|window, cx| {
             form.update(cx, |f, cx| {
                 f.host.update(cx, |s, cx| s.set_value("edited", window, cx));
                 f.save(window, cx);
             })
         });
-        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("dev"));
-        assert_eq!(db_conn::read_global_form(&dir, "gl").unwrap().host, "edited");
-        assert_eq!(db_conn::secrets::get("gl").as_deref(), Ok("pw"));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
+        assert_eq!(db_conn::read_form(&dir, "gl").unwrap().host, "edited");
+        assert_eq!(db_conn::secrets::get("gl").as_deref(), Ok("pw")); // the empty password field kept it
         // Delete removes the connection and its keychain entry, and leaves the pick.
-        cx.update(|window, cx| app.update(cx, |this, cx| this.delete_global_connection("gl", window, cx)));
-        assert!(db_conn::read_global_form(&dir, "gl").is_none());
+        cx.update(|window, cx| app.update(cx, |this, cx| this.delete_connection("gl", window, cx)));
+        assert!(db_conn::read_form(&dir, "gl").is_none());
         assert!(db_conn::secrets::get("gl").is_err());
-        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("dev"));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
     }
 
     #[gpui::test]

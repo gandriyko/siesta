@@ -2,27 +2,30 @@
 
 use serde_json::{Value, json};
 
+/// Tests share the process environment (`SIESTA_CONFIG_DIR`), so a fixture holds this for its lifetime.
+static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     dir: tempfile::TempDir,
     driver: &'static str,
+    _env: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new(driver: &'static str, url_var: &str) -> Fixture {
-        let url = std::env::var(url_var).unwrap_or_else(|_| panic!("{url_var} is not set; run scripts/test-db.sh"));
+        let env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        // Never read the real ~/.config/siesta (set to the same empty dir by both tests).
-        let cfg = std::env::temp_dir().join("siesta-cli-test-empty-config");
-        std::fs::create_dir_all(&cfg).unwrap();
+        // The password stays out of the files: the url comes from the environment (`${env:}`).
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("connections")).unwrap();
         unsafe { std::env::set_var("SIESTA_CONFIG_DIR", &cfg) };
-        let conn = |ro: bool, prod: bool| json!({ "driver": driver, "url": url, "read_only": ro, "prod": prod });
-        let all = json!({ "c": conn(false, false), "prod-c": conn(false, true), "ro": conn(true, false) });
-        std::fs::write(dir.path().join("conns.json"), all.to_string()).unwrap();
-        Fixture { dir, driver }
-    }
-
-    fn conns(&self) -> String {
-        self.dir.path().join("conns.json").display().to_string()
+        assert!(std::env::var(url_var).is_ok(), "{url_var} is not set; run scripts/test-db.sh");
+        let url = format!("${{env:{url_var}}}");
+        for (name, ro, prod) in [("c", false, false), ("prod-c", false, true), ("ro", true, false)] {
+            let conn = json!({ "driver": driver, "url": url, "read_only": ro, "prod": prod });
+            std::fs::write(cfg.join("connections").join(format!("{name}.json")), conn.to_string()).unwrap();
+        }
+        Fixture { dir, driver, _env: env }
     }
 
     fn file(&self, name: &str, sql: &str) -> String {
@@ -35,7 +38,6 @@ impl Fixture {
     fn go(&self, args: &[&str]) -> (u8, String) {
         let mut a = vec!["siesta".to_string()];
         a.extend(args.iter().map(|s| s.to_string()));
-        a.extend(["--connections-file".into(), self.conns()]);
         let mut out = vec![];
         let code = siesta_cli::run_with(a, &mut out);
         (code, String::from_utf8(out).unwrap())

@@ -1,6 +1,6 @@
 ---
 name: siesta
-description: Run SQL against Postgres and MySQL / MariaDB with the Siesta CLI and plain `.sql` files, inspect a database schema (tables, columns, indexes, DDL) before writing queries, and manage connections in `siesta.json` / `siesta.private.json`. Use when the user asks to query a database, check data, explore tables, run or fix a `.sql` file, or set up a database connection, and `siesta` is installed or the project has `.sql` files or a `siesta.json`.
+description: Run SQL against Postgres and MySQL / MariaDB with the Siesta CLI and plain `.sql` files, inspect a database schema (tables, columns, indexes, DDL) before writing queries, and manage connections in `~/.config/siesta/connections/`. Use when the user asks to query a database, check data, explore tables, run or fix a `.sql` file, or set up a database connection, and `siesta` is installed or the project has `.sql` files.
 ---
 
 # Siesta: SQL files and a database CLI
@@ -18,8 +18,9 @@ From an agent, use the CLI only; never launch the GUI.
   boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
-- Never write passwords into `siesta.json`; they belong in the system keychain (`"password": "${keychain}"`),
-  `siesta.private.json` (git-ignored) or `${env:NAME}`. `siesta connections` shows connections with secrets masked.
+- Never write passwords into a connection file; they live only in the system keychain
+  (`siesta connections set-password NAME`, done by the user). `siesta connections` shows connections
+  with secrets masked and whether a password is set.
 - Results are capped at 100 rows by default; check `rows_truncated`. Narrow the query
   (`WHERE`, `LIMIT`, `count(*)`, aggregates) instead of raising `--max-rows` for a big table.
 
@@ -32,19 +33,14 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 | `siesta list [PATH]` | Statements in a `.sql` file or directory: file, line, name, first line, kind |
 | `siesta run FILE [STATEMENTS]...` | Run statements of a file (none named = all, in file order) |
 | `siesta exec [SQL]` | Run SQL from the argument, or from stdin when omitted or `-`; may hold several statements |
-| `siesta connections` | Connections visible from the current directory, secrets masked |
+| `siesta connections` | Connections of `~/.config/siesta/connections/`, secrets masked, with `password: set` / `none` |
 | `siesta connections list` | The same as `siesta connections` |
 | `siesta connections test NAME` | Open a connection and report the server version |
-| `siesta connections set-password NAME` | Store the password of a `${keychain}` connection in the system keychain (hidden prompt, or one line from stdin); the user does this, not you |
+| `siesta connections set-password NAME` | Store the password of a connection in the system keychain (hidden prompt, or one line from stdin); the user does this, not you |
 | `siesta schema [TABLE]` | Every table and view, or one table (`table` or `schema.table`) with columns and indexes |
 
 `list`, `run`, `exec`, `connections` and `schema` take `--output table|json|jsonl|csv`
 (`table` in a terminal, `json` in a pipe).
-
-`--connections-file PATH` adds a connection file above the `siesta*.json` chain (repeatable);
-`list`, `run`, `exec`, `connections` and `schema` accept it. `connections`, `exec` and `schema` look
-for `siesta.json` from the current directory up to the project root (the nearest folder with
-`.git` or `.siesta`), so run them from inside the project.
 
 `run` and `exec` options:
 
@@ -136,30 +132,28 @@ DELETE FROM sessions WHERE expires_at < now();
 
 ## Connections
 
-Plain JSON, committed without secrets, with secrets in a private file next to it:
+One JSON file per connection in the user's config dir, `~/.config/siesta/connections/NAME.json`
+(the file name is the connection name; the desktop app's "New connection" form writes it). There are no
+project-level connection files.
 
 ```jsonc
-// siesta.json
-{ "dev-pg": { "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" },
-  "prod-mysql": { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true } }
-// siesta.private.json (git-ignored)
-{ "dev-pg": { "password": "dev" }, "prod-mysql": { "password": "${env:SHOP_DB_PASSWORD}" } }
+// ~/.config/siesta/connections/dev-pg.json
+{ "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" }
+// ~/.config/siesta/connections/prod-mysql.json
+{ "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
 ```
 
 - Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database` /
-  `user` / `password`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
+  `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
-- `${env:NAME}` reads the environment, `${dotenv:NAME}` the `.env` next to the file.
-- `"password": "${keychain}"` reads the password from the OS keychain (service `siesta`, account = the
-  connection name) only when a session opens; `${keychain:ACCOUNT}` names the account, so a committed
-  `siesta.json` can share the marker while each developer stores their own password
-  (`siesta connections set-password NAME`). A missing entry is a connection error (exit `2`: "No password
-  for `NAME` in the system keychain"): ask the user to run `set-password`; never type a password yourself.
-- Files are found in every folder from the project root down to the `.sql` file; deeper folders and
-  the private file win. The user's global connections (`~/.config/siesta/connections.json` and
-  `connections.private.json`, written by the desktop app's "New connection" form) are read first, so a
-  project's `siesta.json` overrides a global connection of the same name.
-- Check with `siesta connections`, then `siesta connections test NAME`.
+  There is no `password` key.
+- `${env:NAME}` reads the environment.
+- The password lives only in the OS keychain (service `siesta`, account = the connection name), read when
+  a session opens; the user sets it in the connection form or with `siesta connections set-password NAME`.
+  Without an entry Siesta connects without a password; if the server then rejects the login, the error says
+  to set one (exit `2`): ask the user to run `set-password`; never type a password yourself.
+- Check with `siesta connections`, then `siesta connections test NAME`. The environment variable
+  `SIESTA_CONFIG_DIR` replaces `~/.config/siesta`.
 
 ## Safety
 

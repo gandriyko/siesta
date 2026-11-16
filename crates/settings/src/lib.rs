@@ -70,7 +70,6 @@ pub struct Settings {
     pub editor: Editor,
     pub results: Results,
     pub run: Run,
-    pub connections: Connections,
     pub history: History,
 }
 
@@ -109,13 +108,6 @@ pub struct Run {
     pub statement_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct Connections {
-    /// Extra connection files above the chain; `~/` is the home directory, relative = workspace root.
-    pub files: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct History {
@@ -136,7 +128,6 @@ impl Default for Settings {
             editor: Editor::default(),
             results: Results::default(),
             run: Run::default(),
-            connections: Connections::default(),
             history: History::default(),
         }
     }
@@ -163,14 +154,6 @@ impl Default for Run {
 impl Default for History {
     fn default() -> Self {
         Self { total: 500 }
-    }
-}
-
-impl Settings {
-    /// `connections.files` as paths (`~/` → home, relative → `root`).
-    pub fn connection_files(&self, root: &Path) -> Vec<PathBuf> {
-        let home = std::env::home_dir().unwrap_or_default();
-        self.connections.files.iter().map(|p| p.strip_prefix("~/").map_or_else(|| root.join(p), |rest| home.join(rest))).collect()
     }
 }
 
@@ -323,14 +306,5 @@ mod tests {
         let l = Loaded::load_from(None, Some(w));
         assert_eq!(l.errors.len(), 1);
         assert_eq!(l.settings, Settings::default());
-    }
-
-    #[test]
-    fn connection_files() {
-        let mut s = Settings::default();
-        s.connections.files = vec!["~/x/siesta.json".into(), "db/siesta.json".into()];
-        let files = s.connection_files(Path::new("/ws"));
-        assert_eq!(files[1], Path::new("/ws/db/siesta.json"));
-        assert!(files[0].ends_with("x/siesta.json") && files[0].is_absolute());
     }
 }

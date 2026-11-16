@@ -1,12 +1,10 @@
-//! Connections: finds and merges `siesta.json` / `siesta.private.json`, resolves `${env:}` / `${dotenv:}`.
+//! Connections: one JSON file per connection in `<config dir>/connections/<name>.json`
+//! (`~/.config/siesta` unless `SIESTA_CONFIG_DIR` says otherwise); the file name is the connection name.
 //!
-//! Files are read first from the global config dir (`~/.config/siesta/connections.json`, then
-//! `connections.private.json`), then from the workspace root down to the `.sql` file's folder (public,
-//! then private in each folder), then the extra files; later ones win, so a repo's `siesta.json`
-//! overrides a global connection of the same name. Merging is per connection key, field by field
-//! (`ssl` deeply). A broken connection lands in `errors`, a broken file in `warnings`; the rest loads.
-//! Variables are resolved, and relative `ssl` paths made absolute, per file before merging, so
-//! `.env` and relative paths belong to the file that holds the value.
+//! A file holds driver, url | host / port / database / user, ssl, read_only, prod, schema, init_sql, color.
+//! Values may use `${env:NAME}`. There is no password key: the password lives only in the system
+//! keychain (`secrets`, service `siesta`, account = connection name), read when a session opens.
+//! A broken connection lands in `errors`, a suspicious key in `warnings`; the rest loads.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,40 +12,38 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 mod global;
+mod legacy;
 pub mod secrets;
-mod workspace;
-pub use global::{ConnectionForm,delete_global, global_names, read_global_form, save_global};
-pub use workspace::{WorkspacePassword, add_to_gitignore, password_override, private_file_of, set_workspace_password, workspace_def_file};
+pub use global::{ConnectionForm, delete, names, read_form, save};
+pub use legacy::migrate;
 
-/// `${keychain}` is `Some(None)` (the account is the connection name), `${keychain:ACCOUNT}` is
-/// `Some(Some(ACCOUNT))`; anything else is not a marker.
-fn keychain_marker(s: &str) -> Option<Option<&str>> {
-    let inner = s.trim().strip_prefix("${")?.strip_suffix('}')?.trim();
-    match inner.split_once(':') {
-        None if inner == "keychain" => Some(None),
-        Some(("keychain", a)) if !a.trim().is_empty() => Some(Some(a.trim())),
-        _ => None,
-    }
-}
+const KEYS: [&str; 12] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
+const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
 
-/// The marker as written to JSON: the short form when the account is the connection name.
-fn marker_text(account: &str, name: &str) -> String {
-    if account == name { "${keychain}".into() } else { format!("${{keychain:{account}}}") }
-}
-
-const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "password", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
-const GLOBAL_PUBLIC: &str = "connections.json";
-const GLOBAL_PRIVATE: &str = "connections.private.json";
-
-/// `~/.config/siesta`, where global connections (and the settings) live; `SIESTA_CONFIG_DIR`
-/// overrides it (tests, sandboxes).
+/// `~/.config/siesta`, where connections (and the settings) live; `SIESTA_CONFIG_DIR` overrides it
+/// (tests, sandboxes).
 pub fn global_dir() -> Option<PathBuf> {
     match std::env::var_os("SIESTA_CONFIG_DIR") {
         Some(d) if !d.is_empty() => Some(d.into()),
         _ => Some(std::env::home_dir()?.join(".config/siesta")),
     }
 }
-const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
+
+/// The folder of the per-connection files inside the config dir.
+pub fn connections_dir(config: &Path) -> PathBuf {
+    config.join("connections")
+}
+
+/// A connection name is a file name: no path separators, no leading dot, no control characters.
+pub fn valid_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        Err("name is required".into())
+    } else if name != name.trim() || name.starts_with('.') || name.contains(['/', '\\']) || name.chars().any(char::is_control) {
+        Err(format!("invalid connection name '{name}': no / or \\, no leading dot, no control characters"))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Driver {
@@ -69,7 +65,7 @@ pub enum SslMode {
 pub struct Ssl {
     /// `None`: the driver's default.
     pub mode: Option<SslMode>,
-    /// Absolute (relative paths were resolved against the file that set them).
+    /// Absolute (relative paths are resolved against the connections folder).
     pub ca: Option<PathBuf>,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
@@ -84,10 +80,9 @@ pub struct Connection {
     pub port: Option<u16>,
     pub database: Option<String>,
     pub user: Option<String>,
+    /// `None` after loading: the keychain is read only when a session opens (see
+    /// [`Connection::resolve_password`]). Set by the form's Test with a typed password.
     pub password: Option<String>,
-    /// The account of a `"${keychain}"` / `"${keychain:ACCOUNT}"` password, read from the system
-    /// keychain only when a session opens (see [`Connection::resolve_password`]); `password` is `None` then.
-    pub keychain: Option<String>,
     pub ssl: Ssl,
     pub read_only: bool,
     /// A production connection: red, and every run asks for confirmation.
@@ -99,19 +94,22 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// A copy with the password read from the system keychain (when it is a `${keychain}` one).
+    /// Whether a password is already known: set explicitly or written in the url.
+    pub fn has_password(&self) -> bool {
+        self.password.is_some() || self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
+    }
+
+    /// A copy with the password read from the system keychain (account = connection name) when none
+    /// is known yet. No entry (or no keychain) means no password: some local databases need none.
     /// Call right before connecting: on macOS a read may prompt, so loading never does it.
     pub fn resolve_password(&self) -> Result<Connection, String> {
         let mut c = self.clone();
-        if let Some(account) = &self.keychain {
-            c.password = Some(secrets::get(account).map_err(|e| match e {
-                secrets::SecretError::Missing => format!(
-                    "No password for `{}` in the system keychain (service `{}`, account `{account}`). Edit the connection to set it.",
-                    self.name,
-                    secrets::SERVICE
-                ),
-                e => e.to_string(),
-            })?);
+        if !c.has_password() {
+            match secrets::get(&self.name) {
+                Ok(p) => c.password = Some(p),
+                Err(secrets::SecretError::Missing | secrets::SecretError::Unavailable(_)) => {}
+                Err(e) => return Err(e.to_string()),
+            }
         }
         Ok(c)
     }
@@ -122,8 +120,8 @@ impl Connection {
     }
 
     /// A stable id of the server this connection points at (driver, url without its password,
-    /// host, port, database, user), for caches that must not mix two connections that merely
-    /// share a name (the same name in two `siesta.json` files). FNV-1a: stable across Rust versions.
+    /// host, port, database, user), for caches that must not mix a connection with another one
+    /// that was later saved under the same name. FNV-1a: stable across Rust versions.
     pub fn fingerprint(&self) -> u64 {
         let parts = [
             Some(if self.driver == Driver::Postgres { "postgres" } else { "mysql" }.to_string()),
@@ -150,55 +148,29 @@ pub struct Connections {
     pub connections: BTreeMap<String, Connection>,
     /// Connections that could not be built (unresolved variable, no driver, bad value).
     pub errors: BTreeMap<String, String>,
-    /// Every file that defines the name, lowest priority first (also for names in `errors`).
-    pub sources: BTreeMap<String, Vec<PathBuf>>,
-    /// Non-fatal: invalid JSON (file skipped), unknown keys, literal password in a public file.
+    /// Non-fatal: invalid JSON (file skipped), unknown keys, migration notes.
     pub warnings: Vec<String>,
 }
 
 impl Connections {
-    /// The global files of `global` (if any), then files from `root` down to the `.sql` file's folder,
-    /// then `extra` (`~` expanded), later ones overriding earlier ones.
-    pub fn load(sql_file: &Path, root: &Path, extra: &[PathBuf], global: Option<&Path>) -> Self {
-        let dir = sql_file.parent().unwrap_or(root);
-        let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| d.starts_with(root)).collect();
-        if dirs.is_empty() {
-            dirs.push(dir);
-        }
-        dirs.reverse();
-        let mut files: Vec<(PathBuf, bool)> = global.into_iter().flat_map(|d| [(d.join(GLOBAL_PUBLIC), false), (d.join(GLOBAL_PRIVATE), true)]).collect();
-        files.extend(dirs.iter().flat_map(|d| [(d.join("siesta.json"), false), (d.join("siesta.private.json"), true)]));
-        // An extra file counts as public only when it is named like the public one.
-        files.extend(extra.iter().map(|p| {
-            let p = expand_home(p);
-            let private = p.file_name().is_none_or(|n| n != "siesta.json");
-            (p, private)
-        }));
-
-        let mut out = Self::default();
-        let mut merged: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
-        for (path, private) in files {
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let json = match serde_json::from_str::<Map<String, Value>>(&text) {
-                Ok(j) => j,
+    /// Reads `<config>/connections/*.json` (after the one-time migration of an old `connections.json`).
+    pub fn load(config: &Path) -> Self {
+        let mut out = Self { warnings: migrate(config), ..Default::default() };
+        let dir = connections_dir(config);
+        for name in names(config) {
+            let path = dir.join(format!("{name}.json"));
+            let obj = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())) {
+                Ok(Value::Object(o)) => o,
+                Ok(_) => {
+                    out.warnings.push(format!("{}: not a JSON object, skipped", path.display()));
+                    continue;
+                }
                 Err(e) => {
                     out.warnings.push(format!("{}: invalid JSON, skipped: {e}", path.display()));
                     continue;
                 }
             };
-            let fdir = path.parent().unwrap_or(Path::new("."));
-            for (name, v) in json {
-                let Value::Object(obj) = v else {
-                    out.warnings.push(format!("{}: '{name}' is not an object, skipped", path.display()));
-                    continue;
-                };
-                let fields = read_entry(&obj, fdir, private, &path, &name, &mut out.warnings);
-                out.sources.entry(name.clone()).or_default().push(path.clone());
-                merge(merged.entry(name).or_default(), fields);
-            }
-        }
-        for (name, fields) in merged {
-            match build(&name, &fields) {
+            match parse(&name, &obj, &dir, &mut out.warnings) {
                 Ok(c) => {
                     out.connections.insert(name, c);
                 }
@@ -222,7 +194,7 @@ pub fn workspace_root(file: &Path) -> PathBuf {
     dir.ancestors().find(|d| d.join(".git").exists() || d.join(".siesta").exists()).unwrap_or(dir).to_path_buf()
 }
 
-/// The connection as JSON for CLI output: `password` and the password inside `url` become `***`.
+/// The connection as JSON for CLI output: the password inside `url` becomes `***`.
 pub fn masked(c: &Connection) -> Value {
     let mut m = Map::new();
     let mut put = |k: &str, v: Option<Value>| {
@@ -239,8 +211,6 @@ pub fn masked(c: &Connection) -> Value {
     put("port", c.port.map(Value::from));
     put("database", s(&c.database));
     put("user", s(&c.user));
-    // The marker is not a secret; a literal password is.
-    put("password", c.keychain.as_ref().map(|a| marker_text(a, &c.name).into()).or(c.password.as_ref().map(|_| "***".into())));
     let mut ssl = Map::new();
     if let Some(mode) = c.ssl.mode {
         ssl.insert("mode".into(), mode_name(mode).into());
@@ -307,79 +277,8 @@ fn expand_home(p: &Path) -> PathBuf {
     }
 }
 
-/// Merges one file's fields over the earlier ones; `ssl` field by field.
-fn merge(into: &mut Map<String, Value>, from: Map<String, Value>) {
-    for (k, v) in from {
-        match (into.get_mut(&k), v) {
-            (Some(Value::Object(old)), Value::Object(new)) if k == "ssl" => old.extend(new),
-            (_, v) => {
-                into.insert(k, v);
-            }
-        }
-    }
-}
-
-/// One connection of one file: variables substituted, ssl paths made absolute, warnings noted.
-fn read_entry(obj: &Map<String, Value>, dir: &Path, private: bool, file: &Path, name: &str, warnings: &mut Vec<String>) -> Map<String, Value> {
-    let mut out = Map::new();
-    for (k, v) in obj {
-        if !KEYS.contains(&k.as_str()) {
-            warnings.push(format!("{}: '{name}': unknown key '{k}'", file.display()));
-            continue;
-        }
-        let literal = |s: &str| !s.contains("${");
-        match (k.as_str(), v) {
-            ("password", Value::String(s)) if keychain_marker(s).is_some() => {
-                let account = keychain_marker(s).flatten().unwrap_or(name);
-                out.insert(k.clone(), Map::from_iter([("$keychain".to_string(), account.into())]).into());
-            }
-            ("ssl", Value::Object(ssl)) => {
-                let mut o = Map::new();
-                for (sk, sv) in ssl {
-                    if !SSL_KEYS.contains(&sk.as_str()) {
-                        warnings.push(format!("{}: '{name}': unknown key 'ssl.{sk}'", file.display()));
-                        continue;
-                    }
-                    let mut sv = subst_value(sv, dir);
-                    if let (true, Value::String(p)) = (sk != "mode", &sv) {
-                        let p = expand_home(Path::new(p));
-                        sv = dir.join(p).to_string_lossy().into_owned().into();
-                    }
-                    o.insert(sk.clone(), sv);
-                }
-                out.insert(k.clone(), o.into());
-            }
-            ("password", Value::String(s)) if !private && !s.is_empty() && literal(s) => {
-                warnings.push(format!("{}: '{name}': literal password in a public file, move it to siesta.private.json", file.display()));
-                out.insert(k.clone(), subst_value(v, dir));
-            }
-            ("url", Value::String(u)) if !private && url_passwords(u).into_iter().any(|r| literal(&u[r])) => {
-                warnings.push(format!("{}: '{name}': literal password in url of a public file, move it to siesta.private.json", file.display()));
-                out.insert(k.clone(), subst_value(v, dir));
-            }
-            _ => {
-                out.insert(k.clone(), subst_value(v, dir));
-            }
-        }
-    }
-    out
-}
-
-/// A failed substitution becomes `{"$unresolved": message}`: a later file setting the same field
-/// replaces it, and `build` fails the connection only if it survives the merge.
-fn subst_value(v: &Value, dir: &Path) -> Value {
-    match v {
-        Value::String(s) => subst(s, dir).map_or_else(|e| Value::Object(Map::from_iter([("$unresolved".to_string(), e.into())])), Value::String),
-        other => other.clone(),
-    }
-}
-
-fn unresolved(v: &Value) -> Option<&str> {
-    v.as_object()?.get("$unresolved")?.as_str()
-}
-
-/// `${env:NAME}` from the process, `${dotenv:NAME}` from `.env` in `dir`.
-fn subst(text: &str, dir: &Path) -> Result<String, String> {
+/// `${env:NAME}` from the process environment.
+fn subst(text: &str) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("${") {
@@ -388,7 +287,6 @@ fn subst(text: &str, dir: &Path) -> Result<String, String> {
         let expr = rest[open + 2..close].trim();
         let value = match expr.split_once(':') {
             Some(("env", n)) => std::env::var(n.trim()).ok(),
-            Some(("dotenv", n)) => dotenvy::from_path_iter(dir.join(".env")).ok().and_then(|it| it.flatten().find(|(k, _)| k == n.trim()).map(|(_, v)| v)),
             _ => return Err(format!("unsupported variable '${{{expr}}}'")),
         };
         out.push_str(&value.ok_or_else(|| format!("unresolved variable '${{{expr}}}'"))?);
@@ -411,11 +309,45 @@ fn parse_driver(driver: Option<&str>, url: Option<&str>) -> Result<Driver, Strin
     })
 }
 
-fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
-    let ssl_fields = f.get("ssl").and_then(Value::as_object).into_iter().flatten();
-    if let Some(e) = f.values().chain(ssl_fields.map(|(_, v)| v)).find_map(unresolved) {
-        return Err(e.to_string());
+/// One connection's JSON object: unknown keys noted, `${env:}` substituted, ssl paths made absolute
+/// (relative ones against `dir`), values checked. `password` is not a key (the keychain holds it).
+fn parse(name: &str, obj: &Map<String, Value>, dir: &Path, warnings: &mut Vec<String>) -> Result<Connection, String> {
+    let at = || dir.join(format!("{name}.json")).display().to_string();
+    let mut f = Map::new();
+    for (k, v) in obj {
+        if k == "password" {
+            warnings.push(format!("{}: 'password' is ignored: passwords live in the system keychain", at()));
+        } else if !KEYS.contains(&k.as_str()) {
+            warnings.push(format!("{}: unknown key '{k}'", at()));
+        } else if let (Value::Object(ssl), "ssl") = (v, k.as_str()) {
+            let mut o = Map::new();
+            for (sk, sv) in ssl {
+                if !SSL_KEYS.contains(&sk.as_str()) {
+                    warnings.push(format!("{}: unknown key 'ssl.{sk}'", at()));
+                    continue;
+                }
+                let mut sv = subst_value(sv)?;
+                if let (true, Value::String(p)) = (sk != "mode", &sv) {
+                    sv = dir.join(expand_home(Path::new(p))).to_string_lossy().into_owned().into();
+                }
+                o.insert(sk.clone(), sv);
+            }
+            f.insert(k.clone(), o.into());
+        } else {
+            f.insert(k.clone(), subst_value(v)?);
+        }
     }
+    build(name, &f)
+}
+
+fn subst_value(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::String(s) => subst(s).map(Value::String),
+        other => Ok(other.clone()),
+    }
+}
+
+fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
     let str_of = |k: &str| match f.get(k) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
@@ -435,8 +367,6 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         Some(_) => Err(format!("'{k}' must be true or false")),
     };
     let (read_only, prod) = (flag("read_only")?, flag("prod")?);
-    let keychain = f.get("password").and_then(|v| v.get("$keychain")).and_then(Value::as_str).map(String::from);
-    let password = if keychain.is_some() { None } else { str_of("password")? };
     let mut ssl = Ssl::default();
     if let Some(Value::Object(o)) = f.get("ssl") {
         let path = |k: &str| o.get(k).and_then(Value::as_str).map(PathBuf::from);
@@ -459,8 +389,7 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         port,
         database: str_of("database")?,
         user: str_of("user")?,
-        password,
-        keychain,
+        password: None,
         ssl,
         read_only,
         prod,
@@ -475,143 +404,74 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn load(root: &Path, file: &str) -> Connections {
-        Connections::load(&root.join(file), root, &[], None)
+    /// A config dir with one connection file per `(name, json)`.
+    fn config(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(connections_dir(tmp.path())).unwrap();
+        for (n, j) in files {
+            fs::write(connections_dir(tmp.path()).join(format!("{n}.json")), j).unwrap();
+        }
+        tmp
     }
 
     #[test]
-    fn keychain_markers_resolve_lazily_and_mask() {
-        secrets::use_memory_store();
-        assert_eq!((keychain_marker("${keychain}"), keychain_marker(" ${keychain: a b }"), keychain_marker("${keychain:}"), keychain_marker("${env:X}"), keychain_marker("pw")), (Some(None), Some(Some("a b")), None, None, None));
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        // The marker is fine in a public file (no "literal password" warning).
-        fs::write(r.join("siesta.json"), r#"{"kc-lazy": {"driver": "postgres", "host": "h", "password": "${keychain}"}, "kc-team": {"driver": "postgres", "host": "h", "password": "${keychain:kc-shared}"}}"#).unwrap();
-        let c = load(r, "q.sql");
-        assert!(c.warnings.is_empty() && c.errors.is_empty(), "{:?} {:?}", c.warnings, c.errors);
-        let (lazy, team) = (&c.connections["kc-lazy"], &c.connections["kc-team"]);
-        assert_eq!((lazy.keychain.as_deref(), lazy.password.as_deref(), team.keychain.as_deref()), (Some("kc-lazy"), None, Some("kc-shared")));
-        // Nothing stored yet: a clear error naming the account.
-        let e = lazy.resolve_password().unwrap_err();
-        assert_eq!(e, "No password for `kc-lazy` in the system keychain (service `siesta`, account `kc-lazy`). Edit the connection to set it.");
-        secrets::set("kc-lazy", "pw1").unwrap();
-        secrets::set("kc-shared", "pw2").unwrap();
-        assert_eq!((lazy.resolve_password().unwrap().password.as_deref(), team.resolve_password().unwrap().password.as_deref()), (Some("pw1"), Some("pw2")));
-        // `masked` shows the marker as written, not a secret.
-        assert_eq!((masked(lazy)["password"].as_str(), masked(team)["password"].as_str()), (Some("${keychain}"), Some("${keychain:kc-shared}")));
-        // A later file's literal password replaces the marker.
-        fs::write(r.join("siesta.private.json"), r#"{"kc-lazy": {"password": "lit"}}"#).unwrap();
-        let c = load(r, "q.sql");
-        assert_eq!((c.connections["kc-lazy"].keychain.clone(), c.connections["kc-lazy"].password.as_deref()), (None, Some("lit")));
-        assert_eq!(masked(&c.connections["kc-lazy"])["password"], "***");
-    }
-
-    #[test]
-    fn chain_merge_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::create_dir_all(r.join("svc")).unwrap();
-        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "postgres", "host": "root", "port": 1, "user": "u"}}"#).unwrap();
-        fs::write(r.join("siesta.private.json"), r#"{"a": {"host": "root-private", "password": "p"}}"#).unwrap();
-        fs::write(r.join("svc/siesta.json"), r#"{"a": {"port": 2}, "b": {"driver": "mysql"}}"#).unwrap();
-        let c = load(r, "svc/q.sql");
-        let a = &c.connections["a"];
-        assert_eq!((a.host.as_deref(), a.port, a.user.as_deref(), a.password.as_deref()), (Some("root-private"), Some(2), Some("u"), Some("p")));
+    fn loads_one_file_per_connection_and_parses_prod() {
+        let t = config(&[("a", r#"{"driver": "postgres", "host": "h", "port": 5, "prod": true, "read_only": true, "schema": "app"}"#), ("b", r#"{"driver": "mysql"}"#)]);
+        fs::write(connections_dir(t.path()).join("notes.txt"), "x").unwrap();
+        fs::write(connections_dir(t.path()).join(".hidden.json"), "{}").unwrap();
+        let c = Connections::load(t.path());
         assert_eq!(c.names(), ["a", "b"]);
-        // From the root folder the leaf's connections are not visible.
-        assert_eq!(load(r, "q.sql").names(), ["a"]);
-        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
-
-        // Extra files come last.
-        let extra = r.join("extra.private.json");
-        fs::write(&extra, r#"{"a": {"host": "extra"}}"#).unwrap();
-        let c = Connections::load(&r.join("svc/q.sql"), r, &[extra], None);
-        assert_eq!(c.connections["a"].host.as_deref(), Some("extra"));
-    }
-
-    #[test]
-    fn global_files_come_first_and_prod_parses() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (g, r) = (tmp.path().join("cfg"), tmp.path().join("repo"));
-        fs::create_dir_all(&g).unwrap();
-        fs::create_dir_all(&r).unwrap();
-        fs::write(g.join("connections.json"), r#"{"a": {"driver": "postgres", "host": "global", "prod": true}, "g": {"driver": "mysql", "password": "lit"}}"#).unwrap();
-        fs::write(g.join("connections.private.json"), r#"{"a": {"password": "gp"}, "g": {"password": "from-private"}}"#).unwrap();
-        fs::write(r.join("siesta.json"), r#"{"a": {"host": "repo"}}"#).unwrap();
-        let c = Connections::load(&r.join("q.sql"), &r, &[], Some(&g));
         let a = &c.connections["a"];
-        assert_eq!((a.host.as_deref(), a.password.as_deref(), a.prod), (Some("repo"), Some("gp"), true));
-        assert_eq!(c.sources["a"].len(), 3);
-        assert_eq!(c.connections["g"].password.as_deref(), Some("from-private"));
-        // The literal-password warning does not apply to the global private file (the public one still warns).
-        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
-        assert!(c.warnings[0].contains("'g': literal password"));
-        assert!(!Connections::load(&r.join("q.sql"), &r, &[], None).connections.contains_key("g"));
-        fs::write(r.join("siesta.json"), r#"{"a": {"prod": "yes"}}"#).unwrap();
-        assert!(Connections::load(&r.join("q.sql"), &r, &[], Some(&g)).errors["a"].contains("'prod'"));
+        assert_eq!((a.host.as_deref(), a.port, a.prod, a.read_only, a.password.as_deref()), (Some("h"), Some(5), true, true, None));
+        assert!(c.warnings.is_empty() && c.errors.is_empty(), "{:?} {:?}", c.warnings, c.errors);
+        assert!(Connections::load(&t.path().join("missing")).connections.is_empty());
+        fs::write(connections_dir(t.path()).join("a.json"), r#"{"driver": "postgres", "prod": "yes"}"#).unwrap();
+        assert!(Connections::load(t.path()).errors["a"].contains("'prod'"));
     }
 
     #[test]
-    fn ssl_merge_and_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::create_dir_all(r.join("svc")).unwrap();
-        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "mysql", "ssl": {"mode": "verify-full", "ca": "./certs/ca.pem"}}}"#).unwrap();
-        fs::write(r.join("svc/siesta.private.json"), r#"{"a": {"ssl": {"cert": "c.pem", "key": "/abs/k.pem", "mode": "require"}}}"#).unwrap();
-        let ssl = &load(r, "svc/q.sql").connections["a"].ssl;
-        assert_eq!(ssl.mode, Some(SslMode::Require));
-        assert_eq!(ssl.ca, Some(r.join("./certs/ca.pem")));
-        assert_eq!(ssl.cert, Some(r.join("svc/c.pem")));
-        assert_eq!(ssl.key, Some(PathBuf::from("/abs/k.pem")));
+    fn password_comes_from_the_keychain_by_name() {
+        secrets::use_memory_store();
+        let t = config(&[("kc-lazy", r#"{"driver": "postgres", "host": "h"}"#), ("kc-url", r#"{"url": "postgres://u:pw@h/db"}"#)]);
+        let c = Connections::load(t.path());
+        let lazy = &c.connections["kc-lazy"];
+        // Nothing stored: no password, no error (some local databases need none).
+        assert_eq!(lazy.resolve_password().unwrap().password, None);
+        secrets::set("kc-lazy", "pw1").unwrap();
+        assert_eq!(lazy.resolve_password().unwrap().password.as_deref(), Some("pw1"));
+        // A password in the url wins; the keychain is not consulted.
+        secrets::set("kc-url", "other").unwrap();
+        assert_eq!(c.connections["kc-url"].resolve_password().unwrap().password, None);
+        // Unavailable keychain: connect without a password.
+        secrets::set_unavailable(true);
+        let r = lazy.resolve_password();
+        secrets::set_unavailable(false);
+        assert_eq!(r.unwrap().password, None);
     }
 
     #[test]
-    fn env_and_dotenv() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::create_dir_all(r.join("svc")).unwrap();
-        fs::write(r.join("svc/.env"), "DB_PASS=from-dotenv\n").unwrap();
-        fs::write(r.join(".env"), "DB_PASS=wrong\n").unwrap();
-        fs::write(r.join("svc/siesta.private.json"), r#"{"a": {"driver": "postgres", "password": "${dotenv:DB_PASS}", "user": "${env:PATH}"}}"#).unwrap();
-        let c = load(r, "svc/q.sql");
-        let a = &c.connections["a"];
-        assert_eq!(a.password.as_deref(), Some("from-dotenv"));
-        assert_eq!(a.user, std::env::var("PATH").ok());
+    fn ssl_paths_resolve_against_the_connections_folder() {
+        let t = config(&[("a", r#"{"driver": "mysql", "ssl": {"mode": "verify-full", "ca": "./certs/ca.pem", "cert": "c.pem", "key": "/abs/k.pem"}}"#)]);
+        let ssl = &Connections::load(t.path()).connections["a"].ssl;
+        let d = connections_dir(t.path());
+        assert_eq!(ssl.mode, Some(SslMode::VerifyFull));
+        assert_eq!((ssl.ca.clone(), ssl.cert.clone(), ssl.key.clone()), (Some(d.join("./certs/ca.pem")), Some(d.join("c.pem")), Some(PathBuf::from("/abs/k.pem"))));
     }
 
     #[test]
-    fn unresolved_variable_fails_only_that_connection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::write(r.join("siesta.private.json"), r#"{"bad": {"driver": "mysql", "password": "${env:SIESTA_TEST_SURELY_UNSET}"}, "ok": {"driver": "mysql"}, "nodot": {"driver": "mysql", "user": "${dotenv:X}"}}"#).unwrap();
-        let c = load(r, "q.sql");
-        assert_eq!(c.names(), ["ok"]);
+    fn env_variables() {
+        let t = config(&[("a", r#"{"url": "postgres://u:${env:PATH}@h/db", "user": "${env:PATH}"}"#), ("bad", r#"{"driver": "mysql", "user": "${env:SIESTA_TEST_SURELY_UNSET}"}"#), ("dot", r#"{"driver": "mysql", "user": "${dotenv:X}"}"#), ("ok", r#"{"driver": "mysql"}"#)]);
+        let c = Connections::load(t.path());
+        assert_eq!(c.connections["a"].user, std::env::var("PATH").ok());
+        assert_eq!(c.names(), ["a", "ok"]);
         assert!(c.errors["bad"].contains("SIESTA_TEST_SURELY_UNSET"), "{}", c.errors["bad"]);
-        assert!(c.errors["nodot"].contains("dotenv:X"));
-    }
-
-    #[test]
-    fn unresolved_variable_overridden_by_later_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "mysql", "password": "${env:SIESTA_TEST_SURELY_UNSET}", "ssl": {"ca": "${env:SIESTA_TEST_SURELY_UNSET}"}}}"#).unwrap();
-        assert!(load(r, "q.sql").errors["a"].contains("SIESTA_TEST_SURELY_UNSET"));
-        fs::write(r.join("siesta.private.json"), r#"{"a": {"password": "lit", "ssl": {"ca": "ca.pem"}}}"#).unwrap();
-        let c = load(r, "q.sql");
-        assert!(c.errors.is_empty(), "{:?}", c.errors);
-        assert_eq!(c.connections["a"].password.as_deref(), Some("lit"));
+        assert!(c.errors["dot"].contains("unsupported variable"), "{}", c.errors["dot"]);
     }
 
     #[test]
     fn driver_from_url_and_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::write(
-            r.join("siesta.json"),
-            r#"{"p": {"url": "postgresql://h/db"}, "m": {"url": "mariadb://h/db"}, "n": {"host": "h"}, "x": {"driver": "oracle"}}"#,
-        )
-        .unwrap();
-        let c = load(r, "q.sql");
+        let t = config(&[("p", r#"{"url": "postgresql://h/db"}"#), ("m", r#"{"url": "mariadb://h/db"}"#), ("n", r#"{"host": "h"}"#), ("x", r#"{"driver": "oracle"}"#)]);
+        let c = Connections::load(t.path());
         assert_eq!((c.connections["p"].driver, c.connections["m"].driver), (Driver::Postgres, Driver::MySql));
         assert!(c.errors["n"].contains("no driver"));
         assert!(c.errors["x"].contains("oracle"));
@@ -619,32 +479,31 @@ mod tests {
 
     #[test]
     fn warnings() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::create_dir_all(r.join("svc")).unwrap();
-        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "postgres", "password": "hunter2", "colour": "red"}, "b": {"url": "mysql://u:pw@h/d"}, "c": {"driver": "mysql", "password": "${env:PATH}"}}"#).unwrap();
-        fs::write(r.join("siesta.private.json"), r#"{"a": {"password": "fine"}}"#).unwrap();
-        fs::write(r.join("svc/siesta.json"), "{ not json").unwrap();
-        let c = load(r, "svc/q.sql");
+        let t = config(&[("a", r#"{"driver": "postgres", "colour": "red", "password": "x", "ssl": {"cA": "x"}}"#), ("broken", "{ not json"), ("arr", "[]")]);
+        let c = Connections::load(t.path());
         let w = c.warnings.join("\n");
-        assert!(w.contains("'a': literal password"), "{w}");
-        assert!(w.contains("'b': literal password in url"), "{w}");
-        assert!(!w.contains("'c'"), "{w}");
-        assert!(w.contains("unknown key 'colour'"), "{w}");
-        assert!(w.contains("svc/siesta.json") && w.contains("invalid JSON"), "{w}");
-        // The rest still loaded.
-        assert_eq!(c.connections["a"].password.as_deref(), Some("fine"));
+        assert!(w.contains("unknown key 'colour'") && w.contains("'password' is ignored") && w.contains("ssl.cA"), "{w}");
+        assert!(w.contains("broken.json") && w.contains("invalid JSON") && w.contains("arr.json"), "{w}");
+        // The rest still loaded, and the password did not.
+        assert_eq!(c.connections["a"].password, None);
+    }
+
+    #[test]
+    fn names_are_file_names() {
+        for ok in ["dev", "my db", "prod-eu_1", "ключ"] {
+            assert!(valid_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", " ", "a/b", "a\\b", ".x", " x", "x ", "a\nb"] {
+            assert!(valid_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
     fn masking() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::write(r.join("siesta.private.json"), r#"{"a": {"url": "mysql://ro:s3cret@db:3306/shop?x=a@b", "password": "s3cret", "read_only": true}}"#).unwrap();
-        let c = load(r, "q.sql");
-        let m = masked(&c.connections["a"]);
+        let t = config(&[("a", r#"{"url": "mysql://ro:s3cret@db:3306/shop?x=a@b", "read_only": true}"#)]);
+        let m = masked(&Connections::load(t.path()).connections["a"]);
         assert_eq!(m["url"], "mysql://ro:***@db:3306/shop?x=a@b");
-        assert_eq!((m["password"].as_str(), m["read_only"].as_bool(), m["driver"].as_str()), (Some("***"), Some(true), Some("mysql")));
+        assert_eq!((m["read_only"].as_bool(), m["driver"].as_str()), (Some(true), Some("mysql")));
         assert!(!m.to_string().contains("s3cret"));
         assert_eq!(mask_url("postgres://user@h/db"), "postgres://user@h/db");
         assert_eq!(mask_url("postgres://u@h/db?sslmode=require&password=x%40y&a=b#f"), "postgres://u@h/db?sslmode=require&password=***&a=b#f");
@@ -652,28 +511,13 @@ mod tests {
     }
 
     #[test]
-    fn password_in_url_query_is_masked_and_warned() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::write(r.join("siesta.json"), r#"{"a": {"url": "postgres://u@h/db?password=hunter2"}, "b": {"url": "postgres://u@h/db?password=${env:PATH}"}}"#).unwrap();
-        let c = load(r, "q.sql");
-        assert!(!masked(&c.connections["a"]).to_string().contains("hunter2"));
-        let w = c.warnings.join("\n");
-        assert!(w.contains("'a': literal password in url"), "{w}");
-        assert!(!w.contains("'b'"), "{w}");
-    }
-
-    #[test]
-    fn fingerprint_tells_same_named_connections_apart() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        fs::create_dir_all(r.join("a")).unwrap();
-        fs::create_dir_all(r.join("b")).unwrap();
-        fs::write(r.join("a/siesta.json"), r#"{"dev": {"driver": "postgres", "host": "h1", "database": "x", "password": "p1"}}"#).unwrap();
-        fs::write(r.join("b/siesta.json"), r#"{"dev": {"driver": "postgres", "host": "h2", "database": "x", "password": "p2"}}"#).unwrap();
-        let (a, b) = (load(r, "a/q.sql").connections["dev"].clone(), load(r, "b/q.sql").connections["dev"].clone());
+    fn fingerprint_tells_servers_apart() {
+        let t = config(&[("dev", r#"{"driver": "postgres", "host": "h1", "database": "x"}"#)]);
+        let a = Connections::load(t.path()).connections["dev"].clone();
+        let mut b = a.clone();
+        b.host = Some("h2".into());
         assert_ne!(a.fingerprint(), b.fingerprint());
-        assert_eq!(a.fingerprint(), load(r, "a/q.sql").connections["dev"].fingerprint());
+        assert_eq!(a.fingerprint(), a.clone().fingerprint());
         // The password (also in the url) is not part of it; the user and the field a value is in are.
         let (mut c, mut d) = (a.clone(), a.clone());
         c.password = Some("other".into());

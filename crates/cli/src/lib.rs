@@ -30,8 +30,6 @@ enum Cmd {
     List {
         /// .sql file or directory (default: current directory)
         path: Option<PathBuf>,
-        #[command(flatten)]
-        files: FilesArg,
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
@@ -39,12 +37,10 @@ enum Cmd {
     Run(RunArgs),
     /// Run SQL from an argument or stdin
     Exec(ExecArgs),
-    /// Connections from siesta.json / siesta.private.json (secrets masked)
+    /// Connections of the config dir `~/.config/siesta/connections/` (secrets masked)
     Connections {
         #[command(subcommand)]
         cmd: Option<ConnCmd>,
-        #[command(flatten)]
-        files: FilesArg,
         #[arg(long, value_enum, global = true)]
         output: Option<Format>,
     },
@@ -54,7 +50,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ConnCmd {
-    /// The connections visible from the current directory (the default)
+    /// Every connection, and whether it has a password (the default)
     List,
     /// Open a connection and report the server version
     Test {
@@ -63,16 +59,9 @@ enum ConnCmd {
     },
     /// Store a connection's password in the system keychain (prompt without echo, or stdin when piped)
     SetPassword {
-        /// Connection name; its password must be `"${keychain}"` or `"${keychain:ACCOUNT}"`
+        /// Connection name
         name: String,
     },
-}
-
-#[derive(Args, Clone, Default)]
-struct FilesArg {
-    /// Extra connection file above the siesta*.json chain (repeatable)
-    #[arg(long = "connections-file", value_name = "PATH", global = true)]
-    files: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -139,29 +128,26 @@ pub fn run_with<I: IntoIterator<Item = String>>(args: I, out: &mut dyn Write) ->
 fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
     let format = cli.format();
     match cli.cmd {
-        Cmd::List { path, files, output: _ } => list(&path.unwrap_or_else(|| ".".into()), &files.files, format, out),
+        Cmd::List { path, output: _ } => list(&path.unwrap_or_else(|| ".".into()), format, out),
         Cmd::Run(a) => run::run(a, out),
         Cmd::Exec(a) => run::exec(a, out),
-        Cmd::Connections { cmd: None | Some(ConnCmd::List), files, .. } => connections(&files.files, format, out),
-        Cmd::Connections { cmd: Some(ConnCmd::Test { name }), files, .. } => test_connection(&name, &files.files, format, out),
-        Cmd::Connections { cmd: Some(ConnCmd::SetPassword { name }), files, .. } => {
+        Cmd::Connections { cmd: None | Some(ConnCmd::List), .. } => connections(format, out),
+        Cmd::Connections { cmd: Some(ConnCmd::Test { name }), .. } => test_connection(&name, format, out),
+        Cmd::Connections { cmd: Some(ConnCmd::SetPassword { name }), .. } => {
             let stdin = std::io::stdin();
             let tty = stdin.is_terminal();
-            set_password(&name, &files.files, tty, &mut stdin.lock(), format, out)
+            set_password(&name, db_conn::global_dir().as_deref(), tty, &mut stdin.lock(), format, out)
         }
         Cmd::Schema(a) => schema(a, format, out),
     }
 }
 
 /// `connections set-password`: the password is read from a prompt without echo (`tty`) or from `input`
-/// (one line), and stored under the account of the connection's `${keychain}` marker.
-fn set_password(name: &str, extra: &[PathBuf], tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let conn = Env::load(&cwd_probe(), extra).pick(name)?;
-    let Some(account) = conn.keychain else {
-        return Err(CliError::new("no_keychain_marker", format!("connection '{name}' does not use the keychain"), 3).hint("set \"password\": \"${keychain}\" (or \"${keychain:ACCOUNT}\") in its file first"));
-    };
+/// (one line), and stored in the keychain under the connection's name.
+fn set_password(name: &str, config: Option<&Path>, tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    Env::load_in(&cwd_probe(), config).pick(name)?;
     let password = if tty {
-        rpassword::prompt_password(format!("Password for '{name}' (account '{account}'): ")).map_err(|e| CliError::new("io_error", e.to_string(), 3))?
+        rpassword::prompt_password(format!("Password for '{name}': ")).map_err(|e| CliError::new("io_error", e.to_string(), 3))?
     } else {
         let mut line = String::new();
         input.read_line(&mut line).map_err(|e| CliError::new("io_error", e.to_string(), 3))?;
@@ -170,11 +156,11 @@ fn set_password(name: &str, extra: &[PathBuf], tty: bool, input: &mut dyn BufRea
     if password.is_empty() {
         return Err(CliError::new("no_password", "empty password", 3));
     }
-    db_conn::secrets::set(&account, &password).map_err(|e| CliError::new("keychain_error", e.to_string(), 2))?;
+    db_conn::secrets::set(name, &password).map_err(|e| CliError::new("keychain_error", e.to_string(), 2))?;
     if format.human() {
-        put(out, format!("Stored the password of '{name}' in the system keychain (service `{}`, account `{account}`)", db_conn::secrets::SERVICE));
+        put(out, format!("Stored the password of '{name}' in the system keychain (service `{}`, account `{name}`)", db_conn::secrets::SERVICE));
     } else {
-        put(out, json!({ "connection": name, "ok": true, "service": db_conn::secrets::SERVICE, "account": account }).to_string());
+        put(out, json!({ "connection": name, "ok": true, "service": db_conn::secrets::SERVICE, "account": name }).to_string());
     }
     Ok(0)
 }
@@ -266,12 +252,12 @@ fn sql_files(path: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn list(path: &Path, extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+fn list(path: &Path, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
     if !path.exists() {
         return Err(CliError::new("file_not_found", "no such file or directory", 3).at(path, None));
     }
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let env = Env::load(&if path.is_file() { abs.clone() } else { abs.join("_.sql") }, extra);
+    let env = Env::load(&if path.is_file() { abs.clone() } else { abs.join("_.sql") });
     let mut rows = vec![];
     for f in sql_files(path) {
         let src = std::fs::read_to_string(&f).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&f, None))?;
@@ -289,13 +275,17 @@ fn list(path: &Path, extra: &[PathBuf], format: Format, out: &mut dyn Write) -> 
     Ok(0)
 }
 
-fn connections(extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let env = Env::load(&cwd_probe(), extra);
+fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let env = Env::load(&cwd_probe());
     let mut rows: Vec<Value> = env
         .conns
         .connections
         .values()
-        .map(db_conn::masked)
+        .map(|c| {
+            let mut v = db_conn::masked(c);
+            v["password"] = json!(if c.has_password() || db_conn::secrets::get(&c.name).is_ok() { "set" } else { "none" });
+            v
+        })
         .collect();
     rows.extend(env.conns.errors.iter().map(|(n, e)| json!({ "name": n, "error": e })));
     rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -303,8 +293,8 @@ fn connections(extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result
     Ok(0)
 }
 
-fn test_connection(name: &str, extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let env = Env::load(&cwd_probe(), extra);
+fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let env = Env::load(&cwd_probe());
     let started = std::time::Instant::now();
     let (rt, mut s, _) = open_session(&env, name)?;
     let version = rt.block_on(s.run("SELECT version()", Kind::Query, &Page::default())).map_err(|e| db_error(&e))?;
@@ -329,7 +319,7 @@ fn schema(a: SchemaArgs, format: Format, out: &mut dyn Write) -> Result<u8, CliE
     if a.ddl && a.table.is_none() {
         return Err(CliError::new("bad_argument", "--ddl needs a table", 3));
     }
-    let env = Env::load(&cwd_probe(), &a.conn.connections_files);
+    let env = Env::load(&cwd_probe());
     let name = env.resolve(a.conn.connection.as_deref(), None)?.name;
     let (rt, mut s, _) = open_session(&env, &name)?;
     let schema = rt.block_on(s.schema()).map_err(|e| db_error(&e))?;
@@ -437,85 +427,19 @@ mod tests {
         assert_eq!(run_with(args(&["siesta", "--version"]), &mut out), 0);
     }
 
-    #[test]
-    fn errors_map_to_exit_codes_and_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("a.sql");
-        std::fs::write(&f, "SELECT 1;").unwrap();
-        let go = |extra: &[&str]| {
-            let mut a = args(&["siesta"]);
-            a.extend(extra.iter().map(|s| s.to_string()));
-            let mut out = vec![];
-            let code = run_with(a, &mut out);
-            (code, serde_json::from_slice::<Value>(&out).unwrap_or(Value::Null))
-        };
-        let file = f.to_str().unwrap();
-        // No connection chosen, unknown connection, missing file, unknown statement: all 3.
-        let (code, v) = go(&["run", file, "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("no_connection")));
-        let (code, v) = go(&["run", file, "-c", "nope", "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("unknown_connection")));
-        let (code, v) = go(&["run", "/no/such.sql", "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("file_not_found")));
-        // Unreachable server: 2.
-        std::fs::write(dir.path().join("siesta.json"), r#"{"dead": {"driver": "postgres", "host": "127.0.0.1", "port": 1, "database": "x", "user": "u"}}"#).unwrap();
-        let (code, v) = go(&["run", file, "-c", "dead", "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (2, Some("connection_failed")));
-        let (code, v) = go(&["run", file, "-c", "dead", "#9", "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("statement_not_found")));
-        // Unclosed string: parse error.
-        std::fs::write(&f, "SELECT 'abc;").unwrap();
-        let (code, v) = go(&["run", file, "-c", "dead", "--output", "json"]);
-        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("parse_error")));
-    }
+    // Tests that load connections (they read `SIESTA_CONFIG_DIR`) live in tests/config.rs.
 
     #[test]
-    fn list_prints_statements() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.sql"), "-- @name one\nSELECT 1;\nDELETE FROM t;\n").unwrap();
-        std::fs::write(dir.path().join("b.txt"), "x").unwrap();
-        let mut out = vec![];
-        let code = run_with(args(&["siesta", "list", dir.path().to_str().unwrap(), "--output", "jsonl"]), &mut out);
-        assert_eq!(code, 0);
-        let rows: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0]["name"].as_str(), rows[0]["line"].as_u64(), rows[0]["kind"].as_str()), (Some("one"), Some(2), Some("query")));
-        assert_eq!((rows[1]["statement"].as_str(), rows[1]["kind"].as_str()), (Some("DELETE FROM t"), Some("other")));
-    }
-
-    #[test]
-    fn set_password_from_stdin_then_resolves() {
+    fn set_password_from_stdin_stores_by_connection_name() {
         db_conn::secrets::use_memory_store();
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("x.json");
-        std::fs::write(&file, r#"{"kc-cli-a": {"driver": "postgres", "host": "h", "password": "${keychain}"}, "kc-cli-b": {"driver": "postgres", "host": "h", "password": "${keychain:team-db}"}, "plain": {"driver": "postgres", "host": "h"}}"#).unwrap();
-        let extra = [file.clone()];
-        let set = |name: &str, input: &str| set_password(name, &extra, false, &mut input.as_bytes(), Format::Json, &mut vec![]);
+        std::fs::create_dir_all(dir.path().join("connections")).unwrap();
+        std::fs::write(dir.path().join("connections/kc-cli-a.json"), r#"{"driver": "postgres", "host": "h"}"#).unwrap();
+        let set = |name: &str, input: &str| set_password(name, Some(dir.path()), false, &mut input.as_bytes(), Format::Json, &mut vec![]);
         assert_eq!(set("kc-cli-a", "hunter2\r\nignored\n").unwrap(), 0);
-        assert_eq!(set("kc-cli-b", "s3cret\n").unwrap(), 0);
         assert_eq!(db_conn::secrets::get("kc-cli-a").as_deref(), Ok("hunter2"));
-        assert_eq!(db_conn::secrets::get("team-db").as_deref(), Ok("s3cret"));
-        assert_eq!(set("plain", "x\n").unwrap_err().code, "no_keychain_marker");
         assert_eq!(set("nope", "x\n").unwrap_err().code, "unknown_connection");
         assert_eq!(set("kc-cli-a", "\n").unwrap_err().code, "no_password");
-        // `connections` shows the marker, never a secret.
-        let mut out = vec![];
-        assert_eq!(run_with(args(&["siesta", "connections", "--connections-file", file.to_str().unwrap(), "--output", "json"]), &mut out), 0);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("${keychain}") && text.contains("${keychain:team-db}") && !text.contains("hunter2") && !text.contains("s3cret"), "{text}");
-    }
-
-    #[test]
-    fn connections_are_masked() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("siesta.json"), r#"{"dev": {"driver": "mysql", "url": "mysql://u@h/db", "password": "hunter2"}}"#).unwrap();
-        let file = dir.path().join("x.json");
-        std::fs::write(&file, r#"{"extra": {"driver": "postgres", "host": "h", "password": "s3cret"}}"#).unwrap();
-        let mut out = vec![];
-        // Run from the temp dir's perspective through --connections-file (cwd is the crate).
-        let code = run_with(args(&["siesta", "connections", "--connections-file", file.to_str().unwrap(), "--output", "json"]), &mut out);
-        assert_eq!(code, 0);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("\"extra\"") && !text.contains("s3cret"), "{text}");
+        assert_eq!(db_conn::secrets::get("kc-cli-a").as_deref(), Ok("hunter2"));
     }
 }

@@ -8,16 +8,21 @@ Built in Rust on [GPUI](https://www.gpui.rs); a sibling of [Respite](../respite)
 
 ## Connections
 
-Connections are plain JSON: `siesta.json` (committed, no secrets) and `siesta.private.json` (git-ignored passwords). Both are found in every folder from the project root down to the `.sql` file.
+Connections live in your config dir, one JSON file per connection: `~/.config/siesta/connections/<name>.json` (the file name is the connection name). The desktop app's "New connection" form writes them; you can also write them by hand.
 
 ```json
-{ "dev-pg": { "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" },
-  "prod-mysql": { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true } }
+{ "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" }
 ```
 
-A `.sql` file picks its connection with `-- @connection dev-pg` on the first line. Values like `${env:SHOP_DB_PASSWORD}` are read from the environment.
+```json
+{ "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
+```
 
-Your own connections can live outside any repo: `~/.config/siesta/connections.json` (the desktop app's "New connection" form writes it). The form stores the password in the system keychain (macOS Keychain, Linux Secret Service, service `siesta`) and writes `"password": "${keychain}"` (account = connection name; `${keychain:ACCOUNT}` names it, handy in a team's `siesta.json`; each developer runs `siesta connections set-password NAME`). The keychain is read only when a connection opens. Where no keychain is available the password falls back to `connections.private.json` (mode 0600). A project's `siesta.json` overrides a global connection of the same name. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
+A `.sql` file picks its connection with `-- @connection dev-pg` on the first line. Values like `${env:SHOP_DB_HOST}` are read from the environment (handy in CI).
+
+There is no password in the file. The password lives only in the system keychain (macOS Keychain, Linux Secret Service, service `siesta`, account = connection name): type it in the connection form, or run `siesta connections set-password NAME`. It is read only when a connection opens; without an entry Siesta connects without a password. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
+
+An old `~/.config/siesta/connections.json` (with `connections.private.json`) is split into per-connection files on first start and renamed to `*.migrated`; its passwords move into the keychain.
 
 ## CLI
 
@@ -27,7 +32,7 @@ The desktop app and the CLI ship as one binary.
 siesta list          Statements of a file or directory: file, line, name, first line
 siesta run           Run statements of a file (all of them in file order when none are named)
 siesta exec          Run SQL from an argument or stdin
-siesta connections   Connections, secrets masked; `connections test NAME` opens one
+siesta connections   Connections, secrets masked; `test NAME` opens one, `set-password NAME` stores its password
 siesta schema        Tables, columns and indexes of a connection; --ddl prints CREATE TABLE
 ```
 
@@ -56,7 +61,7 @@ crates/
   app/        GPUI desktop app
   cli/        siesta CLI commands
   sql-split/  statement splitter, directives
-  db-conn/    siesta.json / siesta.private.json
+  db-conn/    connection files, keychain passwords
   db-exec/    sqlx sessions, paging, schema
   settings/   settings.json
   workspace/  project folder, file index, UI state
