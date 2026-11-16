@@ -23,6 +23,7 @@ mod themes;
 mod value_popup;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
@@ -36,7 +37,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable, v_resizable,
     button::{Button, ButtonVariants as _},
     input::{Editor, EditorState, InputEvent, InputState, Position, RopeExt as _},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
     resizable_panel,
 };
 use siesta_workspace::{OpenFile, WorkspaceState};
@@ -117,6 +118,8 @@ pub(crate) struct Siesta {
     /// The databases each connection's server offers (`schema_cache::key` of the connection as
     /// saved), read in the background when a picker opens; kept until "Refresh".
     db_lists: HashMap<String, runner::DbList>,
+    /// The database picker's menu while it exists (rebuilt when a list arrives with it open).
+    db_menu: Rc<RefCell<Option<WeakEntity<PopupMenu>>>>,
     /// The connection files at the last check; a change reloads connections.
     conns_seen: Option<Stamp>,
     /// A dirty tab whose close was requested once; the next close discards it.
@@ -150,6 +153,34 @@ pub(crate) struct Siesta {
 }
 
 /// `path` or `path:line` (1-based). A real file named `a:3` wins over the suffix.
+/// Fills the database picker's menu; re-run on the open menu when the list changes.
+pub(crate) type DbMenuBuild = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+
+/// One row of the database picker below "Default (...)".
+#[derive(Debug, PartialEq)]
+enum DbRow {
+    Loading,
+    Error(String),
+    Database(String),
+    Retry,
+    Refresh,
+}
+
+fn db_rows(list: Option<&runner::DbList>) -> Vec<DbRow> {
+    match list {
+        None | Some(runner::DbList::Loading) => vec![DbRow::Loading, DbRow::Refresh],
+        Some(runner::DbList::Failed(e)) => vec![DbRow::Error(db_error_text(e)), DbRow::Retry],
+        Some(runner::DbList::Ready(names)) => names.iter().cloned().map(DbRow::Database).chain([DbRow::Refresh]).collect(),
+    }
+}
+
+/// "Can't list databases: <first line, at most 80 chars>".
+fn db_error_text(e: &str) -> String {
+    let line = e.lines().next().unwrap_or("").trim();
+    let short = if line.chars().count() > 80 { format!("{}…", line.chars().take(80).collect::<String>()) } else { line.to_string() };
+    format!("Can't list databases: {short}")
+}
+
 fn parse_target(arg: &str) -> (PathBuf, Option<u32>) {
     if let Some((p, l)) = arg.rsplit_once(':')
         && let Ok(n) = l.parse::<u32>()
@@ -237,6 +268,7 @@ impl Siesta {
             picks: BTreeMap::new(),
             db_picks: BTreeMap::new(),
             db_lists: HashMap::new(),
+            db_menu: Default::default(),
             conns_seen: None,
             close_armed: None,
             picker_sub: None,
@@ -858,14 +890,9 @@ impl Siesta {
     /// access, read from the server in the background when the picker opens (and kept until Refresh).
     fn database_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
-        let conn = d.conns.connections.get(d.connection()?)?;
-        let shown = d.shown_database();
-        let explicit = d.database().map(str::to_string);
         let forced = d.locked_db().is_some();
-        let list = self.db_lists.get(&schema_cache::key(conn)).cloned();
-        let default_label = format!("Default ({})", conn.database.as_deref().unwrap_or("server default"));
-        let mysql = conn.driver == db_conn::Driver::MySql;
-        let label = shown.unwrap_or_else(|| "(default)".into());
+        let label = d.shown_database().unwrap_or_else(|| "(default)".into());
+        let build = self.db_menu_builder(cx.entity().downgrade())?;
         let view = cx.entity().downgrade();
         let opened = view.clone();
         Some(
@@ -875,34 +902,7 @@ impl Siesta {
                 .small()
                 .ghost()
                 .when(forced, |b| b.tooltip("Set by `-- @database` in this file"))
-                .dropdown_menu(move |menu, _, _| {
-                    let pick = |name: Option<String>| {
-                        let view = view.clone();
-                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            view.update(cx, |this, cx| this.select_database(name.clone(), window, cx)).ok();
-                        }
-                    };
-                    let mut menu = menu.item(PopupMenuItem::new(default_label.clone()).checked(explicit.is_none()).on_click(pick(None))).separator();
-                    match &list {
-                        None | Some(runner::DbList::Loading) => menu = menu.item(PopupMenuItem::new("Loading…").disabled(true)),
-                        Some(runner::DbList::Failed(e)) => menu = menu.item(PopupMenuItem::new(format!("Could not list databases: {e}")).disabled(true)),
-                        Some(runner::DbList::Ready(names)) => {
-                            for n in names {
-                                let muted = mysql && db_exec::is_system_database(n);
-                                let text = n.clone();
-                                let item = PopupMenuItem::element(move |_, cx| {
-                                    let c = if muted { cx.theme().muted_foreground } else { cx.theme().foreground };
-                                    div().text_color(c).child(text.clone())
-                                });
-                                menu = menu.item(item.checked(explicit.as_deref() == Some(n.as_str())).on_click(pick(Some(n.clone()))));
-                            }
-                        }
-                    }
-                    menu.separator().item(PopupMenuItem::new("Refresh").on_click({
-                        let view = view.clone();
-                        move |_, window, cx| _ = view.update(cx, |this, cx| this.refresh_databases(window, cx))
-                    }))
-                })
+                .dropdown_menu(move |menu, window, cx| build(menu, window, cx))
                 .on_open_change(move |open, window, cx| {
                     if *open {
                         opened.update(cx, |this, cx| this.fetch_databases(false, window, cx)).ok();
@@ -910,6 +910,58 @@ impl Siesta {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// The database list rows of the current file's connection, as the picker shows them.
+    #[cfg(test)]
+    fn db_rows(&self) -> Option<Vec<DbRow>> {
+        let d = self.doc().filter(|d| d.sql)?;
+        let conn = d.conns.connections.get(d.connection()?)?;
+        Some(db_rows(self.db_lists.get(&schema_cache::key(conn))))
+    }
+
+    /// Builds the picker menu from the current state. It also remembers the menu entity it fills,
+    /// so a list that arrives while the menu is open can `rebuild` it (see `fetch_databases_of`).
+    pub(crate) fn db_menu_builder(&self, view: WeakEntity<Self>) -> Option<DbMenuBuild> {
+        let d = self.doc().filter(|d| d.sql)?;
+        let conn = d.conns.connections.get(d.connection()?)?;
+        let explicit = d.database().map(str::to_string);
+        let default_label = format!("Default ({})", conn.database.as_deref().unwrap_or("server default"));
+        let mysql = conn.driver == db_conn::Driver::MySql;
+        let rows = db_rows(self.db_lists.get(&schema_cache::key(conn)));
+        let slot = self.db_menu.clone();
+        Some(Rc::new(move |menu, _, cx| {
+            *slot.borrow_mut() = Some(cx.entity().downgrade());
+            let pick = |name: Option<String>| {
+                let view = view.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    view.update(cx, |this, cx| this.select_database(name.clone(), window, cx)).ok();
+                }
+            };
+            let again = |name: &'static str| {
+                let view = view.clone();
+                PopupMenuItem::new(name).on_click(move |_, window, cx| _ = view.update(cx, |this, cx| this.refresh_databases(window, cx)))
+            };
+            let mut menu = menu.item(PopupMenuItem::new(default_label.clone()).checked(explicit.is_none()).on_click(pick(None))).separator();
+            for row in &rows {
+                menu = match row {
+                    DbRow::Loading => menu.item(PopupMenuItem::new("Loading…").disabled(true)),
+                    DbRow::Error(t) => menu.item(PopupMenuItem::new(t.clone()).disabled(true)),
+                    DbRow::Database(n) => {
+                        let muted = mysql && db_exec::is_system_database(n);
+                        let text = n.clone();
+                        let item = PopupMenuItem::element(move |_, cx| {
+                            let c = if muted { cx.theme().muted_foreground } else { cx.theme().foreground };
+                            div().text_color(c).child(text.clone())
+                        });
+                        menu.item(item.checked(explicit.as_deref() == Some(n.as_str())).on_click(pick(Some(n.clone()))))
+                    }
+                    DbRow::Retry => menu.separator().item(again("Retry")),
+                    DbRow::Refresh => menu.separator().item(again("Refresh")),
+                };
+            }
+            menu
+        }))
     }
 
     /// Remembers `name` as the pick of `path` (only that file) and loads its schema in the background.
@@ -2192,5 +2244,29 @@ mod tests {
         // The provider follows the picked connection: none, no tables.
         cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(None, window, cx)));
         assert!(ask(&mut cx, "SELECT * FROM ").is_empty());
+    }
+
+    #[test]
+    fn db_error_text_is_first_line_truncated() {
+        assert_eq!(super::db_error_text("password authentication failed\nDETAIL: x"), "Can't list databases: password authentication failed");
+        let long = "x".repeat(200);
+        assert_eq!(super::db_error_text(&long), format!("Can't list databases: {}…", "x".repeat(80)));
+    }
+
+    #[gpui::test]
+    fn database_list_failure_shows_error_and_retry(tcx: &mut TestAppContext) {
+        use super::DbRow;
+        use crate::runner::DbList;
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
+        let key = cx.update(|_, cx| crate::schema_cache::key(&app.read(cx).doc().unwrap().conns.connections["dev"]));
+        let rows = |app: &Entity<Siesta>, cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).db_rows().unwrap());
+        let set = |cx: &mut VisualTestContext, l: DbList| cx.update(|_, cx| app.update(cx, |this, _| _ = this.db_lists.insert(key.clone(), l)));
+        set(&mut cx, DbList::Failed("28P01 password authentication failed".into()));
+        assert_eq!(rows(&app, &mut cx), vec![DbRow::Error("Can't list databases: 28P01 password authentication failed".into()), DbRow::Retry]);
+        set(&mut cx, DbList::Ready(vec!["app".into()]));
+        assert_eq!(rows(&app, &mut cx), vec![DbRow::Database("app".into()), DbRow::Refresh]);
     }
 }

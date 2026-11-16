@@ -672,11 +672,21 @@ impl Siesta {
         });
         cx.spawn_in(window, async move |this, cx| {
             let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
-            this.update(cx, |this, cx| {
-                this.db_lists.insert(key, r.map_or_else(|e| DbList::Failed(e.to_string()), DbList::Ready));
-                cx.notify();
-            })
-            .ok();
+            let rebuilt = this
+                .update(cx, |this, cx| {
+                    this.db_lists.insert(key, r.map_or_else(|e| DbList::Failed(e.to_string()), DbList::Ready));
+                    cx.notify();
+                    this.db_menu_builder(cx.entity().downgrade()).zip(this.db_menu.borrow().clone())
+                })
+                .ok()
+                .flatten();
+            // The picker may be open: refill its menu with the new state (outside the view's update).
+            if let Some((build, menu)) = rebuilt {
+                cx.update(|window, cx| {
+                    _ = menu.update(cx, |m, cx| m.rebuild(window, cx, |m, w, c| build(m, w, c)));
+                })
+                .ok();
+            }
         })
         .detach();
         cx.notify();
