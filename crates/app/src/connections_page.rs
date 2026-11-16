@@ -29,6 +29,7 @@ pub(crate) enum PasswordKind {
     Keychain,
     Env,
     File,
+    Url,
 }
 
 impl PasswordKind {
@@ -38,6 +39,7 @@ impl PasswordKind {
             PasswordKind::Keychain => Some("keychain"),
             PasswordKind::Env => Some("env"),
             PasswordKind::File => Some("file"),
+            PasswordKind::Url => Some("in URL"),
         }
     }
 }
@@ -87,12 +89,21 @@ fn target_of(c: &Connection) -> String {
 /// How `name` keeps its password in `file` (read from the raw file: the loaded connection no longer knows).
 pub(crate) fn raw_password_kind(file: &Path, name: &str) -> PasswordKind {
     let raw = std::fs::read_to_string(file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-    let Some(p) = raw.as_ref().and_then(|v| v.get(name)?.get("password")?.as_str()) else { return PasswordKind::None };
-    match p.trim() {
+    let field = |k: &str| raw.as_ref().and_then(|v| v.get(name)?.get(k)?.as_str());
+    password_kind(field("password"), field("url"))
+}
+
+/// An explicit `password` wins over one inside the `url` (as when connecting).
+fn password_kind(password: Option<&str>, url: Option<&str>) -> PasswordKind {
+    let kind = |p: &str, plain| match p.trim() {
         "" => PasswordKind::None,
         p if p.starts_with("${keychain") => PasswordKind::Keychain,
         p if p.contains("${") => PasswordKind::Env,
-        _ => PasswordKind::File,
+        _ => plain,
+    };
+    match kind(password.unwrap_or_default(), PasswordKind::File) {
+        PasswordKind::None => url.and_then(|u| db_conn::url_passwords(u).into_iter().map(|r| kind(&u[r], PasswordKind::Url)).find(|k| *k != PasswordKind::None)).unwrap_or(PasswordKind::None),
+        k => k,
     }
 }
 
@@ -410,7 +421,7 @@ impl Render for ConnectionsPage {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{PasswordKind, build_groups};
+    use super::{PasswordKind, build_groups, password_kind};
     use db_conn::{Connection, Connections, Driver};
     use std::path::{Path, PathBuf};
 
@@ -457,5 +468,20 @@ mod tests {
         // The filter matches names.
         let g = build_groups(&c, &global, Path::new("/ws"), None, "BRO", &kind);
         assert_eq!((g.len(), g[0].rows[0].name.as_str()), (1, "broken"));
+    }
+
+    #[test]
+    fn password_kind_looks_at_the_url() {
+        use PasswordKind::{Env, File, Keychain, Url};
+        let k = password_kind;
+        assert_eq!(k(None, Some("postgres://u:secret@h/d")), Url);
+        assert_eq!(k(None, Some("postgres://h/d?sslmode=x&password=secret")), Url);
+        assert_eq!(k(None, Some("postgres://u:${env:X}@h/d")), Env);
+        assert_eq!(k(None, Some("postgres://h/d?password=${keychain}")), Keychain);
+        assert_eq!(k(None, Some("postgres://u@h/d")), PasswordKind::None);
+        assert_eq!(k(Some("${keychain}"), Some("postgres://u:secret@h/d")), Keychain);
+        assert_eq!(k(Some("pw"), Some("postgres://u:${env:X}@h/d")), File);
+        assert_eq!(k(Some(""), Some("postgres://u:secret@h/d")), Url);
+        assert_eq!(k(None, None), PasswordKind::None);
     }
 }

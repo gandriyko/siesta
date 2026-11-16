@@ -268,7 +268,7 @@ pub fn mode_name(m: SslMode) -> &'static str {
 }
 
 /// Byte ranges of the passwords in `scheme://user:password@host/…?password=…`, in order.
-fn url_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
+pub fn url_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let Some(start) = url.find("://").map(|i| i + 3) else { return out };
     let end = url[start..].find(['/', '?', '#']).map_or(url.len(), |i| start + i);
