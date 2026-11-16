@@ -5,8 +5,23 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sql-split = { path = "../sql-split" }
+db-conn = { path = "../db-conn" }
+siesta-settings = { path = "../settings" }
+siesta-workspace = { path = "../workspace" }
+serde = "1"
+serde_json = "1"
 # Same pinned versions as Respite.
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders"] } # runtime_shaders: no Xcode `metal` needed
 gpui-component = { version = "=0.9.1", features = ["tree-sitter-sql"] }
 gpui-kit-assets = "=0.9.1"
+# gpui-component's own base; named only for `ResizeHandleContext` (invisible panel dividers).
+gpui-base = "=0.9.1"
+# Same version and features as gpui-component's, so the editor's provider types match.
+lsp-types = { version = "0.97", features = ["proposed"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Editor-level tests (`#[gpui::test]`, a real EditorState in a test window).
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
