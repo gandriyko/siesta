@@ -7,6 +7,7 @@
 //! Notices: MySQL warnings are read with `SHOW WARNINGS` after non-query statements. Postgres
 //! `NOTICE`s are not reachable (sqlx only logs them), so `notices` stays empty for Postgres.
 
+mod schema;
 mod value;
 mod wrap;
 
@@ -23,6 +24,7 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgDatabaseError, PgErrorPos
 use sqlx::types::chrono;
 use sqlx::{AssertSqlSafe, SqlSafeStr as _, Column as _, ConnectOptions as _, Connection as _, Either, Executor, Row, Statement, TypeInfo, ValueRef};
 
+pub use schema::{ColumnInfo, Index, Schema, SchemaNode, Table, TableKind};
 pub use value::Value;
 pub use wrap::{Cond, Op, Page, parse_filter, quote_ident, strip, wrap};
 

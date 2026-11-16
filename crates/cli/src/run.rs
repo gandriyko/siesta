@@ -1,0 +1,495 @@
+//! `siesta run` / `siesta exec`: pick statements, resolve the connection, confirm, execute, print.
+
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+
+use clap::Args;
+use db_conn::{Connection, Connections, Driver};
+use db_exec::{DbError, Page, Session};
+use serde_json::Value;
+use siesta_settings::{ConfirmDestructive, Settings};
+use sql_split::{Dialect, Kind, Severity, SqlFile};
+
+use crate::output::{Format, Item, YELLOW, item_json, item_text, paint, print_sql_error, put};
+use crate::{CliError, runtime};
+
+/// Default row limit of the CLI (the GUI pages; an agent rarely wants more).
+const DEFAULT_MAX_ROWS: usize = 100;
+
+/// `-c` and the extra connection files; shared by `run`, `exec`, `schema` and `connections`.
+#[derive(Args, Clone, Default)]
+pub struct ConnArgs {
+    /// Connection name (overrides `-- @connection`)
+    #[arg(short = 'c', long)]
+    pub connection: Option<String>,
+    /// Extra connection file above the siesta*.json chain (repeatable)
+    #[arg(long = "connections-file", value_name = "PATH")]
+    pub connections_files: Vec<PathBuf>,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct ExecOpts {
+    #[command(flatten)]
+    pub conn: ConnArgs,
+    #[arg(long, value_enum)]
+    pub output: Option<Format>,
+    /// Rows to return per statement [default: 100]; 0 = the `results.max_rows` cap
+    #[arg(long, value_name = "N")]
+    pub max_rows: Option<usize>,
+    /// Skip the confirmation of `-- @confirm` and destructive statements on prod connections
+    #[arg(long)]
+    pub yes: bool,
+    /// Force the connection read-only (the server rejects writes)
+    #[arg(long)]
+    pub read_only: bool,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// `.sql` file
+    pub file: PathBuf,
+    /// `@name`, `:LINE` or `#N`; none = every statement in file order
+    pub statements: Vec<String>,
+    #[command(flatten)]
+    pub opts: ExecOpts,
+}
+
+#[derive(Args)]
+pub struct ExecArgs {
+    /// SQL text (one or several statements); read from stdin when omitted or `-`
+    pub sql: Option<String>,
+    #[command(flatten)]
+    pub opts: ExecOpts,
+}
+
+/// Settings and connections as seen from a file (or from the working directory).
+pub(crate) struct Env {
+    pub settings: Settings,
+    pub conns: Connections,
+}
+
+impl Env {
+    /// `probe` only decides the folder chain: the real `.sql` file, or `<cwd>/_.sql`.
+    pub fn load(probe: &Path, extra: &[PathBuf]) -> Env {
+        let root = db_conn::workspace_root(probe);
+        let loaded = siesta_settings::Loaded::load(Some(&root));
+        for e in &loaded.errors {
+            eprintln!("{} {e}", paint("warning:", YELLOW, true));
+        }
+        let mut files = loaded.settings.connection_files(&root);
+        files.extend(extra.iter().cloned());
+        let conns = Connections::load(probe, &root, &files);
+        for w in &conns.warnings {
+            eprintln!("{} {w}", paint("warning:", YELLOW, true));
+        }
+        Env { settings: loaded.settings, conns }
+    }
+
+    pub fn pick(&self, name: &str) -> Result<Connection, CliError> {
+        if let Some(c) = self.conns.connections.get(name) {
+            return Ok(c.clone());
+        }
+        if let Some(e) = self.conns.errors.get(name) {
+            return Err(CliError::new("invalid_connection", format!("connection '{name}': {e}"), 3));
+        }
+        let known = self.conns.names();
+        let hint = if known.is_empty() { "no siesta.json found; see `siesta connections`".to_string() } else { format!("available: {}", known.join(", ")) };
+        Err(CliError::new("unknown_connection", format!("no connection '{name}'"), 3).hint(hint))
+    }
+
+    /// Flag, else the file's `-- @connection`, else an error.
+    pub fn resolve(&self, flag: Option<&str>, directive: Option<&str>) -> Result<Connection, CliError> {
+        match flag.or(directive) {
+            Some(n) => self.pick(n),
+            None => Err(CliError::new("no_connection", "no connection chosen", 3).hint("pass -c <name> or add `-- @connection <name>` at the top of the file")),
+        }
+    }
+}
+
+pub(crate) fn dialect_of(d: Driver) -> Dialect {
+    match d {
+        Driver::Postgres => Dialect::Postgres,
+        Driver::MySql => Dialect::MySql,
+    }
+}
+
+/// A statement ready to run.
+pub(crate) struct Job {
+    pub name: Option<String>,
+    pub line: usize,
+    pub kind: Kind,
+    pub text: String,
+    pub confirm: bool,
+}
+
+pub(crate) fn kind_name(k: Kind) -> &'static str {
+    match k {
+        Kind::Query => "query",
+        Kind::Read => "read",
+        Kind::Other => "other",
+    }
+}
+
+pub(crate) fn line_of(src: &str, offset: usize) -> usize {
+    src[..offset.min(src.len())].matches('\n').count() + 1
+}
+
+/// Parse errors (unclosed string / comment / `$$`) are fatal, warnings go to stderr.
+pub(crate) fn check_parse(src: &str, file: &SqlFile, path: Option<&Path>) -> Result<(), CliError> {
+    for d in &file.diagnostics {
+        let line = line_of(src, d.range.start);
+        let at = |e: CliError| match path {
+            Some(p) => e.at(p, Some(line)),
+            None => e.at_line(line),
+        };
+        match d.severity {
+            Severity::Error => return Err(at(CliError::new("parse_error", d.message.clone(), 3))),
+            Severity::Warning => eprintln!("{} {}line {line}: {}", paint("warning:", YELLOW, true), path.map(|p| format!("{}: ", p.display())).unwrap_or_default(), d.message),
+        }
+    }
+    Ok(())
+}
+
+/// Index of a statement: `@name` (the `@` is optional), `:LINE` (any line; a line between
+/// statements belongs to the previous one, like the cursor in the editor) or `#N` (1-based).
+pub(crate) fn find(src: &str, file: &SqlFile, addr: &str, path: &Path) -> Result<usize, CliError> {
+    let sts = &file.statements;
+    let found = if let Some(l) = addr.strip_prefix(':') {
+        let lines = src.split('\n').count();
+        l.parse::<usize>().ok().filter(|l| (1..=lines).contains(l)).filter(|_| !sts.is_empty()).map(|l| {
+            let offset: usize = src.split_inclusive('\n').take(l - 1).map(str::len).sum();
+            sts.partition_point(|s| s.range.start <= offset).saturating_sub(1)
+        })
+    } else if let Some(n) = addr.strip_prefix('#') {
+        n.parse::<usize>().ok().filter(|n| (1..=sts.len()).contains(n)).map(|n| n - 1)
+    } else {
+        let name = addr.strip_prefix('@').unwrap_or(addr);
+        sts.iter().position(|s| s.name.as_deref() == Some(name))
+    };
+    found.ok_or_else(|| {
+        let names: Vec<&str> = sts.iter().filter_map(|s| s.name.as_deref()).collect();
+        CliError::new("statement_not_found", format!("no statement '{addr}'"), 3)
+            .at(path, None)
+            .hint(format!("use a name ({}), :LINE or #N (1..={})", names.join(", "), sts.len()))
+    })
+}
+
+/// Why a statement needs confirmation on a guarded connection, if it does:
+/// `UPDATE` / `DELETE` without a top-level `WHERE`, `DROP`, `TRUNCATE`, `ALTER`.
+// ponytail: looks at the first word only, so `WITH x AS (DELETE …)` is not caught; the server's
+// read_only mode is the real guard.
+pub(crate) fn destructive(sql: &str, dialect: Dialect) -> Option<&'static str> {
+    let words = top_level_words(sql, dialect == Dialect::MySql);
+    match words.first()?.as_str() {
+        "DROP" => Some("DROP"),
+        "TRUNCATE" => Some("TRUNCATE"),
+        "ALTER" => Some("ALTER"),
+        "UPDATE" if !words.iter().any(|w| w == "WHERE") => Some("UPDATE without WHERE"),
+        "DELETE" if !words.iter().any(|w| w == "WHERE") => Some("DELETE without WHERE"),
+        _ => None,
+    }
+}
+
+/// Upper-cased words outside strings, quoted identifiers, comments, dollar quotes and parentheses.
+fn top_level_words(sql: &str, mysql: bool) -> Vec<String> {
+    let b = sql.as_bytes();
+    let (mut i, mut depth, mut words) = (0, 0usize, Vec::new());
+    while i < b.len() {
+        match b[i] {
+            b'-' if b.get(i + 1) == Some(&b'-') => i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i),
+            b'#' if mysql => i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i),
+            b'/' if b.get(i + 1) == Some(&b'*') => i += sql[i + 2..].find("*/").map_or(b.len() - i, |e| e + 4),
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if mysql && b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'$' if !mysql => {
+                let n = b[i + 1..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
+                if b.get(i + 1 + n) == Some(&b'$') && !b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    let tag = &sql[i..i + n + 2];
+                    i += tag.len();
+                    i += sql[i..].find(tag).map_or(b.len() - i, |e| e + tag.len());
+                } else {
+                    i += 1;
+                }
+            }
+            b'(' => (depth, i) = (depth + 1, i + 1),
+            b')' => (depth, i) = (depth.saturating_sub(1), i + 1),
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let len = b[i..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
+                if depth == 0 {
+                    words.push(sql[i..i + len].to_ascii_uppercase());
+                }
+                i += len;
+            }
+            _ => i += 1,
+        }
+    }
+    words
+}
+
+/// Exit code of a failed statement: 2 when the connection is gone, 5 for an SQL error.
+pub(crate) fn sql_exit(e: &DbError) -> u8 {
+    if e.connection_lost { 2 } else { 5 }
+}
+
+fn ask(question: &str) -> bool {
+    eprint!("{question} [y/N] ");
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).is_ok() && matches!(s.trim(), "y" | "Y" | "yes")
+}
+
+/// Refuses (exit 4) or, in a terminal, asks, for every statement that needs confirmation.
+/// Runs before anything executes, so a refusal never leaves a half-run batch.
+fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes: bool) -> Result<(), CliError> {
+    let guarded = conn.read_only || env.settings.connections.is_prod(&conn.name);
+    let policy = env.settings.run.confirm_destructive;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    for j in jobs {
+        let reason = if j.confirm {
+            Some("marked -- @confirm")
+        } else if policy == ConfirmDestructive::Always || (policy == ConfirmDestructive::Prod && guarded) {
+            destructive(&j.text, dialect_of(conn.driver))
+        } else {
+            None
+        };
+        let Some(reason) = reason else { continue };
+        if yes {
+            continue;
+        }
+        let first = j.text.lines().next().unwrap_or("");
+        if interactive && ask(&format!("{} on '{}' ({reason}): {first}\nRun?", paint("confirm", YELLOW, true), conn.name)) {
+            continue;
+        }
+        let err = CliError::new(
+            if interactive { "cancelled" } else { "confirmation_required" },
+            format!("statement at line {} on '{}' needs confirmation: {reason}", j.line, conn.name),
+            4,
+        );
+        let err = match file {
+            Some(p) => err.at(p, Some(j.line)),
+            None => err.at_line(j.line),
+        };
+        return Err(if interactive { err } else { err.hint("pass --yes to run it") });
+    }
+    Ok(())
+}
+
+/// Effective row limit: the flag (default 100), never above `results.max_rows`.
+pub(crate) fn row_limit(flag: Option<usize>, hard: usize) -> usize {
+    let hard = hard.max(1);
+    match flag {
+        None => DEFAULT_MAX_ROWS.min(hard),
+        Some(0) => hard,
+        Some(n) => n.min(hard),
+    }
+}
+
+/// Opens the session, runs the jobs in order and prints one result per statement.
+/// JSON: one object, or an array for several statements; JSON lines: one object per line.
+pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs: Vec<Job>, o: &ExecOpts, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    if jobs.is_empty() {
+        return Err(CliError::new("no_statements", "nothing to run", 3));
+    }
+    conn.read_only |= o.read_only;
+    confirm(env, &conn, &jobs, file, o.yes)?;
+    let cap = row_limit(o.max_rows, env.settings.results.max_rows);
+    let rt = runtime();
+    let mut session = rt.block_on(Session::open(&conn)).map_err(|e| CliError::new("connection_failed", format!("connection '{}': {e}", conn.name), 2))?;
+    session.max_rows = cap;
+    let page = Page { size: cap as u64, ..Page::default() };
+    let file_name = file.map(|p| p.display().to_string());
+    let (mut exit, mut items) = (0, Vec::new());
+    for (n, j) in jobs.iter().enumerate() {
+        let result = rt.block_on(session.run(&j.text, j.kind, &page));
+        let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, result: &result, max_rows: cap };
+        if let Err(e) = &result {
+            exit = exit.max(sql_exit(e));
+        }
+        match format {
+            Format::Table | Format::Csv => {
+                let heading = (jobs.len() > 1).then(|| format!("-- {} (line {})", j.name.as_deref().unwrap_or_else(|| j.text.lines().next().unwrap_or("")), j.line));
+                if n > 0 {
+                    put(out, "");
+                }
+                item_text(&item, format, heading, out);
+                if let Err(e) = &result {
+                    print_sql_error(e);
+                }
+            }
+            Format::Jsonl => put(out, item_json(&item).to_string()),
+            Format::Json => items.push(item_json(&item)),
+        }
+        if result.is_err() && env.settings.run.stop_on_error {
+            break;
+        }
+    }
+    if format == Format::Json {
+        let v = match <[Value; 1]>::try_from(items) {
+            Ok([one]) => one,
+            Err(many) => Value::Array(many),
+        };
+        put(out, v.to_string());
+    }
+    rt.block_on(session.close());
+    Ok(exit)
+}
+
+/// `siesta run`.
+pub(crate) fn run(a: RunArgs, out: &mut dyn Write) -> Result<u8, CliError> {
+    let format = Format::resolve(a.opts.output);
+    let src = std::fs::read_to_string(&a.file).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&a.file, None))?;
+    let path = std::path::absolute(&a.file).unwrap_or_else(|_| a.file.clone());
+    let env = Env::load(&path, &a.opts.conn.connections_files);
+    // The directive is the same in both dialects; the real dialect needs the connection.
+    let directive = sql_split::split(&src, Dialect::Postgres).connection;
+    let conn = env.resolve(a.opts.conn.connection.as_deref(), directive.as_deref()).map_err(|e| e.at(&a.file, None))?;
+    let file = sql_split::split(&src, dialect_of(conn.driver));
+    check_parse(&src, &file, Some(&a.file))?;
+    let picked: Vec<usize> = if a.statements.is_empty() {
+        (0..file.statements.len()).collect()
+    } else {
+        a.statements.iter().map(|s| find(&src, &file, s, &a.file)).collect::<Result<_, _>>()?
+    };
+    if picked.is_empty() {
+        return Err(CliError::new("no_statements", "no statements in file", 3).at(&a.file, None));
+    }
+    let jobs = picked.into_iter().map(|i| job(&src, &file, i)).collect();
+    execute(&env, conn, Some(&a.file), jobs, &a.opts, format, out)
+}
+
+fn job(src: &str, file: &SqlFile, i: usize) -> Job {
+    let st = &file.statements[i];
+    Job { name: st.name.clone(), line: st.line, kind: st.kind, text: st.text(src).to_string(), confirm: st.confirm }
+}
+
+/// `siesta exec`.
+pub(crate) fn exec(a: ExecArgs, out: &mut dyn Write) -> Result<u8, CliError> {
+    let format = Format::resolve(a.opts.output);
+    let sql = match a.sql.as_deref() {
+        Some(s) if s != "-" => s.to_string(),
+        _ if std::io::stdin().is_terminal() => return Err(CliError::new("no_sql", "no SQL given", 3).hint("pass it as an argument or on stdin")),
+        _ => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).map_err(|e| CliError::new("io_error", e.to_string(), 3))?;
+            s
+        }
+    };
+    let probe = std::env::current_dir().unwrap_or_default().join("_.sql");
+    let env = Env::load(&probe, &a.opts.conn.connections_files);
+    let conn = env.resolve(a.opts.conn.connection.as_deref(), None)?;
+    let file = sql_split::split(&sql, dialect_of(conn.driver));
+    check_parse(&sql, &file, None)?;
+    let jobs = (0..file.statements.len()).map(|i| job(&sql, &file, i)).collect();
+    execute(&env, conn, None, jobs, &a.opts, format, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PG: Dialect = Dialect::Postgres;
+    const MY: Dialect = Dialect::MySql;
+
+    #[test]
+    fn statement_addresses() {
+        let src = "-- @name one\nSELECT 1;\n\n-- @name two\nSELECT 2\n  FROM t;\n\nSELECT 3;\n";
+        let file = sql_split::split(src, PG);
+        let p = Path::new("a.sql");
+        let at = |a: &str| find(src, &file, a, p).ok();
+        assert_eq!([at("one"), at("@two"), at("#3"), at("#1")], [Some(0), Some(1), Some(2), Some(0)]);
+        // :LINE: any line of the statement, a blank line belongs to the previous one.
+        assert_eq!([at(":2"), at(":3"), at(":5"), at(":6"), at(":7"), at(":8"), at(":1")], [Some(0), Some(0), Some(1), Some(1), Some(1), Some(2), Some(0)]);
+        assert_eq!([at("#0"), at("#4"), at(":0"), at(":99"), at("nope"), at(":x")], [None; 6]);
+        let e = find(src, &file, "nope", p).unwrap_err();
+        assert_eq!(e.exit, 3);
+        assert!(e.hint.unwrap().contains("one, two"));
+    }
+
+    #[test]
+    fn destructive_statements() {
+        let d = |s| destructive(s, PG);
+        assert_eq!(d("DROP TABLE t"), Some("DROP"));
+        assert_eq!(d("  truncate t"), Some("TRUNCATE"));
+        assert_eq!(d("alter table t add c int"), Some("ALTER"));
+        assert_eq!(d("DELETE FROM t"), Some("DELETE without WHERE"));
+        assert_eq!(d("update t set a = 1"), Some("UPDATE without WHERE"));
+        assert_eq!(d("DELETE FROM t WHERE id = 1"), None);
+        assert_eq!(d("UPDATE t SET a = (SELECT x FROM y WHERE y.id = 1)"), Some("UPDATE without WHERE"));
+        assert_eq!(d("UPDATE t SET a = 1 WHERE id IN (SELECT 1)"), None);
+        assert_eq!(d("-- where\nDELETE FROM t /* WHERE */"), Some("DELETE without WHERE"));
+        assert_eq!(d("DELETE FROM t WHERE note = 'x' OR true"), None);
+        assert_eq!(d("UPDATE t SET note = 'where'"), Some("UPDATE without WHERE"));
+        assert_eq!(d("UPDATE t SET a = $$ where $$"), Some("UPDATE without WHERE"));
+        assert_eq!(d("UPDATE t SET a = $1"), Some("UPDATE without WHERE"));
+        assert_eq!(d("UPDATE t SET a = $1 WHERE id = $2"), None);
+        assert_eq!(d("SELECT * FROM t FOR UPDATE"), None);
+        assert_eq!(d("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1"), None);
+        assert_eq!(d("select 'DROP TABLE t'"), None);
+        assert_eq!(d(""), None);
+        // MySQL: backslash escapes and `#` comments.
+        assert_eq!(destructive(r"UPDATE t SET a = 'it\'s where' ", MY), Some("UPDATE without WHERE"));
+        assert_eq!(destructive("DELETE FROM t # where\n", MY), Some("DELETE without WHERE"));
+        assert_eq!(destructive("DELETE FROM t WHERE a = `where`", MY), None);
+    }
+
+    #[test]
+    fn exit_codes_of_sql_errors() {
+        assert_eq!(sql_exit(&DbError { code: Some("42P01".into()), ..Default::default() }), 5);
+        assert_eq!(sql_exit(&DbError { message: "decode".into(), ..Default::default() }), 5);
+        assert_eq!(sql_exit(&DbError { connection_lost: true, ..Default::default() }), 2);
+    }
+
+    #[test]
+    fn row_limits() {
+        assert_eq!([row_limit(None, 10_000), row_limit(None, 50), row_limit(Some(0), 500), row_limit(Some(7), 500), row_limit(Some(9999), 500)], [100, 50, 500, 7, 500]);
+    }
+
+    fn env(prod: &str) -> Env {
+        let mut settings = Settings::default();
+        settings.connections.prod_pattern = prod.into();
+        Env { settings, conns: Connections::default() }
+    }
+
+    fn conn(name: &str, read_only: bool) -> Connection {
+        let s = r#"{"driver":"postgres","host":"h"}"#;
+        let dir = std::env::temp_dir().join(format!("siesta-cli-unit-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("siesta.json"), format!("{{\"{name}\": {s}}}")).unwrap();
+        let mut c = Connections::load(&dir.join("a.sql"), &dir, &[]).connections.remove(name).unwrap();
+        c.read_only = read_only;
+        std::fs::remove_dir_all(&dir).ok();
+        c
+    }
+
+    fn job_of(sql: &str, confirm: bool) -> Job {
+        Job { name: None, line: 1, kind: Kind::Other, text: sql.into(), confirm }
+    }
+
+    #[test]
+    fn confirmation_rules() {
+        // Not a terminal in tests: confirmation means refusal (exit 4) unless --yes.
+        let refused = |e: &Env, c: &Connection, j: Job, yes| confirm(e, c, &[j], None, yes).err().map(|e| e.exit);
+        let e = env("prod*");
+        let prod = conn("prod-db", false);
+        let dev = conn("dev-db", false);
+        let ro = conn("dev-ro", true);
+        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), false), Some(4));
+        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), true), None);
+        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t WHERE id = 1", false), false), None);
+        assert_eq!(refused(&e, &ro, job_of("DROP TABLE t", false), false), Some(4));
+        assert_eq!(refused(&e, &dev, job_of("DROP TABLE t", false), false), None);
+        assert_eq!(refused(&e, &dev, job_of("SELECT 1", true), false), Some(4));
+        assert_eq!(refused(&e, &dev, job_of("SELECT 1", true), true), None);
+        let mut always = env("prod*");
+        always.settings.run.confirm_destructive = ConfirmDestructive::Always;
+        assert_eq!(refused(&always, &dev, job_of("TRUNCATE t", false), false), Some(4));
+        let mut never = env("prod*");
+        never.settings.run.confirm_destructive = ConfirmDestructive::Never;
+        assert_eq!(refused(&never, &prod, job_of("TRUNCATE t", false), false), None);
+        assert_eq!(refused(&never, &prod, job_of("SELECT 1", true), false), Some(4));
+    }
+}

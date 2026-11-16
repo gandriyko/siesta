@@ -1,1 +1,467 @@
-//! CLI commands, output formats and exit codes.
+//! `siesta <command>`: the same core as the GUI, for terminals, CI and agents.
+//! Exit codes: 0 ok · 2 connection error · 3 parse error / unknown connection or statement /
+//! bad input · 4 refused (confirmation needed) · 5 SQL error.
+
+mod output;
+mod run;
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Args, Parser, Subcommand};
+use db_exec::{DbError, Page, Session, Table};
+use serde_json::{Value, json};
+use sql_split::{Dialect, Kind};
+
+use output::{Format, RED, emit_objects, paint, put, render_csv, render_table};
+use run::{ConnArgs, Env, ExecArgs, RunArgs, dialect_of, kind_name, line_of};
+
+#[derive(Parser)]
+#[command(name = "siesta", version, about = "Lightweight SQL client: Postgres and MySQL / MariaDB")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List statements: file, line, name, first line
+    List {
+        /// .sql file or directory (default: current directory)
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        files: FilesArg,
+        #[arg(long, value_enum)]
+        output: Option<Format>,
+    },
+    /// Run statements of a file (all in file order when none are given)
+    Run(RunArgs),
+    /// Run SQL from an argument or stdin
+    Exec(ExecArgs),
+    /// Connections from siesta.json / siesta.private.json (secrets masked)
+    Connections {
+        #[command(subcommand)]
+        cmd: Option<ConnCmd>,
+        #[command(flatten)]
+        files: FilesArg,
+        #[arg(long, value_enum, global = true)]
+        output: Option<Format>,
+    },
+    /// Tables, columns and indexes of a connection (for writing correct SQL)
+    Schema(SchemaArgs),
+}
+
+#[derive(Subcommand)]
+enum ConnCmd {
+    /// The connections visible from the current directory (the default)
+    List,
+    /// Open a connection and report the server version
+    Test {
+        /// Connection name
+        name: String,
+    },
+}
+
+#[derive(Args, Clone, Default)]
+struct FilesArg {
+    /// Extra connection file above the siesta*.json chain (repeatable)
+    #[arg(long = "connections-file", value_name = "PATH", global = true)]
+    files: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+struct SchemaArgs {
+    /// `table` or `schema.table`; none = every table and view
+    table: Option<String>,
+    #[command(flatten)]
+    conn: ConnArgs,
+    /// Print the CREATE statement of the table instead of its columns
+    #[arg(long)]
+    ddl: bool,
+    #[arg(long, value_enum)]
+    output: Option<Format>,
+}
+
+impl Cli {
+    fn format(&self) -> Format {
+        Format::resolve(match &self.cmd {
+            Cmd::List { output, .. } | Cmd::Connections { output, .. } => *output,
+            Cmd::Run(a) => a.opts.output,
+            Cmd::Exec(a) => a.opts.output,
+            Cmd::Schema(a) => a.output,
+        })
+    }
+}
+
+const COMMANDS: &[&str] = &["list", "run", "exec", "connections", "schema", "help", "--help", "-h", "--version", "-V"];
+
+/// Whether these arguments (without the program name) are a CLI call; otherwise they mean
+/// "open the GUI": nothing, `open`, a path.
+pub fn is_cli(args: &[String]) -> bool {
+    args.first().is_some_and(|a| COMMANDS.contains(&a.as_str()))
+}
+
+/// The GUI binary calls this first; `None` means "not a CLI command, open the GUI".
+pub fn main_if_cli() -> Option<ExitCode> {
+    let args: Vec<String> = std::env::args().collect();
+    if !is_cli(&args[1..]) {
+        return None;
+    }
+    Some(ExitCode::from(run_with(args, &mut std::io::stdout().lock())))
+}
+
+/// Runs the CLI with `args` (program name first), writing results to `out`. Returns the exit code.
+pub fn run_with<I: IntoIterator<Item = String>>(args: I, out: &mut dyn Write) -> u8 {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(c) => c,
+        Err(e) => {
+            // Help and version go to stdout with 0; usage errors are bad input.
+            let _ = e.print();
+            return if e.use_stderr() { 3 } else { 0 };
+        }
+    };
+    let format = cli.format();
+    match dispatch(cli, out) {
+        Ok(code) => code,
+        Err(e) => {
+            e.print(format.human(), out);
+            e.exit
+        }
+    }
+}
+
+fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
+    let format = cli.format();
+    match cli.cmd {
+        Cmd::List { path, files, output: _ } => list(&path.unwrap_or_else(|| ".".into()), &files.files, format, out),
+        Cmd::Run(a) => run::run(a, out),
+        Cmd::Exec(a) => run::exec(a, out),
+        Cmd::Connections { cmd: None | Some(ConnCmd::List), files, .. } => connections(&files.files, format, out),
+        Cmd::Connections { cmd: Some(ConnCmd::Test { name }), files, .. } => test_connection(&name, &files.files, format, out),
+        Cmd::Schema(a) => schema(a, format, out),
+    }
+}
+
+/// `{"error":{"code","message","file","line","hint"}}` in JSON mode, `error: …` otherwise.
+#[derive(Debug)]
+pub(crate) struct CliError {
+    pub code: &'static str,
+    pub message: String,
+    pub file: Option<PathBuf>,
+    pub line: Option<usize>,
+    pub hint: Option<String>,
+    pub exit: u8,
+}
+
+impl CliError {
+    pub fn new(code: &'static str, message: impl Into<String>, exit: u8) -> Self {
+        Self { code, message: message.into(), file: None, line: None, hint: None, exit }
+    }
+
+    pub fn at(mut self, file: &Path, line: Option<usize>) -> Self {
+        (self.file, self.line) = (Some(file.to_path_buf()), line);
+        self
+    }
+
+    pub fn at_line(mut self, line: usize) -> Self {
+        self.line = Some(line);
+        self
+    }
+
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn json(&self) -> Value {
+        json!({ "error": {
+            "code": self.code, "message": self.message,
+            "file": self.file.as_ref().map(|f| f.display().to_string()), "line": self.line, "hint": self.hint,
+        }})
+    }
+
+    pub fn print(&self, human: bool, out: &mut dyn Write) {
+        if !human {
+            put(out, self.json().to_string());
+            return;
+        }
+        let at = match (&self.file, self.line) {
+            (Some(f), Some(l)) => format!("{}:{l}: ", f.display()),
+            (Some(f), None) => format!("{}: ", f.display()),
+            (None, Some(l)) => format!("line {l}: "),
+            _ => String::new(),
+        };
+        eprintln!("{} {at}{}", paint("error:", RED, true), self.message);
+        if let Some(h) = &self.hint {
+            eprintln!("  hint: {h}");
+        }
+    }
+}
+
+/// A failed catalog / version query.
+fn db_error(e: &DbError) -> CliError {
+    CliError::new(if e.connection_lost { "connection_lost" } else { "sql_error" }, e.to_string(), run::sql_exit(e))
+}
+
+/// The CLI creates its own tokio runtime (sqlx needs one); nothing else is async.
+pub(crate) fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime")
+}
+
+fn cwd_probe() -> PathBuf {
+    std::env::current_dir().unwrap_or_default().join("_.sql")
+}
+
+fn open_session(env: &Env, name: &str) -> Result<(tokio::runtime::Runtime, Session, db_conn::Connection), CliError> {
+    let conn = env.pick(name)?;
+    let rt = runtime();
+    let s = rt.block_on(Session::open(&conn)).map_err(|e| CliError::new("connection_failed", format!("connection '{name}': {e}"), 2))?;
+    Ok((rt, s, conn))
+}
+
+/// `.sql` files under `path` (respects .gitignore), or `path` itself.
+fn sql_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+    let mut files: Vec<PathBuf> = ignore::Walk::new(path).flatten().map(|e| e.into_path()).filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "sql")).collect();
+    files.sort();
+    files
+}
+
+fn list(path: &Path, extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    if !path.exists() {
+        return Err(CliError::new("file_not_found", "no such file or directory", 3).at(path, None));
+    }
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let env = Env::load(&if path.is_file() { abs.clone() } else { abs.join("_.sql") }, extra);
+    let mut rows = vec![];
+    for f in sql_files(path) {
+        let src = std::fs::read_to_string(&f).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&f, None))?;
+        // The dialect comes from the file's `-- @connection`, else Postgres.
+        let dialect = sql_split::split(&src, Dialect::Postgres).connection.and_then(|n| env.conns.connections.get(&n).map(|c| dialect_of(c.driver))).unwrap_or_default();
+        let file = sql_split::split(&src, dialect);
+        for d in file.diagnostics.iter().filter(|d| d.severity == sql_split::Severity::Error) {
+            eprintln!("{} {}:{}: {}", paint("warning:", output::YELLOW, true), f.display(), line_of(&src, d.range.start), d.message);
+        }
+        for st in &file.statements {
+            rows.push(json!({ "file": f.display().to_string(), "line": st.line, "name": st.name, "statement": st.label(&src), "kind": kind_name(st.kind) }));
+        }
+    }
+    emit_objects(out, format, &["file", "line", "name", "statement", "kind"], &rows);
+    Ok(0)
+}
+
+fn connections(extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let env = Env::load(&cwd_probe(), extra);
+    let mut rows: Vec<Value> = env
+        .conns
+        .connections
+        .values()
+        .map(|c| {
+            let mut v = db_conn::masked(c);
+            v["prod"] = json!(env.settings.connections.is_prod(&c.name));
+            v
+        })
+        .collect();
+    rows.extend(env.conns.errors.iter().map(|(n, e)| json!({ "name": n, "error": e })));
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    emit_objects(out, format, &["name", "driver", "url", "host", "port", "database", "user", "read_only", "prod", "error"], &rows);
+    Ok(0)
+}
+
+fn test_connection(name: &str, extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let env = Env::load(&cwd_probe(), extra);
+    let started = std::time::Instant::now();
+    let (rt, mut s, _) = open_session(&env, name)?;
+    let version = rt.block_on(s.run("SELECT version()", Kind::Query, &Page::default())).map_err(|e| db_error(&e))?;
+    let version = version.rows.first().and_then(|r| r.first()).map(|v| v.display()).unwrap_or_default();
+    let ms = started.elapsed().as_millis() as u64;
+    rt.block_on(s.close());
+    if format.human() {
+        put(out, format!("OK {name}: {version} ({ms} ms)"));
+    } else {
+        put(out, json!({ "connection": name, "ok": true, "server": version, "duration_ms": ms }).to_string());
+    }
+    Ok(0)
+}
+
+fn table_json(schema: &str, t: &Table) -> Value {
+    let mut v = serde_json::to_value(t).unwrap_or_default();
+    v["schema"] = json!(schema);
+    v
+}
+
+fn schema(a: SchemaArgs, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    if a.ddl && a.table.is_none() {
+        return Err(CliError::new("bad_argument", "--ddl needs a table", 3));
+    }
+    let env = Env::load(&cwd_probe(), &a.conn.connections_files);
+    let name = env.resolve(a.conn.connection.as_deref(), None)?.name;
+    let (rt, mut s, _) = open_session(&env, &name)?;
+    let schema = rt.block_on(s.schema()).map_err(|e| db_error(&e))?;
+    let Some(want) = &a.table else {
+        rt.block_on(s.close());
+        let tables: Vec<Value> = schema.schemas.iter().flat_map(|n| n.tables.iter().map(|t| table_json(&n.name, t))).collect();
+        match format {
+            Format::Json => put(out, json!({ "schema": "siesta.schema/v1", "connection": name, "schemas": schema.schemas }).to_string()),
+            Format::Jsonl => tables.iter().for_each(|t| put(out, t.to_string())),
+            _ => {
+                let rows: Vec<Value> = schema.schemas.iter().flat_map(|n| n.tables.iter().map(|t| {
+                    let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+                    json!({ "schema": n.name, "name": t.name, "kind": t.kind, "columns": cols.join(", ") })
+                })).collect();
+                emit_objects(out, format, &["schema", "name", "kind", "columns"], &rows);
+            }
+        }
+        return Ok(0);
+    };
+    let Some((sch, t)) = schema.find(want) else {
+        let all: Vec<String> = schema.schemas.iter().flat_map(|n| n.tables.iter().map(|t| format!("{}.{}", n.name, t.name))).collect();
+        let needle = want.rsplit('.').next().unwrap_or(want).to_lowercase();
+        let near: Vec<&str> = all.iter().filter(|n| n.to_lowercase().contains(&needle)).take(10).map(String::as_str).collect();
+        let hint = if near.is_empty() { "run `siesta schema -c <connection>` to list the tables".to_string() } else { format!("similar: {}", near.join(", ")) };
+        return Err(CliError::new("table_not_found", format!("no table '{want}' on '{name}'"), 3).hint(hint));
+    };
+    let ddl = if a.ddl { Some(rt.block_on(s.table_ddl(sch, &t.name)).map_err(|e| db_error(&e))?) } else { None };
+    rt.block_on(s.close());
+    let mut obj = table_json(sch, t);
+    if let Some(d) = &ddl {
+        obj["ddl"] = json!(d);
+    }
+    match (format, ddl) {
+        (Format::Json, _) => put(out, json!({ "schema": "siesta.schema/v1", "connection": name, "table": obj }).to_string()),
+        (Format::Jsonl, _) => put(out, obj.to_string()),
+        (_, Some(d)) => put(out, d),
+        (f, None) => {
+            let cols = ["column", "type", "nullable", "primary_key"].map(String::from);
+            let rows: Vec<Vec<String>> = t.columns.iter().map(|c| vec![c.name.clone(), c.data_type.clone(), c.nullable.to_string(), c.primary_key.to_string()]).collect();
+            if f == Format::Csv {
+                put(out, render_csv(&cols, &rows));
+            } else {
+                put(out, format!("{sch}.{} ({})", t.name, if t.kind == db_exec::TableKind::View { "view" } else { "table" }));
+                put(out, render_table(&cols, &rows));
+                for i in &t.indexes {
+                    put(out, format!("index {} ({}){}{}", i.name, i.columns.join(", "), if i.primary { " PRIMARY KEY" } else { "" }, if i.unique && !i.primary { " UNIQUE" } else { "" }));
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The agent skill documents every command, long flag and directive; extend it when this fails.
+    #[test]
+    fn skill_covers_cli() {
+        use clap::CommandFactory as _;
+        let skill = include_str!("../../../skills/siesta/SKILL.md");
+        fn walk(cmd: &clap::Command, path: &str, skill: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands().filter(|s| s.get_name() != "help") {
+                let path = format!("{path} {}", sub.get_name());
+                if !skill.contains(&path) {
+                    missing.push(path.clone());
+                }
+                let flags = sub.get_arguments().filter_map(|a| a.get_long()).filter(|l| *l != "help");
+                missing.extend(flags.filter(|l| !skill.contains(&format!("--{l}"))).map(|l| format!("{path} --{l}")));
+                walk(sub, &path, skill, missing);
+            }
+        }
+        let mut missing = vec![];
+        walk(&Cli::command(), "siesta", skill, &mut missing);
+        missing.extend(sql_split::DIRECTIVES.iter().filter(|d| !skill.contains(&format!("@{d}"))).map(|d| format!("@{d}")));
+        for code in ["0", "2", "3", "4", "5"] {
+            if !skill.contains(&format!("| `{code}` |")) {
+                missing.push(format!("exit code {code}"));
+            }
+        }
+        assert!(missing.is_empty(), "skills/siesta/SKILL.md misses: {missing:?}");
+    }
+
+    #[test]
+    fn arg_routing() {
+        for cli in [&["list", "a.sql"][..], &["run", "a.sql"], &["exec", "-c", "x", "SELECT 1"], &["connections"], &["schema"], &["--help"], &["-V"], &["help"]] {
+            assert!(is_cli(&args(cli)), "{cli:?}");
+        }
+        // GUI: no arguments, `open`, a path (with or without :line).
+        for gui in [&[][..], &["open"], &["open", "a.sql:3"], &["/tmp/project"], &["a.sql"], &["a.sql:12"], &["."]] {
+            assert!(!is_cli(&args(gui)), "{gui:?}");
+        }
+    }
+
+    #[test]
+    fn bad_input_exits_3_and_help_exits_0() {
+        let mut out = vec![];
+        assert_eq!(run_with(args(&["siesta", "run"]), &mut out), 3);
+        assert_eq!(run_with(args(&["siesta", "run", "a.sql", "--output", "xml"]), &mut out), 3);
+        assert_eq!(run_with(args(&["siesta", "--version"]), &mut out), 0);
+    }
+
+    #[test]
+    fn errors_map_to_exit_codes_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.sql");
+        std::fs::write(&f, "SELECT 1;").unwrap();
+        let go = |extra: &[&str]| {
+            let mut a = args(&["siesta"]);
+            a.extend(extra.iter().map(|s| s.to_string()));
+            let mut out = vec![];
+            let code = run_with(a, &mut out);
+            (code, serde_json::from_slice::<Value>(&out).unwrap_or(Value::Null))
+        };
+        let file = f.to_str().unwrap();
+        // No connection chosen, unknown connection, missing file, unknown statement: all 3.
+        let (code, v) = go(&["run", file, "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("no_connection")));
+        let (code, v) = go(&["run", file, "-c", "nope", "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("unknown_connection")));
+        let (code, v) = go(&["run", "/no/such.sql", "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("file_not_found")));
+        // Unreachable server: 2.
+        std::fs::write(dir.path().join("siesta.json"), r#"{"dead": {"driver": "postgres", "host": "127.0.0.1", "port": 1, "database": "x", "user": "u"}}"#).unwrap();
+        let (code, v) = go(&["run", file, "-c", "dead", "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (2, Some("connection_failed")));
+        let (code, v) = go(&["run", file, "-c", "dead", "#9", "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("statement_not_found")));
+        // Unclosed string: parse error.
+        std::fs::write(&f, "SELECT 'abc;").unwrap();
+        let (code, v) = go(&["run", file, "-c", "dead", "--output", "json"]);
+        assert_eq!((code, v["error"]["code"].as_str()), (3, Some("parse_error")));
+    }
+
+    #[test]
+    fn list_prints_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.sql"), "-- @name one\nSELECT 1;\nDELETE FROM t;\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x").unwrap();
+        let mut out = vec![];
+        let code = run_with(args(&["siesta", "list", dir.path().to_str().unwrap(), "--output", "jsonl"]), &mut out);
+        assert_eq!(code, 0);
+        let rows: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0]["name"].as_str(), rows[0]["line"].as_u64(), rows[0]["kind"].as_str()), (Some("one"), Some(2), Some("query")));
+        assert_eq!((rows[1]["statement"].as_str(), rows[1]["kind"].as_str()), (Some("DELETE FROM t"), Some("other")));
+    }
+
+    #[test]
+    fn connections_are_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("siesta.json"), r#"{"dev": {"driver": "mysql", "url": "mysql://u@h/db", "password": "hunter2"}}"#).unwrap();
+        let file = dir.path().join("x.json");
+        std::fs::write(&file, r#"{"extra": {"driver": "postgres", "host": "h", "password": "s3cret"}}"#).unwrap();
+        let mut out = vec![];
+        // Run from the temp dir's perspective through --connections-file (cwd is the crate).
+        let code = run_with(args(&["siesta", "connections", "--connections-file", file.to_str().unwrap(), "--output", "json"]), &mut out);
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"extra\"") && !text.contains("s3cret"), "{text}");
+    }
+}
