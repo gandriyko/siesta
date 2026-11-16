@@ -27,6 +27,12 @@ async fn rejected_login_names_the_fix_pg() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn postgres_driver_on_a_mysql_port_fails_fast() {
+    wrong_driver_fails_fast(PG, "SIESTA_TEST_MYSQL_URL", false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn every_value_type() {
     let mut s = open_pg().await;
     run(&mut s, "CREATE TYPE pg_temp.siesta_mood AS ENUM ('sad', 'happy')").await;

@@ -139,6 +139,7 @@ pub struct Stmt {
 struct Opts {
     stop_on_error: bool,
     timeout_ms: Option<u64>,
+    connect_timeout_ms: u64,
     max_rows: usize,
 }
 
@@ -160,7 +161,7 @@ async fn acquire(h: &Handles, conn: &Connection, opts: Opts, token: u64) -> Resu
         return Ok(None);
     }
     if g.is_none() {
-        let s = Session::open(conn).await?;
+        let s = Session::open_with(conn, Duration::from_millis(opts.connect_timeout_ms)).await?;
         // One handle for the life of the session: it follows the session across reconnects.
         *h.cancel.lock().unwrap() = Some(s.cancel_handle());
         *g = Some(s);
@@ -249,7 +250,7 @@ fn first_line(s: &str) -> String {
 impl Siesta {
     fn opts(&self) -> Opts {
         let s = &self.settings.settings;
-        Opts { stop_on_error: s.run.stop_on_error, timeout_ms: s.run.statement_timeout_ms, max_rows: s.results.max_rows }
+        Opts { stop_on_error: s.run.stop_on_error, timeout_ms: s.run.statement_timeout_ms, connect_timeout_ms: s.run.connect_timeout_ms, max_rows: s.results.max_rows }
     }
 
     /// The connection of `path` by name: spec, or why it is unusable.
@@ -328,9 +329,10 @@ impl Siesta {
             Ok(c) => c,
             Err(e) => return window.push_notification(e, cx),
         };
+        let timeout = Duration::from_millis(self.settings.settings.run.connect_timeout_ms);
         let handle = RT.spawn(async move {
             let t = Instant::now();
-            let s = Session::open(&conn).await?;
+            let s = Session::open_with(&conn, timeout).await?;
             s.close().await;
             Ok::<_, DbError>(t.elapsed())
         });
@@ -784,7 +786,7 @@ mod tests {
     fn cancel_invalidates_queued_runs_without_running_them() {
         use super::{Handles, Opts, Stmt, run_job};
         let (h, rt) = (Handles::new(), &*super::RT);
-        let opts = Opts { stop_on_error: true, timeout_ms: None, max_rows: 10 };
+        let opts = Opts { stop_on_error: true, timeout_ms: None, connect_timeout_ms: 10_000, max_rows: 10 };
         let stmts = || vec![Stmt { text: "SELECT 1".into(), kind: Kind::Query, page: Default::default(), range: None }];
         // A run holds the session; a second one queues behind it.
         let running = rt.block_on(h.session.clone().lock_owned());
@@ -860,7 +862,7 @@ mod tests {
             init_sql: None,
             color: None,
         };
-        let opts = Opts { stop_on_error: true, timeout_ms: Some(5000), max_rows: 1000 };
+        let opts = Opts { stop_on_error: true, timeout_ms: Some(5000), connect_timeout_ms: 10_000, max_rows: 1000 };
         let stmt = |text: &str, kind| Stmt { text: text.into(), kind, page: db_exec::Page { size: 2, ..Default::default() }, range: None };
         let slot = Slot::new();
         let h = slot.handles.clone();

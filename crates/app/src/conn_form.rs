@@ -2,7 +2,10 @@
 //! Connections page. One form for every connection; it writes `<config dir>/connections/<name>.json`
 //! and keeps the password only in the system keychain (reading and writing is `db_conn::global`).
 
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use db_conn::{ConnectionForm, Driver, SslMode};
 use db_exec::{DbError, Session};
@@ -33,8 +36,22 @@ const SSL_MODES: [(&str, Option<SslMode>); 6] = [
 enum Test {
     Idle,
     Running,
+    Cancelled,
     Ok(String),
     Failed(String),
+}
+
+/// The running Test: dropping it (cancel, form closed) drops the GPUI task, so nothing is written
+/// back into the form, and aborts the connection attempt on the tokio runtime.
+struct Running {
+    _task: Task<()>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 pub(crate) struct ConnForm {
@@ -69,6 +86,7 @@ pub(crate) struct ConnForm {
     prod: bool,
     error: Option<String>,
     test: Test,
+    running: Option<Running>,
 }
 
 impl ConnForm {
@@ -113,6 +131,7 @@ impl ConnForm {
             base: f.base,
             error: None,
             test: Test::Idle,
+            running: None,
         }
     }
 
@@ -186,6 +205,7 @@ impl ConnForm {
             return cx.notify();
         }
         let target = self.target.clone();
+        self.running = None;
         window.close_dialog(cx);
         self.app.update(cx, |this, cx| this.connection_saved(target, name, window, cx)).ok();
     }
@@ -200,15 +220,18 @@ impl ConnForm {
             }
         };
         self.test = Test::Running;
+        let timeout = self.app.read_with(cx, |a, _| Duration::from_millis(a.settings.settings.run.connect_timeout_ms)).unwrap_or(db_exec::CONNECT_TIMEOUT);
         let handle = RT.spawn(async move {
             let t = Instant::now();
-            let s = Session::open(&conn).await?;
+            let s = Session::open_with(&conn, timeout).await?;
             s.close().await;
             Ok::<_, DbError>(t.elapsed())
         });
-        cx.spawn_in(window, async move |this, cx| {
+        let abort = handle.abort_handle();
+        let task = cx.spawn_in(window, async move |this, cx| {
             let r = handle.await;
             this.update(cx, |this, cx| {
+                this.running = None;
                 this.test = match r {
                     Ok(Ok(t)) => Test::Ok(format!("Connected in {} ms", t.as_millis())),
                     Ok(Err(e)) => Test::Failed(e.to_string()),
@@ -217,9 +240,17 @@ impl ConnForm {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.running = Some(Running { _task: task, abort });
         cx.notify();
+    }
+
+    /// Aborts the running Test.
+    fn cancel_test(&mut self, cx: &mut Context<Self>) {
+        if self.running.take().is_some() {
+            self.test = Test::Cancelled;
+            cx.notify();
+        }
     }
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -237,6 +268,7 @@ impl ConnForm {
             }
             this.update_in(cx, |this, window, cx| match db_conn::delete(&this.dir, &name) {
                 Ok(_) => {
+                    this.running = None;
                     window.close_dialog(cx);
                     this.app.update(cx, |app, cx| app.connection_deleted(&name, window, cx)).ok();
                 }
@@ -259,6 +291,7 @@ impl ConnForm {
         match &self.test {
             Test::Idle => None,
             Test::Running => Some(div().text_sm().text_color(muted).child("Connecting…")),
+            Test::Cancelled => Some(div().text_sm().text_color(muted).child("Cancelled")),
             Test::Ok(t) => Some(div().text_sm().text_color(success).child(t.clone())),
             Test::Failed(e) => Some(div().text_sm().text_color(danger).child(e.clone())),
         }
@@ -298,6 +331,7 @@ impl Render for ConnForm {
                 cx.notify();
             }))
         };
+        let testing = matches!(self.test, Test::Running);
         let status = self.status(cx);
         let editing = self.original.is_some();
         let location = format!("Saved to {}; the password is kept only in the system keychain.", db_conn::connections_dir(&self.dir).display());
@@ -323,8 +357,15 @@ impl Render for ConnForm {
                     .pt_1()
                     .when(editing, |r| r.child(Button::new("conn-delete").label("Delete").danger().on_click(cx.listener(|this, _, window, cx| this.delete(window, cx)))))
                     .child(div().flex_1())
-                    .child(Button::new("conn-test").label("Test").on_click(cx.listener(|this, _, window, cx| this.test(window, cx))))
-                    .child(Button::new("conn-cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(if testing {
+                        Button::new("conn-test").label("Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_test(cx)))
+                    } else {
+                        Button::new("conn-test").label("Test").on_click(cx.listener(|this, _, window, cx| this.test(window, cx)))
+                    })
+                    .child(Button::new("conn-cancel").label("Close").on_click(cx.listener(|this, _, window, cx| {
+                        this.running = None;
+                        window.close_dialog(cx);
+                    })))
                     .child(Button::new("conn-save").label("Save").primary().on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))),
             )
     }

@@ -37,6 +37,21 @@ pub async fn rejected_login_names_the_fix(driver: Driver) {
     assert!(e.message.contains("No password is stored for `test-no-password`") && e.message.contains("set-password"), "{e}");
 }
 
+/// `driver` pointed at the port of the other database. It must fail within the connect timeout.
+/// `hangs`: the client waits for a server greeting that never comes (MySQL on Postgres), so the
+/// timeout itself ends it with the "No response" message; the Postgres client instead rejects
+/// MariaDB's greeting at once ("unexpected response from SSLRequest").
+pub async fn wrong_driver_fails_fast(driver: Driver, other_url_var: &str, hangs: bool) {
+    let mut c = connection(driver);
+    c.url = Some(std::env::var(other_url_var).unwrap_or_else(|_| panic!("{other_url_var} is not set; run scripts/test-db.sh")));
+    let t = std::time::Instant::now();
+    let e = Session::open_with(&c, std::time::Duration::from_millis(1500)).await.err().expect("must fail");
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+    if hangs {
+        assert!(e.connection_lost && e.message.starts_with("No response from 127.0.0.1:") && e.message.contains("within 1.5 s"), "{e:?}");
+    }
+}
+
 pub async fn open(driver: Driver) -> Session {
     Session::open(&connection(driver)).await.expect("open session")
 }

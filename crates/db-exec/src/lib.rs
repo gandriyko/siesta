@@ -131,6 +131,39 @@ enum Opts {
     My(MySqlConnectOptions),
 }
 
+/// Default connect timeout (setting `run.connect_timeout_ms`).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(10_000);
+
+impl Opts {
+    /// `host:port` of the effective connection; `None` for a unix socket.
+    fn target(&self) -> Option<String> {
+        let (host, port, socket) = match self {
+            Opts::Pg(o) => (o.get_host(), o.get_port(), o.get_socket().is_some()),
+            Opts::My(o) => (o.get_host(), o.get_port(), o.get_socket().is_some()),
+        };
+        (!socket && !host.starts_with('/')).then(|| format!("{host}:{port}"))
+    }
+}
+
+/// The error of a connection attempt that got no answer in time (counts as a lost connection).
+fn connect_timeout_error(target: Option<&str>, timeout: Duration) -> DbError {
+    let ms = timeout.as_millis();
+    let secs = if ms.is_multiple_of(1000) { (ms / 1000).to_string() } else { format!("{:.1}", ms as f64 / 1000.0) };
+    DbError {
+        message: format!(
+            "No response from {} within {secs} s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306).",
+            target.unwrap_or("the server")
+        ),
+        connection_lost: true,
+        ..Default::default()
+    }
+}
+
+/// Bounds a whole connection attempt: a server that speaks another protocol never answers the handshake.
+async fn within<T>(opts: &Opts, timeout: Duration, f: impl Future<Output = Result<T, DbError>>) -> Result<T, DbError> {
+    tokio::time::timeout(timeout, f).await.unwrap_or_else(|_| Err(connect_timeout_error(opts.target().as_deref(), timeout)))
+}
+
 /// Cancels the running statement of a session from a separate short connection.
 /// The session stays usable (the cancelled run fails with SQLSTATE `57014` / `70100`).
 /// It follows the session's live connection: after an automatic reconnect it targets the new
@@ -139,6 +172,7 @@ enum Opts {
 pub struct CancelHandle {
     opts: std::sync::Arc<Opts>,
     backend_id: Arc<AtomicU64>,
+    connect_timeout: Duration,
 }
 
 impl CancelHandle {
@@ -148,19 +182,22 @@ impl CancelHandle {
             return Ok(());
         }
         let e = |e| DbError::from_sqlx(e, 0, 0);
-        match &*self.opts {
-            Opts::Pg(o) => {
-                let mut c = PgConnection::connect_with(o).await.map_err(e)?;
-                sqlx::query("SELECT pg_cancel_backend($1)").bind(id as i32).execute(&mut c).await.map_err(e)?;
-                let _ = c.close().await;
+        within(&self.opts, self.connect_timeout, async {
+            match &*self.opts {
+                Opts::Pg(o) => {
+                    let mut c = PgConnection::connect_with(o).await.map_err(e)?;
+                    sqlx::query("SELECT pg_cancel_backend($1)").bind(id as i32).execute(&mut c).await.map_err(e)?;
+                    let _ = c.close().await;
+                }
+                Opts::My(o) => {
+                    let mut c = MySqlConnection::connect_with(o).await.map_err(e)?;
+                    sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {id}"))).execute(&mut c).await.map_err(e)?;
+                    let _ = c.close().await;
+                }
             }
-            Opts::My(o) => {
-                let mut c = MySqlConnection::connect_with(o).await.map_err(e)?;
-                sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {id}"))).execute(&mut c).await.map_err(e)?;
-                let _ = c.close().await;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -179,6 +216,7 @@ pub struct Session {
     timeout_ms: Option<u64>,
     timeout_applied: Option<u64>,
     pg_types: HashMap<u32, String>,
+    connect_timeout: Duration,
     /// Row cap for statements that cannot be wrapped (default [`MAX_ROWS`]).
     pub max_rows: usize,
 }
@@ -281,6 +319,12 @@ fn sql_str(s: &str) -> sqlx::SqlStr {
 impl Session {
     /// Connects and applies `schema`, `read_only` and `init_sql`.
     pub async fn open(c: &Connection) -> Result<Session, DbError> {
+        Self::open_with(c, CONNECT_TIMEOUT).await
+    }
+
+    /// [`open`](Self::open) with a connect timeout over the whole attempt (TLS, handshake, setup
+    /// statements); also used by cancel and reconnect of this session.
+    pub async fn open_with(c: &Connection, connect_timeout: Duration) -> Result<Session, DbError> {
         // The one place the keychain password is read (also on reconnect: `spec` keeps the resolved copy).
         let resolved = c.resolve_password().map_err(DbError::msg)?;
         let c = &resolved;
@@ -293,31 +337,35 @@ impl Session {
             }
             e
         };
-        let (conn, opts) = match c.driver {
-            Driver::Postgres => {
-                let o = pg_options(c)?;
-                (Conn::Pg(PgConnection::connect_with(&o).await.map_err(e)?), Opts::Pg(o))
-            }
-            Driver::MySql => {
-                let o = mysql_options(c)?;
-                (Conn::My(MySqlConnection::connect_with(&o).await.map_err(e)?), Opts::My(o))
-            }
-        };
-        let mut s = Session {
-            conn,
-            opts: opts.into(),
-            spec: c.clone(),
-            backend_id: Arc::new(AtomicU64::new(0)),
-            in_tx: false,
-            autocommit_off: false,
-            mariadb: false,
-            timeout_ms: None,
-            timeout_applied: None,
-            pg_types: HashMap::new(),
-            max_rows: MAX_ROWS,
-        };
-        s.init().await.map_err(e)?;
-        Ok(s)
+        let opts: Arc<Opts> = match c.driver {
+            Driver::Postgres => Opts::Pg(pg_options(c)?),
+            Driver::MySql => Opts::My(mysql_options(c)?),
+        }
+        .into();
+        // sqlx 0.9 has no connect timeout on the connect options: this one is the guarantee.
+        within(&opts, connect_timeout, async {
+            let conn = match &*opts {
+                Opts::Pg(o) => Conn::Pg(PgConnection::connect_with(o).await.map_err(e)?),
+                Opts::My(o) => Conn::My(MySqlConnection::connect_with(o).await.map_err(e)?),
+            };
+            let mut s = Session {
+                conn,
+                opts: opts.clone(),
+                spec: c.clone(),
+                backend_id: Arc::new(AtomicU64::new(0)),
+                in_tx: false,
+                autocommit_off: false,
+                mariadb: false,
+                timeout_ms: None,
+                timeout_applied: None,
+                pg_types: HashMap::new(),
+                connect_timeout,
+                max_rows: MAX_ROWS,
+            };
+            s.init().await.map_err(e)?;
+            Ok(s)
+        })
+        .await
     }
 
     /// The statement timeout of this session (`None` = none), applied now and again after a
@@ -402,14 +450,14 @@ impl Session {
     }
 
     pub fn cancel_handle(&self) -> CancelHandle {
-        CancelHandle { opts: self.opts.clone(), backend_id: self.backend_id.clone() }
+        CancelHandle { opts: self.opts.clone(), backend_id: self.backend_id.clone(), connect_timeout: self.connect_timeout }
     }
 
     /// Replaces a dead connection with a new one: same settings, same cancel handles.
     async fn reopen(&mut self) -> Result<(), DbError> {
         let shared = self.backend_id.clone();
         shared.store(0, Ordering::SeqCst); // a cancel must not hit a reused id
-        let mut new = Session::open(&self.spec.clone()).await?;
+        let mut new = Session::open_with(&self.spec.clone(), self.connect_timeout).await?;
         new.max_rows = self.max_rows;
         new.timeout_ms = self.timeout_ms;
         new.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
@@ -920,6 +968,17 @@ mod tests {
         assert!(!tx_state(true, "CREATE TABLE t(a int)", my));
         assert!(tx_state(true, "CREATE TEMPORARY TABLE t(a int)", my));
         assert!(!tx_state(true, "drop table t", my));
+    }
+
+    #[test]
+    fn connect_timeout_message() {
+        let e = connect_timeout_error(Some("localhost:25432"), Duration::from_millis(10_000));
+        assert!(e.connection_lost);
+        assert_eq!(
+            e.message,
+            "No response from localhost:25432 within 10 s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306)."
+        );
+        assert!(connect_timeout_error(None, Duration::from_millis(1500)).message.starts_with("No response from the server within 1.5 s."));
     }
 
     #[test]

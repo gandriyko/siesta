@@ -99,6 +99,9 @@ failure's code.
   instead of the result fields, and the exit code is `5` (`2` for a lost connection, `4` for `read_only_refused`).
 - `notices` carries server warnings and siesta's notes, e.g. `2 more result sets not shown`: only the first
   result set of a statement that returns several (`CALL p()`) is printed.
+- A server that does not answer within `run.connect_timeout_ms` (default 10 s) fails with exit `2` and
+  "No response from <host>:<port> within … s. Check the driver and port …": usually a wrong `driver`
+  or port in the connection.
 - Errors before any statement runs (exit `2`, `3`, `4`) print `{"error": {"code", "message", "file", "line", "hint"}}`.
   Read `hint`: it names the fix, for example the available connections.
 

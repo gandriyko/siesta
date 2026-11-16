@@ -1,6 +1,7 @@
 //! `siesta run` / `siesta exec`: pick statements, resolve the connection, confirm, execute, print.
 
 use std::io::{IsTerminal, Read, Write};
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
@@ -271,7 +272,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     confirm(env, &conn, &jobs, file, o.yes)?;
     let cap = row_limit(o.max_rows, env.settings.results.max_rows);
     let rt = runtime();
-    let mut session = rt.block_on(Session::open(&conn)).map_err(|e| CliError::new("connection_failed", format!("connection '{}': {e}", conn.name), 2))?;
+    let mut session = rt.block_on(Session::open_with(&conn, Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{}': {e}", conn.name), 2))?;
     session.max_rows = cap;
     let page = Page { size: cap as u64, ..Page::default() };
     let file_name = file.map(|p| p.display().to_string());

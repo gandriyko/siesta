@@ -106,6 +106,8 @@ pub struct Run {
     pub confirm_destructive: ConfirmDestructive,
     /// Server-side timeout per statement; `null` = no limit.
     pub statement_timeout_ms: Option<u64>,
+    /// How long opening a connection (also cancel and reconnect) may take before it fails.
+    pub connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,7 +149,7 @@ impl Default for Results {
 
 impl Default for Run {
     fn default() -> Self {
-        Self { stop_on_error: true, confirm_destructive: ConfirmDestructive::Prod, statement_timeout_ms: None }
+        Self { stop_on_error: true, confirm_destructive: ConfirmDestructive::Prod, statement_timeout_ms: None, connect_timeout_ms: 10_000 }
     }
 }
 
@@ -265,6 +267,7 @@ mod tests {
         assert_eq!(s.results.null_text, "NULL");
         assert!(s.run.stop_on_error);
         assert_eq!((s.run.confirm_destructive, s.run.statement_timeout_ms), (ConfirmDestructive::Prod, None));
+        assert_eq!(s.run.connect_timeout_ms, 10_000);
         assert_eq!((s.results.json_preview_lines, s.history.total), (4, 500));
         // an empty layer set yields exactly the defaults
         assert_eq!(Loaded::load_from(None, None).settings, s);

@@ -238,7 +238,7 @@ fn cwd_probe() -> PathBuf {
 fn open_session(env: &Env, name: &str) -> Result<(tokio::runtime::Runtime, Session, db_conn::Connection), CliError> {
     let conn = env.pick(name)?;
     let rt = runtime();
-    let s = rt.block_on(Session::open(&conn)).map_err(|e| CliError::new("connection_failed", format!("connection '{name}': {e}"), 2))?;
+    let s = rt.block_on(Session::open_with(&conn, std::time::Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{name}': {e}"), 2))?;
     Ok((rt, s, conn))
 }
 

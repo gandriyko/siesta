@@ -206,6 +206,19 @@ fn postgres() {
 
 #[test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+fn wrong_driver_fails_fast_with_exit_2() {
+    // MySQL driver on the Postgres port: nobody speaks first, so only the connect timeout ends it.
+    let f = Fixture::new("mysql", "SIESTA_TEST_PG_URL");
+    std::fs::write(f.dir.path().join("config/settings.json"), r#"{"run": {"connect_timeout_ms": 1500}}"#).unwrap();
+    let t = std::time::Instant::now();
+    let (code, v) = f.json(&["connections", "test", "c", "--output", "json"]);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+    assert_eq!(code, 2, "{v}");
+    assert!(v.to_string().contains("No response from 127.0.0.1:25432 within 1.5 s"), "{v}");
+}
+
+#[test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 fn mysql() {
     let f = Fixture::new("mysql", "SIESTA_TEST_MYSQL_URL");
     scenario(&f, "42S02");

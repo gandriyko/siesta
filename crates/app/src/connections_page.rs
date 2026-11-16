@@ -2,7 +2,11 @@
 //! Edit / Test / Duplicate / Delete. Edit, Duplicate and Delete run in the main window (the form is
 //! a dialog there) and never change a file's pick.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use db_conn::{Connection, Connections, Driver};
 use db_exec::Session;
@@ -168,9 +172,10 @@ impl ConnectionsPage {
     fn test(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(conn) = self.app.upgrade().and_then(|a| a.read(cx).conns_for_page().0.connections.get(&name).cloned()) else { return };
         self.tests.insert(name.clone(), Test::Running);
+        let timeout = self.app.read_with(cx, |a, _| Duration::from_millis(a.settings.settings.run.connect_timeout_ms)).unwrap_or(db_exec::CONNECT_TIMEOUT);
         let handle = RT.spawn(async move {
             let t = Instant::now();
-            let s = Session::open(&conn).await.map_err(|e| e.to_string())?;
+            let s = Session::open_with(&conn, timeout).await.map_err(|e| e.to_string())?;
             s.close().await;
             Ok::<_, String>(t.elapsed())
         });

@@ -22,6 +22,12 @@ async fn rejected_login_names_the_fix_my() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn mysql_driver_on_a_postgres_port_times_out() {
+    wrong_driver_fails_fast(MY, "SIESTA_TEST_PG_URL", true).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn every_value_type() {
     let mut s = open_my().await;
     run(
