@@ -346,6 +346,11 @@ fn classify(words: &[(u32, &str)]) -> Kind {
 /// inside a subquery does not count.
 // ponytail: `WITH … DELETE` is looked up by its first top-level UPDATE / DELETE; a parser would be exact.
 pub fn is_destructive(text: &str, dialect: Dialect) -> bool {
+    destructive_reason(text, dialect).is_some()
+}
+
+/// Why [`is_destructive`] says yes (`"DROP"`, `"UPDATE without WHERE"`, …).
+pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> {
     let b = text.as_bytes();
     let (mut i, mut depth) = (0, 0u32);
     let mut words: Vec<(u32, &str)> = Vec::new();
@@ -386,16 +391,23 @@ pub fn is_destructive(text: &str, dialect: Dialect) -> bool {
         }
     }
     let is = |w: &str, list: &[&str]| list.iter().any(|k| w.eq_ignore_ascii_case(k));
-    let Some(&(_, first)) = words.first() else { return false };
+    let &(_, first) = words.first()?;
     if is(first, &["drop", "truncate", "alter"]) {
-        return true;
+        return Some(match first.to_ascii_lowercase().as_str() {
+            "drop" => "DROP",
+            "truncate" => "TRUNCATE",
+            _ => "ALTER",
+        });
     }
     if !is(first, &["update", "delete", "with"]) {
-        return false; // SELECT … FOR UPDATE and the like
+        return None; // SELECT … FOR UPDATE and the like
     }
     let top: Vec<&str> = words.iter().filter(|(d, _)| *d == 0).map(|(_, w)| *w).collect();
-    let Some(at) = top.iter().position(|w| is(w, &["update", "delete"])) else { return false };
-    !top[at..].iter().any(|w| is(w, &["where"]))
+    let at = top.iter().position(|w| is(w, &["update", "delete"]))?;
+    if top[at..].iter().any(|w| is(w, &["where"])) {
+        return None;
+    }
+    Some(if is(top[at], &["update"]) { "UPDATE without WHERE" } else { "DELETE without WHERE" })
 }
 
 fn line_end(b: &[u8], i: usize) -> usize {
@@ -598,8 +610,18 @@ mod tests {
             ("INSERT INTO t VALUES (1)", PG, false),
             ("DELETE FROM `where`", MY, true),
             ("", PG, false),
+            ("UPDATE t SET a = $1", PG, true),
+            ("UPDATE t SET a = $1 WHERE id = $2", PG, false),
+            ("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1", PG, false),
+            (r"UPDATE t SET a = 'it\'s where' ", MY, true),
+            ("DELETE FROM t # where\n", MY, true),
+            ("DELETE FROM t WHERE a = `where`", MY, false),
         ] {
             assert_eq!(is_destructive(sql, d), want, "{sql}");
         }
+        assert_eq!(destructive_reason("  truncate t", PG), Some("TRUNCATE"));
+        assert_eq!(destructive_reason("alter table t add c int", PG), Some("ALTER"));
+        assert_eq!(destructive_reason("update t set a = 1", PG), Some("UPDATE without WHERE"));
+        assert_eq!(destructive_reason("DELETE FROM t", PG), Some("DELETE without WHERE"));
     }
 }

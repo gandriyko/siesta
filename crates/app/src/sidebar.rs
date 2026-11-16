@@ -19,12 +19,12 @@ use gpui_component::{
 
 use crate::{Siesta, SideTab};
 
-const ROW_H: f32 = 24.;
-const INDENT: f32 = 14.;
+pub(crate) const ROW_H: f32 = 24.;
+pub(crate) const INDENT: f32 = 14.;
 /// Left padding before the first chevron.
-const PAD: f32 = 6.;
+pub(crate) const PAD: f32 = 6.;
 /// Chevron column width; leaves get a spacer of the same width.
-const CHEVRON: f32 = 14.;
+pub(crate) const CHEVRON: f32 = 14.;
 
 pub(crate) enum Row {
     Dir { path: PathBuf, name: String, depth: usize },
@@ -310,7 +310,7 @@ impl Siesta {
 
     pub(crate) fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
-        let (muted, hover) = (t.muted_foreground, t.list_hover);
+        let (muted, hover, fg, border) = (t.muted_foreground, t.list_hover, t.sidebar_foreground, t.sidebar_border);
         let icon_button = |id: &'static str, name: IconName| {
             div().id(id).p_1().rounded_md().cursor_pointer().text_color(muted).hover(move |s| s.bg(hover)).child(Icon::new(name).size_3p5())
         };
@@ -384,16 +384,7 @@ impl Siesta {
                     .child(div().flex_1().min_h_0().child(list.size_full()))
                     .into_any_element()
             }
-            // Filled in with the schema tree when connections are live.
-            SideTab::Db => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(muted)
-                .child("Connect to see the schema")
-                .into_any_element(),
+            SideTab::Db => self.db_body(cx),
         };
         let footer = div().flex_none().mx_1().mb_1().child(
             div()
@@ -417,16 +408,16 @@ impl Siesta {
             .flex()
             .flex_col()
             // Background and border come from the card it sits in (main.rs `card`).
-            .text_color(t.sidebar_foreground)
+            .text_color(fg)
             .child(header)
             .child(body)
-            .child(div().flex_none().h(px(1.)).mx_2().bg(t.sidebar_border))
+            .child(div().flex_none().h(px(1.)).mx_2().bg(border))
             .child(footer)
             .into_any_element()
     }
 }
 
-fn chevron(open: bool, color: Hsla) -> impl IntoElement {
+pub(crate) fn chevron(open: bool, color: Hsla) -> impl IntoElement {
     div()
         .w(px(CHEVRON))
         .flex_none()

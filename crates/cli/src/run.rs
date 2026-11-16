@@ -174,63 +174,6 @@ pub(crate) fn find(src: &str, file: &SqlFile, addr: &str, path: &Path) -> Result
     })
 }
 
-/// Why a statement needs confirmation on a guarded connection, if it does:
-/// `UPDATE` / `DELETE` without a top-level `WHERE`, `DROP`, `TRUNCATE`, `ALTER`.
-// ponytail: looks at the first word only, so `WITH x AS (DELETE …)` is not caught; the server's
-// read_only mode is the real guard.
-pub(crate) fn destructive(sql: &str, dialect: Dialect) -> Option<&'static str> {
-    let words = top_level_words(sql, dialect == Dialect::MySql);
-    match words.first()?.as_str() {
-        "DROP" => Some("DROP"),
-        "TRUNCATE" => Some("TRUNCATE"),
-        "ALTER" => Some("ALTER"),
-        "UPDATE" if !words.iter().any(|w| w == "WHERE") => Some("UPDATE without WHERE"),
-        "DELETE" if !words.iter().any(|w| w == "WHERE") => Some("DELETE without WHERE"),
-        _ => None,
-    }
-}
-
-/// Upper-cased words outside strings, quoted identifiers, comments, dollar quotes and parentheses.
-fn top_level_words(sql: &str, mysql: bool) -> Vec<String> {
-    let b = sql.as_bytes();
-    let (mut i, mut depth, mut words) = (0, 0usize, Vec::new());
-    while i < b.len() {
-        match b[i] {
-            b'-' if b.get(i + 1) == Some(&b'-') => i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i),
-            b'#' if mysql => i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i),
-            b'/' if b.get(i + 1) == Some(&b'*') => i += sql[i + 2..].find("*/").map_or(b.len() - i, |e| e + 4),
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < b.len() && b[i] != q {
-                    i += if mysql && b[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
-            b'$' if !mysql => {
-                let n = b[i + 1..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
-                if b.get(i + 1 + n) == Some(&b'$') && !b.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                    let tag = &sql[i..i + n + 2];
-                    i += tag.len();
-                    i += sql[i..].find(tag).map_or(b.len() - i, |e| e + tag.len());
-                } else {
-                    i += 1;
-                }
-            }
-            b'(' => (depth, i) = (depth + 1, i + 1),
-            b')' => (depth, i) = (depth.saturating_sub(1), i + 1),
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let len = b[i..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
-                if depth == 0 {
-                    words.push(sql[i..i + len].to_ascii_uppercase());
-                }
-                i += len;
-            }
-            _ => i += 1,
-        }
-    }
-    words
-}
-
 /// Exit code of a failed statement: 2 when the connection is gone, 5 for an SQL error.
 pub(crate) fn sql_exit(e: &DbError) -> u8 {
     if e.connection_lost { 2 } else { 5 }
@@ -252,7 +195,7 @@ fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes:
         let reason = if j.confirm {
             Some("marked -- @confirm")
         } else if policy == ConfirmDestructive::Always || (policy == ConfirmDestructive::Prod && guarded) {
-            destructive(&j.text, dialect_of(conn.driver))
+            sql_split::destructive_reason(&j.text, dialect_of(conn.driver))
         } else {
             None
         };
@@ -392,7 +335,6 @@ mod tests {
     use super::*;
 
     const PG: Dialect = Dialect::Postgres;
-    const MY: Dialect = Dialect::MySql;
 
     #[test]
     fn statement_addresses() {
@@ -407,33 +349,6 @@ mod tests {
         let e = find(src, &file, "nope", p).unwrap_err();
         assert_eq!(e.exit, 3);
         assert!(e.hint.unwrap().contains("one, two"));
-    }
-
-    #[test]
-    fn destructive_statements() {
-        let d = |s| destructive(s, PG);
-        assert_eq!(d("DROP TABLE t"), Some("DROP"));
-        assert_eq!(d("  truncate t"), Some("TRUNCATE"));
-        assert_eq!(d("alter table t add c int"), Some("ALTER"));
-        assert_eq!(d("DELETE FROM t"), Some("DELETE without WHERE"));
-        assert_eq!(d("update t set a = 1"), Some("UPDATE without WHERE"));
-        assert_eq!(d("DELETE FROM t WHERE id = 1"), None);
-        assert_eq!(d("UPDATE t SET a = (SELECT x FROM y WHERE y.id = 1)"), Some("UPDATE without WHERE"));
-        assert_eq!(d("UPDATE t SET a = 1 WHERE id IN (SELECT 1)"), None);
-        assert_eq!(d("-- where\nDELETE FROM t /* WHERE */"), Some("DELETE without WHERE"));
-        assert_eq!(d("DELETE FROM t WHERE note = 'x' OR true"), None);
-        assert_eq!(d("UPDATE t SET note = 'where'"), Some("UPDATE without WHERE"));
-        assert_eq!(d("UPDATE t SET a = $$ where $$"), Some("UPDATE without WHERE"));
-        assert_eq!(d("UPDATE t SET a = $1"), Some("UPDATE without WHERE"));
-        assert_eq!(d("UPDATE t SET a = $1 WHERE id = $2"), None);
-        assert_eq!(d("SELECT * FROM t FOR UPDATE"), None);
-        assert_eq!(d("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET a = 1"), None);
-        assert_eq!(d("select 'DROP TABLE t'"), None);
-        assert_eq!(d(""), None);
-        // MySQL: backslash escapes and `#` comments.
-        assert_eq!(destructive(r"UPDATE t SET a = 'it\'s where' ", MY), Some("UPDATE without WHERE"));
-        assert_eq!(destructive("DELETE FROM t # where\n", MY), Some("DELETE without WHERE"));
-        assert_eq!(destructive("DELETE FROM t WHERE a = `where`", MY), None);
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct Doc {
     pub dirty: bool,
     /// The file's mtime when it was last read or written: a newer one means it changed on disk.
     pub mtime: Option<std::time::SystemTime>,
+    /// What the completion provider reads: connection, dialect, schema cache.
+    pub lang: std::rc::Rc<std::cell::RefCell<crate::lang::Ctx>>,
     pub _subs: Vec<Subscription>,
 }
 
@@ -43,10 +45,32 @@ pub fn dialect_of(driver: Driver) -> Dialect {
     }
 }
 
+/// The schema whose tables are written without a prefix: Postgres' first `search_path` entry
+/// (`public` by default); MySQL has none (the connection's database is its only schema).
+pub fn default_schema(c: &db_conn::Connection) -> Option<String> {
+    match c.driver {
+        Driver::Postgres => Some(c.schema.as_deref().and_then(|s| s.split(',').next()).map_or("public", str::trim).to_string()),
+        Driver::MySql => c.database.clone(),
+    }
+}
+
 impl Doc {
-    pub fn new(path: PathBuf, editor: Entity<EditorState>, conns: Arc<Connections>, picked: Option<String>, subs: Vec<Subscription>, cx: &mut App) -> Self {
+    pub fn new(
+        path: PathBuf,
+        editor: Entity<EditorState>,
+        conns: Arc<Connections>,
+        picked: Option<String>,
+        cache: crate::schema_cache::Shared,
+        subs: Vec<Subscription>,
+        cx: &mut App,
+    ) -> Self {
         let stmt_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
         let sql = siesta_workspace::is_sql(&path);
+        let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { dialect: Dialect::default(), connection: None, default_schema: None, cache }));
+        if sql {
+            let provider = std::rc::Rc::new(crate::lang::Lang(lang.clone()));
+            editor.update(cx, |s, _| s.lsp_mut().completion_provider = Some(provider));
+        }
         let mut doc = Self {
             path: Arc::new(path),
             editor,
@@ -61,6 +85,7 @@ impl Doc {
             stmt_bar,
             dirty: false,
             mtime: None,
+            lang,
             _subs: subs,
         };
         doc.mtime = mtime(&doc.path);
@@ -97,6 +122,11 @@ impl Doc {
             file = sql_split::split(&text, wanted);
         }
         self.file = Arc::new(file);
+        let connection = self.connection().map(str::to_string);
+        let default_schema = connection.as_deref().and_then(|c| self.conns.connections.get(c)).and_then(default_schema);
+        let mut lang = self.lang.borrow_mut();
+        (lang.dialect, lang.connection, lang.default_schema) = (self.dialect, connection, default_schema);
+        drop(lang);
         self.publish_diagnostics(cx);
         self.sync_active(cx);
     }

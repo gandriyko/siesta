@@ -53,6 +53,8 @@ fn defaults() -> Vec<Spec> {
         spec(key("shift-enter"), RunAll, Editor),
         spec(key("alt-l"), RepeatLast, Editor),
         spec(key("."), CancelRun, Editor),
+        // The editor has the action but no default key.
+        spec("ctrl-space", gpui_component::input::ShowCompletions, Editor),
         spec("alt-up", PrevStatement, Editor),
         spec("alt-down", NextStatement, Editor),
         spec(key("s"), SaveFile, Both),

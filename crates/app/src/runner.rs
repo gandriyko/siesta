@@ -169,6 +169,23 @@ async fn count_job(h: Handles, conn: Connection, text: String, filters: Vec<(Str
     g.as_mut().expect("session opened").count(&text, &filters).await
 }
 
+/// Reads the structure on the file's session (queued behind a running statement) and saves it
+/// to the disk cache.
+async fn schema_job(h: Handles, conn: Connection, opts: Opts, file: Option<PathBuf>) -> Result<db_exec::Schema, DbError> {
+    let mut g = acquire(&h, &conn, opts).await?;
+    let schema = g.as_mut().expect("session opened").schema().await?;
+    if let Some(file) = file {
+        let copy = schema.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::schema_cache::save(&file, &copy)).await;
+    }
+    Ok(schema)
+}
+
+async fn ddl_job(h: Handles, conn: Connection, opts: Opts, schema: String, table: String) -> Result<String, DbError> {
+    let mut g = acquire(&h, &conn, opts).await?;
+    g.as_mut().expect("session opened").table_ddl(&schema, &table).await
+}
+
 /// Close the session on the runtime; `finish` (`COMMIT` / `ROLLBACK`) runs first.
 fn close_slot(slot: Slot, finish: Option<&'static str>) {
     let Slot { handles, .. } = slot;
@@ -408,6 +425,11 @@ impl Siesta {
         if let Some((text, p, msg)) = position {
             self.underline_error(&path, &text, p, &msg, cx);
         }
+        // The first live session of a connection reads its schema, once per run of the app.
+        let first = !self.schemas.borrow().fresh.contains(&name);
+        if first && report.live && report.results.last().is_some_and(Result::is_ok) {
+            self.load_schema(path.clone(), name.clone(), conn.clone(), window, cx);
+        }
         if report.results.iter().any(|r| r.as_ref().is_err_and(|e| e.connection_lost)) {
             window.push_notification("Connection was lost and reopened", cx);
         }
@@ -492,6 +514,86 @@ impl Siesta {
                     Err(err) => window.push_notification(format!("Count failed: {err}"), cx),
                 }
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The disk cache of `name`, read once, so the DB tab and completion work before any session.
+    pub(crate) fn load_cached_schema(&mut self, name: &str) {
+        let Some(base) = self.base.as_deref() else { return };
+        let mut cache = self.schemas.borrow_mut();
+        if cache.schemas.contains_key(name) || !cache.disk_tried.insert(name.to_string()) {
+            return;
+        }
+        if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, &self.root, name)) {
+            cache.schemas.insert(name.to_string(), Arc::new(s));
+        }
+    }
+
+    /// "Refresh schema": read the current file's connection again (opens its session if needed).
+    pub(crate) fn refresh_schema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        match self.connection_of(&path) {
+            Ok((name, conn)) => self.load_schema(path, name, conn, window, cx),
+            Err(e) => window.push_notification(e, cx),
+        }
+    }
+
+    /// Reads the schema in the background; the old one (cache) stays until the new one arrives.
+    fn load_schema(&mut self, path: PathBuf, name: String, conn: Connection, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            let mut c = self.schemas.borrow_mut();
+            if !c.loading.insert(name.clone()) {
+                return;
+            }
+            c.errors.remove(&name);
+        }
+        let handles = self.slots.entry((path, name.clone())).or_insert_with(Slot::new).handles.clone();
+        let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &self.root, &name));
+        let handle = RT.spawn(schema_job(handles, conn, self.opts(), file));
+        cx.spawn_in(window, async move |this, cx| {
+            let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
+            this.update(cx, |this, cx| {
+                let mut c = this.schemas.borrow_mut();
+                c.loading.remove(&name);
+                match r {
+                    Ok(s) => {
+                        c.fresh.insert(name.clone());
+                        c.schemas.insert(name, Arc::new(s));
+                    }
+                    Err(e) => {
+                        c.errors.insert(name, e.to_string());
+                    }
+                }
+                drop(c);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// "Copy DDL" of a table of the current file's connection, to the clipboard.
+    pub(crate) fn copy_ddl(&mut self, schema: &str, table: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        let (name, conn) = match self.connection_of(&path) {
+            Ok(c) => c,
+            Err(e) => return window.push_notification(e, cx),
+        };
+        let handles = self.slots.entry((path, name)).or_insert_with(Slot::new).handles.clone();
+        let handle = RT.spawn(ddl_job(handles, conn, self.opts(), schema.to_string(), table.to_string()));
+        let table = table.to_string();
+        cx.spawn_in(window, async move |_, cx| {
+            let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
+            cx.update(|window, cx| match r {
+                Ok(ddl) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(ddl));
+                    window.push_notification(format!("DDL of {table} copied"), cx);
+                }
+                Err(e) => window.push_notification(format!("DDL of {table}: {e}"), cx),
             })
             .ok();
         })

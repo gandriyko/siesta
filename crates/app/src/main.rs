@@ -4,13 +4,17 @@
 //! Running statements lives in `runner`, the result panel and table in `results`, the value
 //! dialog in `value_popup`, pure formatting in `format`; everything else of the shell is here.
 
+mod complete;
+mod dbtab;
 mod doc;
 mod format;
 mod highlight;
 mod keymap;
+mod lang;
 mod palette;
 mod results;
 mod runner;
+mod schema_cache;
 mod settings_page;
 mod sidebar;
 mod themes;
@@ -40,7 +44,7 @@ actions!(
     [
         RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenFolder, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
-        NextStatement, FocusEditor, ToggleFilters,
+        NextStatement, FocusEditor, ToggleFilters, RefreshSchema,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
         CopyCells, OpenCell, OpenRow, NextPage, PrevPage, PopupPrev, PopupNext
     ]
@@ -93,6 +97,12 @@ pub(crate) struct Siesta {
     outlines: HashMap<PathBuf, Vec<(usize, String)>>,
     rows: Vec<sidebar::Row>,
     sidebar_filter: Entity<InputState>,
+    /// Schemas per connection name, in memory and in `~/.siesta/cache`; shared with the editors' completion.
+    schemas: schema_cache::Shared,
+    /// DB tab: the tree's rows, the filter, and the toggled nodes (see `dbtab::rows`).
+    db_rows: Vec<dbtab::DbRow>,
+    db_filter: Entity<InputState>,
+    db_toggled: HashSet<String>,
     /// Folders are open by default; this holds the collapsed ones.
     collapsed_dirs: HashSet<PathBuf>,
     sidebar: bool,
@@ -152,6 +162,7 @@ impl Siesta {
             notify_later(window, cx, format!("Settings: {e}"));
         }
         let sidebar_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search statements"));
+        let db_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search tables and columns"));
         // The close button: with unsaved files, ask (as Quit does) instead of closing.
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -166,6 +177,11 @@ impl Siesta {
         });
         let _subs = vec![
             cx.subscribe_in(&sidebar_filter, window, |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&db_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
@@ -195,6 +211,10 @@ impl Siesta {
             outlines: HashMap::new(),
             rows: vec![],
             sidebar_filter,
+            schemas: Default::default(),
+            db_rows: vec![],
+            db_filter,
+            db_toggled: HashSet::new(),
             collapsed_dirs: HashSet::new(),
             sidebar: true,
             result_open: true,
@@ -482,6 +502,10 @@ impl Siesta {
                         if let (InputEvent::Change, Some(d)) = (ev, this.docs.iter_mut().find(|d| d.editor == editor)) {
                             d.dirty = true;
                             d.reparse(cx);
+                            // `-- @connection` may have just changed.
+                            if let Some(c) = d.connection().map(str::to_string) {
+                                this.load_cached_schema(&c);
+                            }
                         }
                     }),
                     // Cursor moves and scrolling only notify; re-render overlays and the active statement.
@@ -495,8 +519,12 @@ impl Siesta {
                 let conns = self.load_connections(&path);
                 self.report_connections(&conns, window, cx);
                 let picked = self.picks.get(&path).cloned().flatten();
-                self.docs.push(Doc::new(path.clone(), editor, Arc::new(conns), picked, subs, cx));
-                self.docs.len() - 1
+                self.docs.push(Doc::new(path.clone(), editor, Arc::new(conns), picked, self.schemas.clone(), subs, cx));
+                let ix = self.docs.len() - 1;
+                if let Some(c) = self.docs[ix].connection().map(str::to_string) {
+                    self.load_cached_schema(&c);
+                }
+                ix
             }
         };
         self.current = Some(ix);
@@ -702,6 +730,9 @@ impl Siesta {
         self.picks.insert((*self.docs[ix].path).clone(), name.clone());
         self.docs[ix].picked = name;
         self.docs[ix].reparse(cx);
+        if let Some(c) = self.docs[ix].connection().map(str::to_string) {
+            self.load_cached_schema(&c);
+        }
         self.remember(cx);
         cx.notify();
     }
@@ -1010,6 +1041,7 @@ impl Render for Siesta {
             .on_action(cx.listener(|this, _: &RepeatLast, window, cx| this.repeat_last(window, cx)))
             .on_action(cx.listener(|this, _: &CancelRun, window, cx| this.cancel_run(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFilters, window, cx| this.toggle_filters(window, cx)))
+            .on_action(cx.listener(|this, _: &RefreshSchema, window, cx| this.refresh_schema(window, cx)))
             // Esc reaches here only when the editor had nothing of its own to close.
             // ponytail: Esc that closes the completion menu also gets here (the menu propagates it).
             .on_action(cx.listener(|this, _: &gpui_component::input::Escape, window, cx| this.cancel_run(window, cx)))
@@ -1098,6 +1130,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Toggle Column Filters", ToggleFilters),
             MenuItem::separator(),
             MenuItem::action("Pick Connection…", PickConnection),
+            MenuItem::action("Refresh Schema", RefreshSchema),
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
@@ -1128,6 +1161,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Cancel Running", Box::new(CancelRun)),
         ("Toggle Column Filters", Box::new(ToggleFilters)),
         ("Pick Connection…", Box::new(PickConnection)),
+        ("Refresh Schema", Box::new(RefreshSchema)),
         ("Go to File…", Box::new(GoToFile)),
         ("Go to Statement…", Box::new(GoToStatement)),
         ("Go to Statement in Workspace…", Box::new(GoToWorkspaceStatement)),
@@ -1501,5 +1535,102 @@ mod tests {
         let (again, mut cx2) = open_app(tcx, ws.path(), base.path(), None);
         assert_eq!(conn(&again, &mut cx2, &a), (Some("dev".into()), sql_split::Dialect::Postgres));
         assert_eq!(conn(&again, &mut cx2, &b), (Some("my".into()), sql_split::Dialect::MySql));
+    }
+
+    /// `public.users` (+ `analytics.events`), as `Session::schema()` would give it.
+    fn demo_schema() -> db_exec::Schema {
+        use db_exec::{ColumnInfo, SchemaNode, Table, TableKind};
+        let table = |name: &str| Table {
+            name: name.into(),
+            kind: TableKind::Table,
+            columns: vec![ColumnInfo { name: "id".into(), data_type: "integer".into(), nullable: false, primary_key: true, ordinal: 1 }],
+            indexes: vec![],
+        };
+        db_exec::Schema {
+            schemas: vec![
+                SchemaNode { name: "analytics".into(), tables: vec![table("events")] },
+                SchemaNode { name: "public".into(), tables: vec![table("users")] },
+            ],
+        }
+    }
+
+    fn text_of(app: &Entity<Siesta>, cx: &mut VisualTestContext) -> String {
+        cx.update(|_, cx| app.read(cx).doc().unwrap().editor.read(cx).value().to_string())
+    }
+
+    #[gpui::test]
+    fn db_tab_inserts_the_select_after_the_current_statement(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.select_connection(Some("dev".into()), window, cx);
+                this.schemas.borrow_mut().schemas.insert("dev".into(), std::sync::Arc::new(demo_schema()));
+            })
+        });
+        // The tree: `public` is the default schema, both are listed.
+        let rows = cx.update(|_, cx| app.update(cx, |this, _| crate::dbtab::rows(&this.schemas.borrow().schemas["dev"], "", &this.db_toggled)));
+        assert_eq!(rows.len(), 4);
+        // The cursor is on the first statement: the new one goes right below it and becomes the active one.
+        let ok = cx.update(|window, cx| app.update(cx, |this, cx| this.insert_select("public", "users", window, cx)));
+        assert!(ok);
+        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\nSELECT * FROM users;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n");
+        let active = cx.update(|_, cx| {
+            let d = app.read(cx).doc().unwrap();
+            let src = d.editor.read(cx).value();
+            d.active_statement().map(|s| (s.line, s.text(&src).to_string()))
+        });
+        assert_eq!(active, Some((2, "SELECT * FROM users".to_string())));
+        assert_eq!(cursor_line(&app, &mut cx), 1);
+        // Outside the default schema the name is qualified; a statement without `;` gets one.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.docs[0].editor.update(cx, |s, cx| s.set_value("SELECT 1", window, cx));
+                this.docs[0].reparse(cx);
+                assert!(this.insert_select("analytics", "events", window, cx));
+            })
+        });
+        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\nSELECT * FROM analytics.events;");
+        // "Insert name" replaces the selection.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.docs[0].editor.update(cx, |s, cx| s.set_value("SELECT  FROM x", window, cx));
+                this.docs[0].editor.update(cx, |s, cx| s.set_cursor_position(gpui_component::input::Position::new(0, 7), window, cx));
+                this.insert_name("public", "users", window, cx);
+            })
+        });
+        assert_eq!(text_of(&app, &mut cx), "SELECT users FROM x");
+    }
+
+    #[gpui::test]
+    fn completion_provider_offers_tables_after_from(tcx: &mut TestAppContext) {
+        use gpui_component::input::{CompletionProvider as _, Rope};
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.select_connection(Some("dev".into()), window, cx);
+                this.schemas.borrow_mut().schemas.insert("dev".into(), std::sync::Arc::new(demo_schema()));
+            })
+        });
+        let lang = cx.update(|_, cx| crate::lang::Lang(app.read(cx).doc().unwrap().lang.clone()));
+        let ask = |cx: &mut VisualTestContext, sql: &str| -> Vec<String> {
+            let (text, offset) = (Rope::from(sql), sql.len());
+            let ctx = lsp_types::CompletionContext { trigger_kind: lsp_types::CompletionTriggerKind::INVOKED, trigger_character: None };
+            let task = cx.update(|window, cx| lang.completions(&text, offset, ctx, window, cx));
+            match cx.foreground_executor().block_test(task).unwrap() {
+                lsp_types::CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+                lsp_types::CompletionResponse::List(l) => l.items.into_iter().map(|i| i.label).collect(),
+            }
+        };
+        assert_eq!(ask(&mut cx, "SELECT * FROM "), ["analytics.events", "users"]);
+        assert_eq!(ask(&mut cx, "SELECT * FROM us"), ["users"]);
+        assert_eq!(ask(&mut cx, "SELECT * FROM users u WHERE u."), ["id"]);
+        // Directives need no schema; a string needs nothing at all.
+        assert_eq!(ask(&mut cx, "-- @conf"), ["confirm"]);
+        assert!(ask(&mut cx, "SELECT 'FROM us").is_empty());
+        // The provider follows the picked connection: none, no tables.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(None, window, cx)));
+        assert!(ask(&mut cx, "SELECT * FROM ").is_empty());
     }
 }
