@@ -45,7 +45,8 @@ pub(crate) struct ConnForm {
     /// The config dir the files live in.
     dir: PathBuf,
     /// The file the form was opened for: the saved connection is picked there, and only there.
-    target: PathBuf,
+    /// `None` (opened from the Connections page): no file's pick changes.
+    target: Option<PathBuf>,
     /// The connection being edited (`None`: a new one).
     original: Option<String>,
     /// Keys of the entry the form does not show (kept on save).
@@ -74,7 +75,7 @@ pub(crate) struct ConnForm {
 
 impl ConnForm {
     #[allow(clippy::too_many_arguments)]
-    fn new(app: WeakEntity<Siesta>, dir: PathBuf, target: PathBuf, original: Option<String>, f: ConnectionForm, locked: Option<(Vec<PathBuf>, String)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(app: WeakEntity<Siesta>, dir: PathBuf, target: Option<PathBuf>, original: Option<String>, f: ConnectionForm, locked: Option<(Vec<PathBuf>, String)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |placeholder: &str, value: &str, window: &mut Window, cx: &mut Context<Self>| {
             let (placeholder, value) = (placeholder.to_string(), value.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
@@ -320,29 +321,46 @@ impl Render for ConnForm {
 }
 
 impl Siesta {
-    /// "New connection…" (`edit == None`) or "Edit connection…" of `name`, for the current file.
+    /// "New connection…" (`edit == None`) or "Edit connection…" of `name`; the saved connection is picked by the current file.
     pub(crate) fn open_conn_form(&mut self, edit: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_conn_form_for(edit, false, true, window, cx)
+    }
+
+    /// The form for any connection, independent of the current file's pick. `duplicate`: a new
+    /// connection prefilled from `edit` (`<name>-copy`, no password). `pick`: the current file
+    /// picks the saved connection (the picker and DB tab); the Connections page never changes picks.
+    pub(crate) fn open_conn_form_for(&mut self, edit: Option<String>, duplicate: bool, pick: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = self.config_dir.clone() else { return window.push_notification("No config folder (is HOME set?): connections cannot be saved", cx) };
-        let Some(d) = self.doc().filter(|d| d.sql) else { return };
-        let target = (*d.path).clone();
+        let target = if pick {
+            let Some(d) = self.doc().filter(|d| d.sql) else { return };
+            Some((*d.path).clone())
+        } else {
+            None
+        };
+        let conns = self.conns_for_page().0;
         let mut data = ConnectionForm { driver: Some(Driver::Postgres), ..Default::default() };
         let (mut original, mut locked) = (None, None);
         if let Some(name) = &edit {
             let globals = [dir.join("connections.json"), dir.join("connections.private.json")];
-            let team: Vec<PathBuf> = d.conns.sources.get(name).into_iter().flatten().filter(|p| !globals.contains(p)).cloned().collect();
+            let team: Vec<PathBuf> = conns.sources.get(name).into_iter().flatten().filter(|p| !globals.contains(p)).cloned().collect();
             if !team.is_empty() {
-                let resolved = match (d.conns.connections.get(name), d.conns.errors.get(name)) {
+                let resolved = match (conns.connections.get(name), conns.errors.get(name)) {
                     (Some(c), _) => serde_json::to_string_pretty(&db_conn::masked(c)).unwrap_or_default(),
                     (None, Some(e)) => format!("error: {e}"),
                     _ => String::new(),
                 };
                 locked = Some((team, resolved));
             } else if let Some(f) = db_conn::read_global_form(&dir, name) {
-                (original, data) = (Some(name.clone()), f);
+                if duplicate {
+                    data = ConnectionForm { name: format!("{name}-copy"), password: String::new(), keychain: None, ..f };
+                } else {
+                    (original, data) = (Some(name.clone()), f);
+                }
             } else {
                 return window.push_notification(format!("'{name}' is not in a file Siesta can edit"), cx);
             }
         }
+        let edit = edit.filter(|_| !duplicate);
         let title = match (&edit, &locked) {
             (None, _) => "New connection".to_string(),
             (Some(n), Some(_)) => format!("Connection {n}"),
@@ -357,11 +375,22 @@ impl Siesta {
     }
 
     /// The form saved `name`: every open file sees it; only `target` (the file the form was opened for) picks it.
-    pub(crate) fn connection_saved(&mut self, target: PathBuf, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn connection_saved(&mut self, target: Option<PathBuf>, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_connections(window, cx);
         self.conns_seen = Some(self.conns_stamp());
-        self.pick_for(&target, Some(name), window, cx);
+        if let Some(target) = target {
+            self.pick_for(&target, Some(name), window, cx);
+        }
         self.conn_form = None;
+    }
+
+    /// Deletes a global connection (and its keychain entry) from the Connections page.
+    pub(crate) fn delete_global_connection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.config_dir.clone() else { return };
+        match db_conn::delete_global(&dir, name) {
+            Ok(_) => self.connection_deleted(name, window, cx),
+            Err(e) => window.push_notification(e, cx),
+        }
     }
 
     /// A global connection was deleted: files that had picked it are left with "No connection".

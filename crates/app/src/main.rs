@@ -6,6 +6,7 @@
 
 mod complete;
 mod conn_form;
+mod connections_page;
 mod dbtab;
 mod doc;
 mod format;
@@ -43,7 +44,7 @@ use siesta_workspace::{OpenFile, WorkspaceState};
 actions!(
     siesta,
     [
-        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenFolder, Quit,
+        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, OpenFolder, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
         NextStatement, FocusEditor, ToggleFilters, RefreshSchema,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
@@ -131,6 +132,7 @@ pub(crate) struct Siesta {
     ticking: bool,
     settings: siesta_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
+    connections_window: Option<WindowHandle<Root>>,
     /// `~/.config/siesta`: the global connection files live here; `None` = no global connections.
     config_dir: Option<PathBuf>,
     /// The open New / Edit connection form.
@@ -237,6 +239,7 @@ impl Siesta {
             ticking: false,
             settings,
             settings_window: None,
+            connections_window: None,
             config_dir,
             conn_form: None,
             focus: cx.focus_handle(),
@@ -902,7 +905,10 @@ impl Siesta {
                     };
                     let mut menu = menu.item(row("No connection".into(), None)).separator();
                     if names.is_empty() {
-                        menu = menu.label("No connections: create siesta.json");
+                        menu = menu.item(PopupMenuItem::new("New connection…").on_click({
+                            let view = view.clone();
+                            move |_, window, cx| _ = view.update(cx, |this, cx| this.open_conn_form(None, window, cx))
+                        }));
                     }
                     menu = names.iter().fold(menu, |menu, n| menu.item(row(n.clone(), Some(n.clone()))));
                     if forced {
@@ -919,7 +925,12 @@ impl Siesta {
                             .ok();
                         })
                     };
-                    menu = menu.separator().item(form("New connection…", false)).item(form("Edit connection…", true));
+                    menu = menu.separator().item(form("New connection…", false)).item(form("Edit connection…", true)).item(
+                        PopupMenuItem::new("Manage connections…").on_click({
+                            let view = view.clone();
+                            move |_, window, cx| _ = view.update(cx, |this, cx| this.open_connections(window, cx))
+                        }),
+                    );
                     let hook = |label: &'static str, enabled: bool, run: fn(&mut Siesta, &mut Window, &mut Context<Siesta>)| {
                         let view = view.clone();
                         PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, window, cx| {
@@ -1156,6 +1167,7 @@ impl Render for Siesta {
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_folder(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenConnections, window, cx| this.open_connections(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar = !this.sidebar;
                 cx.notify();
@@ -1184,6 +1196,7 @@ fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("Siesta").items([
             MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Connections…", OpenConnections),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
@@ -1260,6 +1273,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Close Tab", Box::new(CloseTab)),
         ("Open Folder…", Box::new(OpenFolder)),
         ("Settings…", Box::new(OpenSettings)),
+        ("Connections", Box::new(OpenConnections)),
         ("Quit Siesta", Box::new(Quit)),
     ]
 }
@@ -1800,6 +1814,65 @@ mod tests {
         let locked = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.read(cx).locked_paths()));
         assert_eq!(locked, Some(vec![ws.path().join("siesta.json")]));
         assert!(!cfg.path().join("connections.json").exists());
+    }
+
+    #[gpui::test]
+    fn connections_page_lists_edits_and_deletes_without_touching_picks(tcx: &mut TestAppContext) {
+        use crate::connections_page::{ConnectionsPage, PasswordKind, build_groups, raw_password_kind};
+        db_conn::secrets::use_memory_store();
+        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, dir) = (ws.path().join("a.sql"), cfg.path().to_path_buf());
+        std::fs::write(dir.join("connections.json"), r#"{"gl": {"driver": "postgres", "host": "h", "port": 5, "database": "d", "password": "${keychain}"}}"#).unwrap();
+        db_conn::secrets::set("gl", "pw").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.config_dir = Some(dir.clone());
+                this.reload_connections(window, cx);
+                this.pick_for(&a, Some("dev".into()), window, cx);
+            })
+        });
+        // The page shows both groups; the global one is not the current file's.
+        let groups = cx.update(|_, cx| {
+            let this = app.read(cx);
+            let (conns, current, root) = this.conns_for_page();
+            let files = [dir.join("connections.json"), dir.join("connections.private.json")];
+            build_groups(&conns, &files, &root, current.as_deref(), "", &raw_password_kind)
+        });
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].global);
+        let gl = &groups[0].rows[0];
+        assert_eq!((gl.name.as_str(), gl.password, gl.used, gl.target.as_str()), ("gl", PasswordKind::Keychain, false, "h:5/d"));
+        assert_eq!(groups[1].title, "siesta.json");
+        let flags: Vec<_> = groups[1].rows.iter().map(|r| (r.name.as_str(), r.prod, r.read_only, r.used)).collect();
+        assert_eq!(flags, [("dev", false, false, true), ("live", true, false, false), ("my", false, true, false)]);
+        // The page itself renders.
+        let (weak, main) = (app.downgrade(), cx.update(|window, _| window.window_handle()));
+        let page = tcx.update(|cx| cx.open_window(Default::default(), |w, cx| cx.new(|cx| ConnectionsPage::new(weak, main, w, cx))).unwrap());
+        VisualTestContext::from_window(page.into(), tcx).run_until_parked();
+        // Duplicate: a new form prefilled from `gl`, no password.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), true, false, window, cx)));
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        let f = cx.update(|_, cx| form.read(cx).collect(cx));
+        assert_eq!((f.name.as_str(), f.host.as_str(), f.password.as_str()), ("gl-copy", "h", ""));
+        // Edit a connection the file did not pick: the pick stays.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), false, false, window, cx)));
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).name), "gl");
+        cx.update(|window, cx| {
+            form.update(cx, |f, cx| {
+                f.host.update(cx, |s, cx| s.set_value("edited", window, cx));
+                f.save(window, cx);
+            })
+        });
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("dev"));
+        assert_eq!(db_conn::read_global_form(&dir, "gl").unwrap().host, "edited");
+        assert_eq!(db_conn::secrets::get("gl").as_deref(), Ok("pw"));
+        // Delete removes the connection and its keychain entry, and leaves the pick.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.delete_global_connection("gl", window, cx)));
+        assert!(db_conn::read_global_form(&dir, "gl").is_none());
+        assert!(db_conn::secrets::get("gl").is_err());
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("dev"));
     }
 
     #[gpui::test]

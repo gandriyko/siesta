@@ -84,6 +84,11 @@ pub(crate) fn rows(schema: &Schema, query: &str, toggled: &HashSet<String>) -> V
     out
 }
 
+/// Opens the Connections page.
+fn manage_button(cx: &mut Context<Siesta>) -> Button {
+    Button::new("manage-connections").icon(IconName::Network).ghost().small().tooltip("Manage connections").on_click(cx.listener(|this, _, window, cx| this.open_connections(window, cx)))
+}
+
 impl Siesta {
     fn toggle_db(&mut self, key: String) {
         if !self.db_toggled.remove(&key) {
@@ -268,7 +273,7 @@ impl Siesta {
         let Some(d) = self.doc().filter(|d| d.sql) else { return note("Open a .sql file to see its connection's schema".into()) };
         let Some(conn) = d.connection().map(str::to_string) else {
             let new = Button::new("db-new-connection").label("New connection…").small().on_click(cx.listener(|this, _, window, cx| this.open_conn_form(None, window, cx)));
-            return div().flex_1().flex().flex_col().gap_2().child(note("No connection: pick one in the top-right corner".into())).child(div().px_3().child(new)).into_any_element();
+            return div().flex_1().flex().flex_col().gap_2().child(note("No connection: pick one in the top-right corner".into())).child(div().px_3().flex().gap_2().child(new).child(manage_button(cx))).into_any_element();
         };
         let key = d.schema_key().unwrap_or_default();
         let (schema, loading, error) = {
@@ -330,7 +335,7 @@ impl Siesta {
                     .items_center()
                     .justify_between()
                     .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).truncate().child(title.to_uppercase()))
-                    .child(div().flex().gap_1().child(edit).child(refresh)),
+                    .child(div().flex().gap_1().child(manage_button(cx)).child(edit).child(refresh)),
             )
             .child(div().flex_none().px_2().pb_1p5().child(Input::new(&self.db_filter).small().cleanable(true)))
             .when(self.db_rows.is_empty(), |el| el.child(note("Nothing matches".into())))
