@@ -11,8 +11,12 @@ impl Fixture {
     fn new(driver: &'static str, url_var: &str) -> Fixture {
         let url = std::env::var(url_var).unwrap_or_else(|_| panic!("{url_var} is not set; run scripts/test-db.sh"));
         let dir = tempfile::tempdir().unwrap();
-        let conn = |ro: bool| json!({ "driver": driver, "url": url, "read_only": ro });
-        let all = json!({ "c": conn(false), "prod-c": conn(false), "ro": conn(true) });
+        // Never read the real ~/.config/siesta (set to the same empty dir by both tests).
+        let cfg = std::env::temp_dir().join("siesta-cli-test-empty-config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        unsafe { std::env::set_var("SIESTA_CONFIG_DIR", &cfg) };
+        let conn = |ro: bool, prod: bool| json!({ "driver": driver, "url": url, "read_only": ro, "prod": prod });
+        let all = json!({ "c": conn(false, false), "prod-c": conn(false, true), "ro": conn(true, false) });
         std::fs::write(dir.path().join("conns.json"), all.to_string()).unwrap();
         Fixture { dir, driver }
     }
@@ -98,12 +102,14 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     assert_eq!(v["error"]["sqlstate"], sql_error_state, "{v}");
     assert!(!v.is_array(), "the second statement must not run: {v}");
 
-    // Refusal: destructive on a prod connection, 4 and nothing runs; --yes runs.
+    // Refusal: every statement on a prod connection (even a SELECT), 4 and nothing runs; --yes runs.
     let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "DELETE FROM siesta_cli_t"]));
+    assert_eq!((code, v["error"]["code"].as_str()), (4, Some("confirmation_required")));
+    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "SELECT 1"]));
     assert_eq!((code, v["error"]["code"].as_str()), (4, Some("confirmation_required")));
     let (_, v) = f.json(&with(&["exec", "-c", "c", "SELECT count(*) AS n FROM siesta_cli_t"]));
     assert_eq!(v["rows"][0][0], 5);
-    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "DELETE FROM siesta_cli_t WHERE id = 5"]));
+    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "--yes", "DELETE FROM siesta_cli_t WHERE id = 5"]));
     assert_eq!((code, v["rows_affected"].as_u64()), (0, Some(1)));
     let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "--yes", "UPDATE siesta_cli_t SET name = 'z'"]));
     assert_eq!((code, v["rows_affected"].as_u64()), (0, Some(4)));
@@ -195,4 +201,20 @@ fn postgres() {
 fn mysql() {
     let f = Fixture::new("mysql", "SIESTA_TEST_MYSQL_URL");
     scenario(&f, "42S02");
+}
+
+#[test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+fn mariadb_json_column_is_nested_json() {
+    let f = Fixture::new("mysql", "SIESTA_TEST_MYSQL_URL");
+    let (code, v) = f.json(&[
+        "exec", "-c", "c", "--output", "json",
+        "DROP TABLE IF EXISTS siesta_cli_json; CREATE TABLE siesta_cli_json (id INT, doc JSON); \
+         INSERT INTO siesta_cli_json VALUES (1, '{\"a\": [1, {\"b\": null}]}'); SELECT doc, CAST(0xDEAD AS BINARY) AS bin FROM siesta_cli_json; \
+         DROP TABLE siesta_cli_json",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let sel = &v.as_array().unwrap()[3];
+    assert_eq!(sel["rows"][0][0], json!({"a": [1, {"b": null}]}), "{sel}");
+    assert_eq!(sel["rows"][0][1], "dead", "real binary stays bytes: {sel}");
 }

@@ -36,7 +36,8 @@ pub struct ExecOpts {
     /// Rows to return per statement [default: 100]; 0 = the `results.max_rows` cap
     #[arg(long, value_name = "N")]
     pub max_rows: Option<usize>,
-    /// Skip the confirmation of `-- @confirm` and destructive statements on prod connections
+    /// Skip confirmations: every statement on a `prod` connection, `-- @confirm`, and destructive
+    /// statements when `run.confirm_destructive` asks
     #[arg(long)]
     pub yes: bool,
     /// Force the connection read-only: a safety default of the session (the server rejects writes,
@@ -80,7 +81,7 @@ impl Env {
         }
         let mut files = loaded.settings.connection_files(&root);
         files.extend(extra.iter().cloned());
-        let conns = Connections::load(probe, &root, &files);
+        let conns = Connections::load(probe, &root, &files, db_conn::global_dir().as_deref());
         for w in &conns.warnings {
             eprintln!("{} {w}", paint("warning:", YELLOW, true));
         }
@@ -202,13 +203,16 @@ fn ask(question: &str) -> bool {
 /// Refuses (exit 4) or, in a terminal, asks, for every statement that needs confirmation.
 /// Runs before anything executes, so a refusal never leaves a half-run batch.
 fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes: bool) -> Result<(), CliError> {
-    let guarded = conn.read_only || env.settings.connections.is_prod(&conn.name);
     let policy = env.settings.run.confirm_destructive;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     for j in jobs {
-        let reason = if j.confirm {
+        // `prod` connections confirm every statement; the policy only matters elsewhere
+        // (`prod` in the policy means that same flag, so it adds nothing for the others).
+        let reason = if conn.prod {
+            Some("production connection")
+        } else if j.confirm {
             Some("marked -- @confirm")
-        } else if policy == ConfirmDestructive::Always || (policy == ConfirmDestructive::Prod && guarded) {
+        } else if policy == ConfirmDestructive::Always {
             sql_split::destructive_reason(&j.text, dialect_of(conn.driver))
         } else {
             None
@@ -388,18 +392,16 @@ mod tests {
         assert_eq!([row_limit(None, 10_000), row_limit(None, 50), row_limit(Some(0), 500), row_limit(Some(7), 500), row_limit(Some(9999), 500)], [100, 50, 500, 7, 500]);
     }
 
-    fn env(prod: &str) -> Env {
-        let mut settings = Settings::default();
-        settings.connections.prod_pattern = prod.into();
-        Env { settings, conns: Connections::default() }
+    fn env() -> Env {
+        Env { settings: Settings::default(), conns: Connections::default() }
     }
 
-    fn conn(name: &str, read_only: bool) -> Connection {
-        let s = r#"{"driver":"postgres","host":"h"}"#;
+    fn conn(name: &str, read_only: bool, prod: bool) -> Connection {
+        let s = format!(r#"{{"driver":"postgres","host":"h","prod":{prod}}}"#);
         let dir = std::env::temp_dir().join(format!("siesta-cli-unit-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("siesta.json"), format!("{{\"{name}\": {s}}}")).unwrap();
-        let mut c = Connections::load(&dir.join("a.sql"), &dir, &[]).connections.remove(name).unwrap();
+        let mut c = Connections::load(&dir.join("a.sql"), &dir, &[], None).connections.remove(name).unwrap();
         c.read_only = read_only;
         std::fs::remove_dir_all(&dir).ok();
         c
@@ -413,23 +415,29 @@ mod tests {
     fn confirmation_rules() {
         // Not a terminal in tests: confirmation means refusal (exit 4) unless --yes.
         let refused = |e: &Env, c: &Connection, j: Job, yes| confirm(e, c, &[j], None, yes).err().map(|e| e.exit);
-        let e = env("prod*");
-        let prod = conn("prod-db", false);
-        let dev = conn("dev-db", false);
-        let ro = conn("dev-ro", true);
-        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), false), Some(4));
+        let e = env();
+        let prod = conn("prod-db", false, true);
+        let dev = conn("dev-db", false, false);
+        let ro = conn("dev-ro", true, false);
+        // A prod connection confirms every statement, even a plain SELECT.
+        assert!(prod.prod && !dev.prod);
+        assert_eq!(refused(&e, &prod, job_of("SELECT 1", false), false), Some(4));
+        assert_eq!(refused(&e, &prod, job_of("SELECT 1", false), true), None);
+        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t WHERE id = 1", false), false), Some(4));
         assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), true), None);
-        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t WHERE id = 1", false), false), None);
-        assert_eq!(refused(&e, &ro, job_of("DROP TABLE t", false), false), Some(4));
+        // Neither a read-only nor a plain connection does, by default.
+        assert_eq!(refused(&e, &ro, job_of("DROP TABLE t", false), false), None);
         assert_eq!(refused(&e, &dev, job_of("DROP TABLE t", false), false), None);
         assert_eq!(refused(&e, &dev, job_of("SELECT 1", true), false), Some(4));
         assert_eq!(refused(&e, &dev, job_of("SELECT 1", true), true), None);
-        let mut always = env("prod*");
+        let mut always = env();
         always.settings.run.confirm_destructive = ConfirmDestructive::Always;
         assert_eq!(refused(&always, &dev, job_of("TRUNCATE t", false), false), Some(4));
-        let mut never = env("prod*");
+        assert_eq!(refused(&always, &dev, job_of("SELECT 1", false), false), None);
+        // `never` does not switch the prod rule off.
+        let mut never = env();
         never.settings.run.confirm_destructive = ConfirmDestructive::Never;
-        assert_eq!(refused(&never, &prod, job_of("TRUNCATE t", false), false), None);
-        assert_eq!(refused(&never, &prod, job_of("SELECT 1", true), false), Some(4));
+        assert_eq!(refused(&never, &prod, job_of("TRUNCATE t", false), false), Some(4));
+        assert_eq!(refused(&never, &dev, job_of("TRUNCATE t", false), false), None);
     }
 }

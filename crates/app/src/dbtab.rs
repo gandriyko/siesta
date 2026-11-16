@@ -266,7 +266,10 @@ impl Siesta {
         let muted = cx.theme().muted_foreground;
         let note = |text: String| div().flex_1().px_3().pt_2().text_sm().text_color(muted).child(text).into_any_element();
         let Some(d) = self.doc().filter(|d| d.sql) else { return note("Open a .sql file to see its connection's schema".into()) };
-        let Some(conn) = d.connection().map(str::to_string) else { return note("No connection: pick one in the top-right corner".into()) };
+        let Some(conn) = d.connection().map(str::to_string) else {
+            let new = Button::new("db-new-connection").label("New connection…").small().on_click(cx.listener(|this, _, window, cx| this.open_conn_form(None, window, cx)));
+            return div().flex_1().flex().flex_col().gap_2().child(note("No connection: pick one in the top-right corner".into())).child(div().px_3().child(new)).into_any_element();
+        };
         let key = d.schema_key().unwrap_or_default();
         let (schema, loading, error) = {
             let c = self.schemas.borrow();
@@ -281,7 +284,8 @@ impl Siesta {
             } else if let Some(e) = &error {
                 format!("Could not read the schema of '{conn}': {e}")
             } else {
-                format!("The schema of '{conn}' is not loaded yet. It loads after the first successful run, or now:")
+                // It loads by itself when a connection is picked; nothing to click yet.
+                format!("The schema of '{conn}' is not loaded.")
             };
             return div()
                 .flex_1()
@@ -289,7 +293,7 @@ impl Siesta {
                 .flex_col()
                 .gap_2()
                 .child(note(text))
-                .when(!loading, |el| el.child(div().px_3().child(action("load-schema", if error.is_some() { "Retry" } else { "Load schema" }, cx))))
+                .when(!loading, |el| el.child(div().px_3().child(action("retry-schema", if error.is_some() { "Retry" } else { "Refresh" }, cx))))
                 .into_any_element();
         };
         let query = self.db_filter.read(cx).value().trim().to_lowercase();
@@ -297,6 +301,7 @@ impl Siesta {
         let list = uniform_list("db-tree", self.db_rows.len(), cx.processor(|this, range: Range<usize>, _, cx| {
             range.map(|ix| this.render_db_row(ix, cx)).collect::<Vec<_>>()
         }));
+        let conn_name = conn.clone();
         let title = if loading { format!("{conn} · loading…") } else { conn };
         let refresh = Button::new("refresh-schema")
             .icon(IconName::RefreshCw)
@@ -304,6 +309,13 @@ impl Siesta {
             .small()
             .tooltip("Refresh schema")
             .on_click(cx.listener(|this, _, window, cx| this.refresh_schema(window, cx)));
+        let edit_name = conn_name.clone();
+        let edit = Button::new("edit-connection")
+            .icon(IconName::Settings)
+            .ghost()
+            .small()
+            .tooltip("Edit connection")
+            .on_click(cx.listener(move |this, _, window, cx| this.open_conn_form(Some(edit_name.clone()), window, cx)));
         div()
             .flex_1()
             .min_h_0()
@@ -318,7 +330,7 @@ impl Siesta {
                     .items_center()
                     .justify_between()
                     .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).truncate().child(title.to_uppercase()))
-                    .child(refresh),
+                    .child(div().flex().gap_1().child(edit).child(refresh)),
             )
             .child(div().flex_none().px_2().pb_1p5().child(Input::new(&self.db_filter).small().cleanable(true)))
             .when(self.db_rows.is_empty(), |el| el.child(note("Nothing matches".into())))

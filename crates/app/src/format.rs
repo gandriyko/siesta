@@ -31,6 +31,34 @@ pub fn cell_display(v: &Value, null_text: &str, max_bytes: usize) -> String {
     out
 }
 
+/// The JSON of a cell, if it is one: a JSON value, or text that parses as an object / array.
+pub fn cell_json(v: &Value) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
+    use std::borrow::Cow;
+    match v {
+        Value::Json(j) => Some(Cow::Borrowed(j)),
+        Value::Text(s) if s.trim_start().starts_with(['{', '[']) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(j @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => Some(Cow::Owned(j)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The first `n` lines of the pretty-printed JSON; when it is longer, the last line ends with `…`.
+/// (`n == 0` gives nothing.) Printing the whole document first is fine at page size; a huge document
+/// per cell would want a streaming printer.
+pub fn json_preview(j: &serde_json::Value, n: usize) -> Vec<String> {
+    let pretty = serde_json::to_string_pretty(j).unwrap_or_default();
+    let mut lines: Vec<String> = pretty.lines().take(n + 1).map(str::to_string).collect();
+    if lines.len() > n {
+        lines.truncate(n);
+        if let Some(last) = lines.last_mut() {
+            last.push('…');
+        }
+    }
+    lines
+}
+
 /// Numbers are right-aligned: every non-null value among the first rows is a number.
 pub fn is_numeric_column(rows: &[Vec<Value>], col: usize) -> bool {
     let mut seen = false;
@@ -333,6 +361,15 @@ mod tests {
         assert_eq!(page_label(0, 100, Some(0)), "1 / 1");
         assert_eq!(duration_label(Duration::from_millis(12)), "12 ms");
         assert_eq!(duration_label(Duration::from_millis(3200)), "3.20 s");
+        let doc = serde_json::json!({"a": [1, 2], "b": {"c": null}});
+        assert_eq!(json_preview(&doc, 2), ["{", "  \"a\": […"]);
+        assert_eq!(json_preview(&serde_json::json!([1]), 4), ["[", "  1", "]"]); // fits: no ellipsis
+        assert_eq!(json_preview(&serde_json::json!([1]), 3), ["[", "  1", "]"]);
+        assert_eq!(json_preview(&serde_json::json!([1]), 2), ["[", "  1…"]);
+        assert!(json_preview(&doc, 0).is_empty());
+        assert_eq!(cell_json(&Value::Text(" {\"a\":1}".into())).as_deref(), Some(&serde_json::json!({"a": 1})));
+        assert!(cell_json(&Value::Text("123".into())).is_none() && cell_json(&Value::Text("{x".into())).is_none() && cell_json(&Value::Int(1)).is_none());
+        assert!(cell_json(&Value::Json(serde_json::json!(5))).is_some());
         assert!(parse_color("#ff0000").is_some() && parse_color("red").is_some() && parse_color("nope").is_none());
     }
 }

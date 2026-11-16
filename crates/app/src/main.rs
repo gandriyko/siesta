@@ -5,6 +5,7 @@
 //! dialog in `value_popup`, pure formatting in `format`; everything else of the shell is here.
 
 mod complete;
+mod conn_form;
 mod dbtab;
 mod doc;
 mod format;
@@ -130,6 +131,10 @@ pub(crate) struct Siesta {
     ticking: bool,
     settings: siesta_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
+    /// `~/.config/siesta`: the global connection files live here; `None` = no global connections.
+    config_dir: Option<PathBuf>,
+    /// The open New / Edit connection form.
+    conn_form: Option<Entity<conn_form::ConnForm>>,
     /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Siesta" context.
     focus: FocusHandle,
     /// Theme's own monospace font, used when `font_family` is empty.
@@ -155,6 +160,7 @@ impl Siesta {
         open: Option<(PathBuf, Option<u32>)>,
         base: Option<PathBuf>,
         settings: siesta_settings::Loaded,
+        config_dir: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -231,6 +237,8 @@ impl Siesta {
             ticking: false,
             settings,
             settings_window: None,
+            config_dir,
+            conn_form: None,
             focus: cx.focus_handle(),
             default_mono: cx.theme().mono_font_family.clone(),
             _subs,
@@ -366,14 +374,15 @@ impl Siesta {
     }
 
     fn conns_stamp(&self) -> Stamp {
-        let mut out: Stamp = self.docs.iter().flat_map(|d| self.conn_candidates(&d.path)).map(|p| (p.clone(), doc::mtime(&p))).collect();
+        let global = self.config_dir.iter().flat_map(|d| [d.join("connections.json"), d.join("connections.private.json")]);
+        let mut out: Stamp = global.chain(self.docs.iter().flat_map(|d| self.conn_candidates(&d.path))).map(|p| (p.clone(), doc::mtime(&p))).collect();
         out.sort();
         out.dedup();
         out
     }
 
     fn load_connections(&self, path: &Path) -> Connections {
-        Connections::load(path, &self.root_of(path), &self.settings.settings.connection_files(&self.root_of(path)))
+        Connections::load(path, &self.root_of(path), &self.settings.settings.connection_files(&self.root_of(path)), self.config_dir.as_deref())
     }
 
     /// Surface what `Connections::load` found wrong, the way Respite does for env files.
@@ -525,6 +534,8 @@ impl Siesta {
                 if let Some(key) = self.docs[ix].schema_key() {
                     self.load_cached_schema(&key);
                 }
+                // A restored pick loads the schema like a fresh one.
+                self.autoload_schema(&path, window, cx);
                 ix
             }
         };
@@ -739,43 +750,40 @@ impl Siesta {
 
     /// The picker's choice for the current file (`None` = no connection): remembered per file.
     /// `-- @connection` in the text still wins.
-    pub(crate) fn select_connection(&mut self, name: Option<String>, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.current else { return };
-        self.picks.insert((*self.docs[ix].path).clone(), name.clone());
-        self.docs[ix].picked = name;
+    pub(crate) fn select_connection(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        self.pick_for(&path, name, window, cx);
+    }
+
+    /// Remembers `name` as the pick of `path` (only that file) and loads its schema in the background.
+    pub(crate) fn pick_for(&mut self, path: &Path, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
+        self.picks.insert(path.to_path_buf(), name.clone());
+        self.docs[ix].picked = name.clone();
         self.docs[ix].reparse(cx);
         if let Some(key) = self.docs[ix].schema_key() {
             self.load_cached_schema(&key);
+        }
+        if name.is_some() {
+            self.autoload_schema(path, window, cx);
         }
         self.remember(cx);
         cx.notify();
     }
 
-    /// Red when the file's connection looks like production or is read-only.
+    /// Above the editor: a red "Production" banner for a `prod` connection; a read-only one alone
+    /// only gets a neutral badge.
     fn banner(&self, cx: &App) -> Option<AnyElement> {
         let d = self.doc()?;
         let name = d.connection()?;
-        let prod = self.settings.settings.connections.is_prod(name);
-        let read_only = d.conns.connections.get(name).is_some_and(|c| c.read_only);
-        let what = match (prod, read_only) {
-            (true, true) => "production, read-only",
-            (true, false) => "production",
-            (false, true) => "read-only",
-            (false, false) => return None,
-        };
+        let c = d.conns.connections.get(name)?;
         let t = cx.theme();
-        Some(
-            div()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .bg(t.danger)
-                .text_color(t.danger_foreground)
-                .child(format!("{name}: {what} connection"))
-                .into_any_element(),
-        )
+        let bar = || div().flex_none().px_3().py_1().text_sm().font_weight(FontWeight::SEMIBOLD);
+        Some(match (c.prod, c.read_only) {
+            (false, false) => return None,
+            (true, ro) => bar().bg(t.danger).text_color(t.danger_foreground).child(format!("Production: {name}{}", if ro { " (read only)" } else { "" })).into_any_element(),
+            (false, true) => bar().bg(t.secondary).text_color(t.muted_foreground).child(format!("Read only: {name}")).into_any_element(),
+        })
     }
 
     /// Top-right connection picker: the connections of the current file's chain, "No connection",
@@ -785,7 +793,11 @@ impl Siesta {
         let current = d.connection().map(str::to_string);
         let forced = d.file.connection.is_some();
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
-        let prod = current.as_deref().is_some_and(|n| self.settings.settings.connections.is_prod(n));
+        let conn_of = |n: &str| d.conns.connections.get(n);
+        let prod = current.as_deref().and_then(conn_of).is_some_and(|c| c.prod);
+        // Each connection's colour (its own, or red for prod) marks it in the picker.
+        let colors: std::collections::HashMap<String, Hsla> = names.iter().filter_map(|n| Some((n.clone(), format::parse_color(conn_of(n)?.display_color()?)?))).collect();
+        let strip = current.as_ref().and_then(|n| colors.get(n).copied());
         let status = self.dot_of(&d.path, current.as_deref());
         let (can_test, can_disconnect) = (current.is_some(), self.slots.keys().any(|(p, _)| *p == *d.path));
         let t = cx.theme();
@@ -801,7 +813,7 @@ impl Siesta {
         Some(
             Button::new("connection-picker")
                 .icon(IconName::Network)
-                .child(h_flex().gap_1p5().child(dot(status_color)).child(label))
+                .child(h_flex().gap_1p5().children(strip.map(|c| div().flex_none().w(px(3.)).h(fs).rounded_full().bg(c))).child(dot(status_color)).child(label))
                 .dropdown_caret(true)
                 .small()
                 .when(prod, |b| b.danger())
@@ -833,7 +845,7 @@ impl Siesta {
                         }
                     };
                     let row = |label: String, name: Option<String>| {
-                        let color = cx.theme().muted_foreground.opacity(0.6);
+                        let color = name.as_ref().and_then(|n| colors.get(n).copied()).unwrap_or(cx.theme().muted_foreground.opacity(0.6));
                         let size = cx.theme().font_size * 0.55;
                         PopupMenuItem::element(move |_, _| {
                             h_flex().gap_2().items_center().child(div().flex_none().size(size).rounded_full().bg(color)).child(label.clone())
@@ -849,7 +861,18 @@ impl Siesta {
                     if forced {
                         menu = menu.separator().label("Set by -- @connection in the file");
                     }
-                    // Test needs a connection, Disconnect a live session.
+                    // Global connections are made and edited in a form; Test needs a connection, Disconnect a live session.
+                    let form = |label: &'static str, edit: bool| {
+                        let view = view.clone();
+                        PopupMenuItem::new(label).disabled(edit && !can_test).on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                let name = if edit { this.doc().and_then(|d| d.connection().map(str::to_string)) } else { None };
+                                this.open_conn_form(name, window, cx);
+                            })
+                            .ok();
+                        })
+                    };
+                    menu = menu.separator().item(form("New connection…", false)).item(form("Edit connection…", true));
                     let hook = |label: &'static str, enabled: bool, run: fn(&mut Siesta, &mut Window, &mut Context<Siesta>)| {
                         let view = view.clone();
                         PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, window, cx| {
@@ -1232,7 +1255,7 @@ fn main() -> std::process::ExitCode {
         let handle = cx
             .open_window(options, |window, cx| {
                 let settings = siesta_settings::Loaded::load(Some(&root));
-                let v = cx.new(|cx| Siesta::new(root, open, base, settings, window, cx));
+                let v = cx.new(|cx| Siesta::new(root, open, base, settings, db_conn::global_dir(), window, cx));
                 v.update(cx, |this, cx| this.start_watch(window, cx));
                 view = Some(v.downgrade());
                 cx.new(|cx| Root::new(v, window, cx))
@@ -1279,7 +1302,14 @@ mod tests {
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
-        std::fs::write(r.join("siesta.json"), r#"{"dev": {"driver": "postgres", "database": "d"}, "my": {"driver": "mysql", "read_only": true}}"#).unwrap();
+        // Nothing listens on port 1: a picked connection tries to load its schema and fails at once.
+        std::fs::write(
+            r.join("siesta.json"),
+            r#"{"dev": {"driver": "postgres", "url": "postgres://nobody@127.0.0.1:1/d"},
+                "my": {"driver": "mysql", "read_only": true, "url": "mysql://nobody@127.0.0.1:1/d"},
+                "live": {"driver": "postgres", "prod": true, "url": "postgres://nobody@127.0.0.1:1/p"}}"#,
+        )
+        .unwrap();
         std::fs::write(r.join("a.sql"), "SELECT 1;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n").unwrap();
         std::fs::write(r.join("b.sql"), "SELECT 'b';\n").unwrap();
         std::fs::write(r.join("c.sql"), "-- @connection my\nSELECT 'c';\n").unwrap();
@@ -1294,7 +1324,7 @@ mod tests {
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 let settings = siesta_settings::Loaded::load_from(None, None);
-                let v = cx.new(|cx| Siesta::new(root.to_path_buf(), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, window, cx));
+                let v = cx.new(|cx| Siesta::new(root.to_path_buf(), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, None, window, cx));
                 view = Some(v.clone());
                 cx.new(|cx| Root::new(v, window, cx))
             })
@@ -1551,6 +1581,139 @@ mod tests {
         let (again, mut cx2) = open_app(tcx, ws.path(), base.path(), None);
         assert_eq!(conn(&again, &mut cx2, &a), (Some("dev".into()), sql_split::Dialect::Postgres));
         assert_eq!(conn(&again, &mut cx2, &b), (Some("my".into()), sql_split::Dialect::MySql));
+        // A restored pick reads its schema in the background right away (nothing was run).
+        let loading = cx2.update(|_, cx| {
+            let this = again.read(cx);
+            let key = this.docs.iter().find(|d| *d.path == a).unwrap().schema_key().unwrap();
+            this.schemas.borrow().loading.contains(&key)
+        });
+        assert!(loading);
+    }
+
+    #[gpui::test]
+    fn prod_run_asks_once_and_paging_does_not(tcx: &mut TestAppContext) {
+        use db_exec::Value::Int;
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        let run = |cx: &mut VisualTestContext| cx.update(|window, cx| app.update(cx, |this, cx| this.run_current(window, cx)));
+        let ran = |cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).store.last.is_some());
+        // A dev connection runs a plain SELECT without asking.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
+        run(&mut cx);
+        assert!(!cx.has_pending_prompt() && ran(&mut cx));
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.last = None));
+
+        // A prod one asks for every run, even a SELECT; Cancel runs nothing.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("live".into()), window, cx)));
+        run(&mut cx);
+        assert!(cx.has_pending_prompt());
+        assert!(cx.pending_prompt().unwrap().0.contains("PRODUCTION live"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!ran(&mut cx));
+        run(&mut cx);
+        cx.simulate_prompt_answer("Run");
+        cx.run_until_parked();
+        assert!(ran(&mut cx));
+
+        // Paging, sorting and filtering re-run the confirmed result: no second question.
+        let key = (a.clone(), "SELECT 9".to_string());
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.put(key.clone(), done("SELECT 9", &[("a", "int4")], vec![vec![Int(1)]; 3], true))));
+        cx.update(|_, cx| app.update(cx, |this, _| this.ui.pinned = Some(key.clone())));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.step_page(true, window, cx)));
+        assert!(!cx.has_pending_prompt());
+        // The re-run really was requested (page 2, running), without a dialog.
+        let (offset, running) = cx.update(|_, cx| {
+            let e = &app.read(cx).store.entries[&key];
+            (e.page.offset, e.running.is_some())
+        });
+        assert_eq!((offset, running), (100, true));
+    }
+
+    #[gpui::test]
+    fn form_saves_into_the_config_dir_and_picks_for_its_own_file_only(tcx: &mut TestAppContext) {
+        use db_conn::Driver;
+        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (ws.path().join("a.sql"), ws.path().join("b.sql"));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        let dir = cfg.path().join("siesta");
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.config_dir = Some(dir.clone());
+                this.open_conn_form(None, window, cx);
+                // The user moves on to another file before pressing Save.
+                this.open(b.clone(), None, window, cx);
+            })
+        });
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().expect("the form is open"));
+        cx.update(|window, cx| {
+            form.update(cx, |f, cx| {
+                f.name.update(cx, |s, cx| s.set_value("fresh", window, cx));
+                f.host.update(cx, |s, cx| s.set_value("127.0.0.1", window, cx));
+                f.port.update(cx, |s, cx| s.set_value("1", window, cx));
+                f.password.update(cx, |s, cx| s.set_value("pw", window, cx));
+                f.driver = Some(Driver::MySql);
+                f.save(window, cx);
+            })
+        });
+        let read = |name: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap();
+        assert_eq!(read("connections.json")["fresh"], serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1}));
+        assert_eq!(read("connections.private.json")["fresh"], serde_json::json!({"password": "pw"}));
+        // Every open file sees the connection; only `a.sql` (the file the form was opened for) picked it.
+        let (pa, pb, pw) = cx.update(|_, cx| {
+            let this = app.read(cx);
+            let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
+            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections["fresh"].password.clone())
+        });
+        assert_eq!((pa.as_deref(), pb, pw.as_deref()), (Some("fresh"), None, Some("pw")));
+        let state = siesta_workspace::load_state(base.path(), ws.path());
+        assert_eq!((state.connections[&a].as_deref(), state.connections.get(&b)), (Some("fresh"), None));
+        // Edit: the same dialog on the saved connection, then Delete clears the pick.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open(a.clone(), None, window, cx);
+                this.open_conn_form(Some("fresh".into()), window, cx);
+            })
+        });
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "127.0.0.1");
+        cx.update(|window, cx| app.update(cx, |this, cx| this.connection_deleted("fresh", window, cx)));
+        cx.update(|_, cx| assert!(app.read(cx).docs.iter().all(|d| d.picked.is_none())));
+    }
+
+    #[gpui::test]
+    fn team_connections_are_read_only_in_the_form(tcx: &mut TestAppContext) {
+        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.config_dir = Some(cfg.path().to_path_buf());
+                this.open_conn_form(Some("dev".into()), window, cx);
+            })
+        });
+        let locked = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.read(cx).locked_paths()));
+        assert_eq!(locked, Some(vec![ws.path().join("siesta.json")]));
+        assert!(!cfg.path().join("connections.json").exists());
+    }
+
+    #[gpui::test]
+    fn json_cells_make_tall_rows_until_toggled_off(tcx: &mut TestAppContext) {
+        use db_exec::Value::{Int, Json, Text};
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        let rows = vec![vec![Int(1), Json(serde_json::json!({"a": [1, 2, 3], "b": {"c": null}}))], vec![Int(2), Text("[1]".into())]];
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.put((a.clone(), "SELECT 1".into()), done("SELECT 1", &[("id", "int4"), ("doc", "jsonb")], rows, false))));
+        shown_at(&app, &mut cx, 0);
+        let grid = |cx: &mut VisualTestContext| cx.update(|_, cx| {
+            let g = app.read(cx).ui.table.read(cx).delegate();
+            (g.has_json, g.tall())
+        });
+        assert_eq!(grid(&mut cx), (true, true)); // results.json_preview_lines defaults to 4
+        cx.update(|_, cx| app.update(cx, |this, cx| this.toggle_json_preview(cx)));
+        shown_at(&app, &mut cx, 0);
+        assert_eq!(grid(&mut cx), (true, false));
     }
 
     /// `public.users` (+ `analytics.events`), as `Session::schema()` would give it.

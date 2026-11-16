@@ -57,7 +57,6 @@ pub(crate) struct SettingsWindow {
     main: AnyWindowHandle,
     focus: FocusHandle,
     font_input: Entity<InputState>,
-    prod_input: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -65,7 +64,6 @@ impl SettingsWindow {
     fn new(app: WeakEntity<Siesta>, main: AnyWindowHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let s = app.upgrade().map(|a| a.read(cx).settings.settings.clone()).unwrap_or_default();
         let font_input = cx.new(|cx| InputState::new(window, cx).placeholder("Default monospace font").default_value(s.font_family.clone()));
-        let prod_input = cx.new(|cx| InputState::new(window, cx).placeholder("prod*").default_value(s.connections.prod_pattern.clone()));
         // Only real edits are written: syncing an input from the file must not write it back
         // (a workspace override would land in the global file).
         let mut _subs = vec![
@@ -75,18 +73,12 @@ impl SettingsWindow {
                     this.set("font_family", v.into(), cx);
                 }
             }),
-            cx.subscribe(&prod_input, |this, input, ev: &InputEvent, cx| {
-                let v = input.read(cx).value().trim().to_string();
-                if matches!(ev, InputEvent::Change) && Some(&v) != this.current(cx).map(|s| s.connections.prod_pattern).as_ref() {
-                    this.set("connections.prod_pattern", v.into(), cx);
-                }
-            }),
         ];
         // Settings changed elsewhere (the file on disk): refresh the text inputs not being edited.
         if let Some(entity) = app.upgrade() {
             _subs.push(cx.observe_in(&entity, window, |this, app, window, cx| {
                 let s = app.read(cx).settings.settings.clone();
-                let inputs = [(&this.font_input, s.font_family), (&this.prod_input, s.connections.prod_pattern)];
+                let inputs = [(&this.font_input, s.font_family)];
                 for (input, value) in inputs {
                     if !input.focus_handle(cx).is_focused(window) && input.read(cx).value() != value {
                         input.update(cx, |i, cx| i.set_value(value, window, cx));
@@ -97,7 +89,7 @@ impl SettingsWindow {
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Self { app, main, focus, font_input, prod_input, _subs }
+        Self { app, main, focus, font_input, _subs }
     }
 
     fn current(&self, cx: &App) -> Option<siesta_settings::Settings> {
@@ -216,9 +208,10 @@ impl Render for SettingsWindow {
             ))
             .child(section("Result panel"))
             .child(Self::row(&l, "Layout", "split", split, cx))
+            .child(Self::row(&l, "JSON preview lines", "results.json_preview_lines", Self::stepper("results.json_preview_lines", s.results.json_preview_lines as f64, 1., 0., 20., cx), cx))
+            .child(div().text_xs().text_color(muted).child("Lines of a JSON cell shown in the table (rows get taller); 0 = off. The result header has a toggle."))
             .child(section("Connections"))
-            .child(Self::row(&l, "Production pattern", "connections.prod_pattern", Input::new(&self.prod_input).w(px(160.)).into_any_element(), cx))
-            .child(div().text_xs().text_color(muted).child("Matching connections get a red banner above the editor. * matches any suffix."))
+            .child(div().text_xs().text_color(muted).child("Mark a connection \"prod\": true (or tick Production in its form) for a red banner and a confirmation on every run."))
             .child(section("Keyboard"))
             .child(Self::row(&l, "Extra shortcuts", "keymap", keymap, cx))
             .child(div().text_xs().text_color(muted).child("Your own: keymap.json next to the settings file (Zed's format)."))

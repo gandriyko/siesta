@@ -43,7 +43,7 @@ pub enum Split {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfirmDestructive {
-    /// Only on connections matching `connections.prod_pattern`.
+    /// Only on connections with `"prod": true`.
     #[default]
     Prod,
     Always,
@@ -95,6 +95,8 @@ pub struct Results {
     pub cell_preview_kb: usize,
     /// How SQL NULL is shown.
     pub null_text: String,
+    /// JSON cells show this many lines of pretty-printed JSON (rows get taller); 0 = off.
+    pub json_preview_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,13 +109,11 @@ pub struct Run {
     pub statement_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Connections {
     /// Extra connection files above the chain; `~/` is the home directory, relative = workspace root.
     pub files: Vec<String>,
-    /// Connections shown with a red warning; `*` matches any suffix, case-insensitive.
-    pub prod_pattern: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ impl Default for Editor {
 
 impl Default for Results {
     fn default() -> Self {
-        Self { page_size: 100, max_rows: 10_000, cell_preview_kb: 8, null_text: "NULL".into() }
+        Self { page_size: 100, max_rows: 10_000, cell_preview_kb: 8, null_text: "NULL".into(), json_preview_lines: 4 }
     }
 }
 
@@ -160,25 +160,9 @@ impl Default for Run {
     }
 }
 
-impl Default for Connections {
-    fn default() -> Self {
-        Self { files: vec![], prod_pattern: "prod*".into() }
-    }
-}
-
 impl Default for History {
     fn default() -> Self {
         Self { total: 500 }
-    }
-}
-
-impl Connections {
-    pub fn is_prod(&self, name: &str) -> bool {
-        let (p, n) = (self.prod_pattern.to_lowercase(), name.to_lowercase());
-        match p.strip_suffix('*') {
-            Some(prefix) => n.starts_with(prefix),
-            None => !p.is_empty() && n == p,
-        }
     }
 }
 
@@ -202,9 +186,12 @@ pub struct Loaded {
     pub errors: Vec<String>,
 }
 
-/// `~/.config/siesta/settings.json`
+/// `~/.config/siesta/settings.json` (`SIESTA_CONFIG_DIR` replaces the folder).
 pub fn global_path() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".config/siesta/settings.json"))
+    match std::env::var_os("SIESTA_CONFIG_DIR") {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d).join("settings.json")),
+        _ => Some(std::env::home_dir()?.join(".config/siesta/settings.json")),
+    }
 }
 
 impl Loaded {
@@ -295,7 +282,7 @@ mod tests {
         assert_eq!(s.results.null_text, "NULL");
         assert!(s.run.stop_on_error);
         assert_eq!((s.run.confirm_destructive, s.run.statement_timeout_ms), (ConfirmDestructive::Prod, None));
-        assert_eq!((s.connections.prod_pattern.as_str(), s.history.total), ("prod*", 500));
+        assert_eq!((s.results.json_preview_lines, s.history.total), (4, 500));
         // an empty layer set yields exactly the defaults
         assert_eq!(Loaded::load_from(None, None).settings, s);
     }
@@ -339,12 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn prod_pattern_and_connection_files() {
-        let c = Connections::default();
-        assert!(c.is_prod("prod") && c.is_prod("Production") && !c.is_prod("dev"));
-        let exact = Connections { prod_pattern: "live".into(), ..Default::default() };
-        assert!(exact.is_prod("LIVE") && !exact.is_prod("live2"));
-
+    fn connection_files() {
         let mut s = Settings::default();
         s.connections.files = vec!["~/x/siesta.json".into(), "db/siesta.json".into()];
         let files = s.connection_files(Path::new("/ws"));

@@ -51,7 +51,7 @@ for `siesta.json` from the current directory up to the project root (the nearest
   no connection at all is an error (exit `3`). `exec` and `schema` need `-c`.
 - `--max-rows N` — rows per statement (default 100, `0` = the `results.max_rows` setting, which is also the upper limit).
 - `--read-only` — force the connection read-only.
-- `--yes` — skip the confirmation (see Safety).
+- `--yes` — skip the confirmations (every statement on a `prod` connection, `-- @confirm`; see Safety).
 
 `schema` options:
 
@@ -146,21 +146,24 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
 ```
 
 - Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database` /
-  `user` / `password`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `schema` (Postgres `search_path`),
-  `init_sql`, `color`.
+  `user` / `password`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
+  statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
 - `${env:NAME}` reads the environment, `${dotenv:NAME}` the `.env` next to the file.
 - Files are found in every folder from the project root down to the `.sql` file; deeper folders and
-  the private file win.
+  the private file win. The user's global connections (`~/.config/siesta/connections.json` and
+  `connections.private.json`, written by the desktop app's "New connection" form) are read first, so a
+  project's `siesta.json` overrides a global connection of the same name.
 - Check with `siesta connections`, then `siesta connections test NAME`.
 
 ## Safety
 
-- A statement needs confirmation when it has `-- @confirm`, or when the connection is a prod one (its name
-  matches the `connections.prod_pattern` setting, default `prod*`, or it is `read_only`) and the statement is
-  `UPDATE` / `DELETE` without `WHERE`, `DROP`, `TRUNCATE` or `ALTER`. The setting `run.confirm_destructive`
-  (`prod` | `always` | `never`) widens or turns off the second rule.
-- Without a terminal the CLI never asks: it exits `4` before running anything, so a batch is never half-run.
-  In a terminal it asks `[y/N]`. `--yes` skips the question.
+- On a connection with `"prod": true` EVERY statement needs confirmation, even a `SELECT`. Elsewhere a
+  statement needs it when it has `-- @confirm`, or, with the setting `run.confirm_destructive` = `always`,
+  when it is `UPDATE` / `DELETE` without `WHERE`, `DROP`, `TRUNCATE` or `ALTER`.
+- Without a terminal the CLI never asks: it exits `4` (error code `confirmation_required`) before running
+  anything, so a batch is never half-run. In a terminal it asks `[y/N]`. `--yes` skips the question.
+- `siesta connections` shows the `prod` flag of every connection. For a prod connection prefer `--read-only`
+  and ask the user before every run.
 - `--read-only` and `"read_only": true` are a safety default of the session, enforced by the server
   (not by parsing the SQL), plus a cheap guard: statements that switch the session to read-write
   (`BEGIN READ WRITE`, `SET TRANSACTION READ WRITE`, `SET default_transaction_read_only`, `RESET ALL`, …)

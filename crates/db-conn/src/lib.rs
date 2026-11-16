@@ -1,7 +1,9 @@
 //! Connections: finds and merges `siesta.json` / `siesta.private.json`, resolves `${env:}` / `${dotenv:}`.
 //!
-//! Files are read from the workspace root down to the `.sql` file's folder (public, then private in
-//! each folder), then the extra files; later ones win. Merging is per connection key, field by field
+//! Files are read first from the global config dir (`~/.config/siesta/connections.json`, then
+//! `connections.private.json`), then from the workspace root down to the `.sql` file's folder (public,
+//! then private in each folder), then the extra files; later ones win, so a repo's `siesta.json`
+//! overrides a global connection of the same name. Merging is per connection key, field by field
 //! (`ssl` deeply). A broken connection lands in `errors`, a broken file in `warnings`; the rest loads.
 //! Variables are resolved, and relative `ssl` paths made absolute, per file before merging, so
 //! `.env` and relative paths belong to the file that holds the value.
@@ -11,7 +13,21 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-const KEYS: [&str; 12] = ["driver", "url", "host", "port", "database", "user", "password", "ssl", "read_only", "schema", "init_sql", "color"];
+mod global;
+pub use global::{ConnectionForm, delete_global, global_names, read_global_form, save_global};
+
+const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "password", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
+const GLOBAL_PUBLIC: &str = "connections.json";
+const GLOBAL_PRIVATE: &str = "connections.private.json";
+
+/// `~/.config/siesta`, where global connections (and the settings) live; `SIESTA_CONFIG_DIR`
+/// overrides it (tests, sandboxes).
+pub fn global_dir() -> Option<PathBuf> {
+    match std::env::var_os("SIESTA_CONFIG_DIR") {
+        Some(d) if !d.is_empty() => Some(d.into()),
+        _ => Some(std::env::home_dir()?.join(".config/siesta")),
+    }
+}
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +68,8 @@ pub struct Connection {
     pub password: Option<String>,
     pub ssl: Ssl,
     pub read_only: bool,
+    /// A production connection: red, and every run asks for confirmation.
+    pub prod: bool,
     /// Postgres `search_path`.
     pub schema: Option<String>,
     pub init_sql: Option<String>,
@@ -59,6 +77,11 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// The strip / dot colour: `color`, else red for a production connection.
+    pub fn display_color(&self) -> Option<&str> {
+        self.color.as_deref().or(self.prod.then_some("red"))
+    }
+
     /// A stable id of the server this connection points at (driver, url without its password,
     /// host, port, database, user), for caches that must not mix two connections that merely
     /// share a name (the same name in two `siesta.json` files). FNV-1a: stable across Rust versions.
@@ -88,21 +111,24 @@ pub struct Connections {
     pub connections: BTreeMap<String, Connection>,
     /// Connections that could not be built (unresolved variable, no driver, bad value).
     pub errors: BTreeMap<String, String>,
+    /// Every file that defines the name, lowest priority first (also for names in `errors`).
+    pub sources: BTreeMap<String, Vec<PathBuf>>,
     /// Non-fatal: invalid JSON (file skipped), unknown keys, literal password in a public file.
     pub warnings: Vec<String>,
 }
 
 impl Connections {
-    /// Files from `root` down to the `.sql` file's folder, then `extra` (`~` expanded), later ones
-    /// overriding earlier ones.
-    pub fn load(sql_file: &Path, root: &Path, extra: &[PathBuf]) -> Self {
+    /// The global files of `global` (if any), then files from `root` down to the `.sql` file's folder,
+    /// then `extra` (`~` expanded), later ones overriding earlier ones.
+    pub fn load(sql_file: &Path, root: &Path, extra: &[PathBuf], global: Option<&Path>) -> Self {
         let dir = sql_file.parent().unwrap_or(root);
         let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| d.starts_with(root)).collect();
         if dirs.is_empty() {
             dirs.push(dir);
         }
         dirs.reverse();
-        let mut files: Vec<(PathBuf, bool)> = dirs.iter().flat_map(|d| [(d.join("siesta.json"), false), (d.join("siesta.private.json"), true)]).collect();
+        let mut files: Vec<(PathBuf, bool)> = global.into_iter().flat_map(|d| [(d.join(GLOBAL_PUBLIC), false), (d.join(GLOBAL_PRIVATE), true)]).collect();
+        files.extend(dirs.iter().flat_map(|d| [(d.join("siesta.json"), false), (d.join("siesta.private.json"), true)]));
         // An extra file counts as public only when it is named like the public one.
         files.extend(extra.iter().map(|p| {
             let p = expand_home(p);
@@ -128,6 +154,7 @@ impl Connections {
                     continue;
                 };
                 let fields = read_entry(&obj, fdir, private, &path, &name, &mut out.warnings);
+                out.sources.entry(name.clone()).or_default().push(path.clone());
                 merge(merged.entry(name).or_default(), fields);
             }
         }
@@ -185,13 +212,14 @@ pub fn masked(c: &Connection) -> Value {
     }
     put("ssl", (!ssl.is_empty()).then(|| ssl.into()));
     put("read_only", Some(c.read_only.into()));
+    put("prod", Some(c.prod.into()));
     put("schema", s(&c.schema));
     put("init_sql", s(&c.init_sql));
     put("color", s(&c.color));
     Value::Object(m)
 }
 
-fn mode_name(m: SslMode) -> &'static str {
+pub fn mode_name(m: SslMode) -> &'static str {
     match m {
         SslMode::Disable => "disable",
         SslMode::Prefer => "prefer",
@@ -326,6 +354,19 @@ fn subst(text: &str, dir: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+fn parse_driver(driver: Option<&str>, url: Option<&str>) -> Result<Driver, String> {
+    Ok(match driver {
+        Some("postgres") => Driver::Postgres,
+        Some("mysql") => Driver::MySql,
+        Some(d) => return Err(format!("unknown driver '{d}' (postgres or mysql)")),
+        None => match url.and_then(|u| u.split_once("://")).map(|(s, _)| s) {
+            Some("postgres" | "postgresql") => Driver::Postgres,
+            Some("mysql" | "mariadb") => Driver::MySql,
+            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// url".into()),
+        },
+    })
+}
+
 fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
     let ssl_fields = f.get("ssl").and_then(Value::as_object).into_iter().flatten();
     if let Some(e) = f.values().chain(ssl_fields.map(|(_, v)| v)).find_map(unresolved) {
@@ -337,27 +378,19 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         Some(_) => Err(format!("'{k}' must be a string")),
     };
     let url = str_of("url")?;
-    let driver = match str_of("driver")?.as_deref() {
-        Some("postgres") => Driver::Postgres,
-        Some("mysql") => Driver::MySql,
-        Some(d) => return Err(format!("unknown driver '{d}' (postgres or mysql)")),
-        None => match url.as_deref().and_then(|u| u.split_once("://")).map(|(s, _)| s) {
-            Some("postgres" | "postgresql") => Driver::Postgres,
-            Some("mysql" | "mariadb") => Driver::MySql,
-            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// url".into()),
-        },
-    };
+    let driver = parse_driver(str_of("driver")?.as_deref(), url.as_deref())?;
     let port = match f.get("port") {
         None | Some(Value::Null) => None,
         Some(Value::Number(n)) => Some(n.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or("'port' out of range")?),
         Some(Value::String(s)) => Some(s.trim().parse().map_err(|_| format!("'port' is not a number: '{s}'"))?),
         Some(_) => return Err("'port' must be a number".into()),
     };
-    let read_only = match f.get("read_only") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err("'read_only' must be true or false".into()),
+    let flag = |k: &str| match f.get(k) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!("'{k}' must be true or false")),
     };
+    let (read_only, prod) = (flag("read_only")?, flag("prod")?);
     let mut ssl = Ssl::default();
     if let Some(Value::Object(o)) = f.get("ssl") {
         let path = |k: &str| o.get(k).and_then(Value::as_str).map(PathBuf::from);
@@ -383,6 +416,7 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         password: str_of("password")?,
         ssl,
         read_only,
+        prod,
         schema: str_of("schema")?,
         init_sql: str_of("init_sql")?,
         color: str_of("color")?,
@@ -395,7 +429,7 @@ mod tests {
     use std::fs;
 
     fn load(root: &Path, file: &str) -> Connections {
-        Connections::load(&root.join(file), root, &[])
+        Connections::load(&root.join(file), root, &[], None)
     }
 
     #[test]
@@ -417,8 +451,30 @@ mod tests {
         // Extra files come last.
         let extra = r.join("extra.private.json");
         fs::write(&extra, r#"{"a": {"host": "extra"}}"#).unwrap();
-        let c = Connections::load(&r.join("svc/q.sql"), r, &[extra]);
+        let c = Connections::load(&r.join("svc/q.sql"), r, &[extra], None);
         assert_eq!(c.connections["a"].host.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn global_files_come_first_and_prod_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (g, r) = (tmp.path().join("cfg"), tmp.path().join("repo"));
+        fs::create_dir_all(&g).unwrap();
+        fs::create_dir_all(&r).unwrap();
+        fs::write(g.join("connections.json"), r#"{"a": {"driver": "postgres", "host": "global", "prod": true}, "g": {"driver": "mysql", "password": "lit"}}"#).unwrap();
+        fs::write(g.join("connections.private.json"), r#"{"a": {"password": "gp"}, "g": {"password": "from-private"}}"#).unwrap();
+        fs::write(r.join("siesta.json"), r#"{"a": {"host": "repo"}}"#).unwrap();
+        let c = Connections::load(&r.join("q.sql"), &r, &[], Some(&g));
+        let a = &c.connections["a"];
+        assert_eq!((a.host.as_deref(), a.password.as_deref(), a.prod), (Some("repo"), Some("gp"), true));
+        assert_eq!(c.sources["a"].len(), 3);
+        assert_eq!(c.connections["g"].password.as_deref(), Some("from-private"));
+        // The literal-password warning does not apply to the global private file (the public one still warns).
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.warnings[0].contains("'g': literal password"));
+        assert!(!Connections::load(&r.join("q.sql"), &r, &[], None).connections.contains_key("g"));
+        fs::write(r.join("siesta.json"), r#"{"a": {"prod": "yes"}}"#).unwrap();
+        assert!(Connections::load(&r.join("q.sql"), &r, &[], Some(&g)).errors["a"].contains("'prod'"));
     }
 
     #[test]

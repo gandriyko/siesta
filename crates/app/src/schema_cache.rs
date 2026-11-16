@@ -18,7 +18,7 @@ pub struct Cache {
     pub schemas: HashMap<String, Arc<Schema>>,
     pub loading: HashSet<String>,
     pub errors: HashMap<String, String>,
-    /// Read from the server in this run (the first live session does it once; "Refresh" again).
+    /// Read from the server in this run (picking a connection does it once; DDL and "Refresh" again).
     pub fresh: HashSet<String>,
     /// Keys whose disk cache was already looked at.
     pub disk_tried: HashSet<String>,
@@ -75,6 +75,7 @@ mod tests {
             password: None,
             ssl: Default::default(),
             read_only: false,
+            prod: false,
             schema: None,
             init_sql: None,
             color: None,

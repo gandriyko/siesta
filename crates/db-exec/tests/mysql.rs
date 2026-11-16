@@ -47,10 +47,10 @@ async fn every_value_type() {
     assert_eq!(g("a_bool"), ("BOOLEAN", &Value::Bool(true)));
     assert_eq!(g("a_varchar"), ("VARCHAR", &Value::Text("héllo".into())));
     assert_eq!(g("a_text"), ("TEXT", &Value::Text("long text".into())));
-    // MySQL reports a real JSON type; MariaDB's JSON is a utf8mb4_bin LONGTEXT that arrives as BLOB.
+    // MySQL reports a real JSON type; MariaDB's JSON is a utf8mb4_bin LONGTEXT that arrives as BLOB:
+    // decoded as text, then as JSON by the heuristic.
     match g("a_json") {
-        ("JSON", Value::Json(j)) => assert_eq!(j, &serde_json::json!({"a": [1, 2]})),
-        ("BLOB", Value::Bytes(b)) => assert_eq!(b, b"{\"a\": [1, 2]}"),
+        ("JSON" | "BLOB", Value::Json(j)) => assert_eq!(j, &serde_json::json!({"a": [1, 2]})),
         other => panic!("{other:?}"),
     }
     assert_eq!(g("a_blob"), ("BLOB", &Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])));
@@ -474,4 +474,18 @@ async fn cancel_handle_follows_the_reconnected_backend() {
     if let Err(e) = res {
         assert_eq!(e.code.as_deref(), Some("70100"));
     }
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn json_text_and_bin_collation_are_text_binary_stays_bytes() {
+    let mut s = open_my().await;
+    run(&mut s, "CREATE TEMPORARY TABLE jt (doc JSON, v VARCHAR(20) COLLATE utf8mb4_bin, plain VARCHAR(20), raw VARBINARY(4))").await;
+    run(&mut s, "INSERT INTO jt VALUES ('[1, {\"a\": null}]', 'bin collation', '{not json', 0x7b7d)").await;
+    let o = run(&mut s, "SELECT * FROM jt").await;
+    assert_eq!(col(&o, "doc").1, &Value::Json(serde_json::json!([1, {"a": null}])));
+    assert_eq!(col(&o, "v").1, &Value::Text("bin collation".into()));
+    assert_eq!(col(&o, "plain").1, &Value::Text("{not json".into()));
+    // `{}` in the binary charset is Bytes, even though the same bytes as text would be JSON.
+    assert_eq!(col(&o, "raw").1, &Value::Bytes(b"{}".to_vec()));
 }

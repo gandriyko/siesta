@@ -397,6 +397,20 @@ pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> 
     split_words(text, dialect, true).1.iter().find_map(|w| reason(w))
 }
 
+/// Whether any statement of `text` changes the schema (`CREATE`, `ALTER`, `DROP`, `RENAME`,
+/// `TRUNCATE`, `COMMENT ON`), so a cached schema is stale after it ran. Same top-level-token
+/// approach as [`is_destructive`]; `EXPLAIN` without `ANALYZE` does not run its statement.
+pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
+    fn changes(words: &[(u32, &str)]) -> bool {
+        let Some(&(_, first)) = words.first() else { return false };
+        if let Some((inner, runs)) = explain_inner(words) {
+            return runs && changes(inner);
+        }
+        is(first, &["create", "alter", "drop", "rename", "truncate"]) || (is(first, &["comment"]) && words.get(1).is_some_and(|&(_, w)| is(w, &["on"])))
+    }
+    split_words(text, dialect, true).1.iter().any(|w| changes(w))
+}
+
 /// What the top level of a SELECT-like statement has, for the page wrapper.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopLevel {
@@ -713,5 +727,27 @@ mod tests {
         assert_eq!(destructive_reason("alter table t add c int", PG), Some("ALTER"));
         assert_eq!(destructive_reason("update t set a = 1", PG), Some("UPDATE without WHERE"));
         assert_eq!(destructive_reason("DELETE FROM t", PG), Some("DELETE without WHERE"));
+    }
+
+    #[test]
+    fn schema_changing() {
+        for (sql, d, want) in [
+            ("CREATE TABLE t (a int)", PG, true),
+            ("  alter table t add c int", MY, true),
+            ("DROP INDEX i", PG, true),
+            ("RENAME TABLE a TO b", MY, true),
+            ("TRUNCATE t", PG, true),
+            ("COMMENT ON TABLE t IS 'x'", PG, true),
+            ("-- c\nSELECT 1; CREATE VIEW v AS SELECT 1", PG, true),
+            ("SELECT 'create table x'", PG, false),
+            ("SELECT 1 -- drop table t", PG, false),
+            ("INSERT INTO t VALUES (1)", PG, false),
+            ("COMMENT 'x'", PG, false),
+            ("EXPLAIN DROP TABLE t", PG, false),
+            ("EXPLAIN ANALYZE CREATE TABLE a AS SELECT 1", PG, true),
+            ("", PG, false),
+        ] {
+            assert_eq!(is_schema_changing(sql, d), want, "{sql}");
+        }
     }
 }

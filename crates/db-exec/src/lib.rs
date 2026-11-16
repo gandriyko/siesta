@@ -708,8 +708,12 @@ fn my_value(row: &MySqlRow, i: usize, ty: &str) -> Value {
         Err(e) => return Value::Other { type_name: ty.into(), text: format!("<{e}>") },
         _ => {}
     }
+    // A `_bin` collation (MariaDB `JSON` = LONGTEXT utf8mb4_bin, `VARCHAR … COLLATE utf8mb4_bin`) sets the
+    // BINARY flag, so sqlx names the column BLOB / VARBINARY; only the `binary` charset is truly binary.
+    let textual = <String as sqlx::Type<sqlx::MySql>>::compatible(row.column(i).type_info());
     let r: SqlxResult<Value> = (|| {
         Ok(match ty {
+            "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" if textual => value::mysql_text(row.try_get_unchecked::<String, _>(i)?),
             "BOOLEAN" => Value::Bool(row.try_get_unchecked::<i64, _>(i)? != 0),
             "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => Value::Int(row.try_get_unchecked::<i64, _>(i)?),
             "YEAR" => Value::Int(row.try_get_unchecked::<u16, _>(i)? as i64),
@@ -722,7 +726,8 @@ fn my_value(row: &MySqlRow, i: usize, ty: &str) -> Value {
             "DOUBLE" => Value::Float(row.try_get_unchecked::<f64, _>(i)?),
             "DECIMAL" => Value::Decimal(row.try_get_unchecked::<String, _>(i)?),
             "JSON" => Value::Json(row.try_get_unchecked::<serde_json::Value, _>(i)?),
-            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "SET" => Value::Text(row.try_get_unchecked::<String, _>(i)?),
+            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => value::mysql_text(row.try_get_unchecked::<String, _>(i)?),
+            "ENUM" | "SET" => Value::Text(row.try_get_unchecked::<String, _>(i)?),
             "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => Value::Bytes(row.try_get_unchecked::<Vec<u8>, _>(i)?),
             "DATE" => Value::DateTime(row.try_get_unchecked::<chrono::NaiveDate, _>(i)?.to_string()),
             "DATETIME" | "TIMESTAMP" => Value::DateTime(row.try_get_unchecked::<chrono::NaiveDateTime, _>(i)?.to_string()),

@@ -259,11 +259,7 @@ fn connections(extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result
         .conns
         .connections
         .values()
-        .map(|c| {
-            let mut v = db_conn::masked(c);
-            v["prod"] = json!(env.settings.connections.is_prod(&c.name));
-            v
-        })
+        .map(db_conn::masked)
         .collect();
     rows.extend(env.conns.errors.iter().map(|(n, e)| json!({ "name": n, "error": e })));
     rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));

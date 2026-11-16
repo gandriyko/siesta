@@ -115,6 +115,14 @@ pub struct Grid {
     preview_bytes: usize,
     pub filters: Vec<Entity<InputState>>,
     show_filters: bool,
+    /// The result has a JSON column (or text cells that are JSON objects / arrays): the toggle shows.
+    pub has_json: bool,
+    /// JSON preview on: lines per cell (0 = off) and the row height that fits them.
+    json_lines: usize,
+    line_h: Pixels,
+    row_h: Pixels,
+    /// First lines of the pretty-printed JSON per (row in `done`, column); only with the preview on.
+    previews: HashMap<(usize, usize), Vec<String>>,
 }
 
 impl Grid {
@@ -130,7 +138,17 @@ impl Grid {
             preview_bytes: 8 * 1024,
             filters: vec![],
             show_filters: false,
+            has_json: false,
+            json_lines: 0,
+            line_h: px(18.),
+            row_h: px(30.),
+            previews: HashMap::new(),
         }
+    }
+
+    /// Whether the rows are tall (the JSON preview is on and there is JSON to show).
+    pub fn tall(&self) -> bool {
+        self.json_lines > 0 && self.has_json
     }
 
     pub fn outcome(&self) -> Option<&Outcome> {
@@ -142,10 +160,25 @@ impl Grid {
         self.outcome()?.rows.get(*self.order.get(row)?)?.get(col)
     }
 
-    fn load(&mut self, done: Arc<Done>, sort: Vec<(String, bool)>, null_text: &str, preview_bytes: usize, fs: Pixels) {
+    /// `json_lines`: lines of JSON per cell, 0 = no preview; `mono`: the monospace font size they use.
+    #[allow(clippy::too_many_arguments)]
+    fn load(&mut self, done: Arc<Done>, sort: Vec<(String, bool)>, null_text: &str, preview_bytes: usize, fs: Pixels, json_lines: usize, mono: Pixels) {
         let mut order = vec![];
         let (mut numeric, mut widths) = (vec![], vec![]);
+        let mut previews = HashMap::new();
+        self.has_json = false;
         if let Some(o) = done.outcome() {
+            // ponytail: JSON is looked for in the first 200 rows; a column that only has JSON later gets no preview.
+            self.has_json = o.rows.iter().take(200).any(|r| r.iter().any(|v| cell_json(v).is_some()));
+            if json_lines > 0 && self.has_json {
+                for (ri, r) in o.rows.iter().enumerate() {
+                    for (ci, v) in r.iter().enumerate() {
+                        if let Some(j) = cell_json(v) {
+                            previews.insert((ri, ci), json_preview(&j, json_lines));
+                        }
+                    }
+                }
+            }
             // The server sorted wrappable statements; the others are sorted here ("local").
             order = if done.paged() { (0..o.rows.len()).collect() } else { sort_order(&o.rows, &o.columns, &sort) };
             for (i, c) in o.columns.iter().enumerate() {
@@ -157,6 +190,10 @@ impl Grid {
         }
         (self.done, self.order, self.numeric, self.widths, self.sort) = (Some(done), order, numeric, widths, sort);
         (self.null_text, self.preview_bytes) = (null_text.to_string(), preview_bytes);
+        self.json_lines = if previews.is_empty() { 0 } else { json_lines };
+        self.line_h = mono * 1.4;
+        self.row_h = self.line_h * json_lines as f32 + px(10.);
+        self.previews = previews;
     }
 }
 
@@ -210,10 +247,26 @@ impl TableDelegate for Grid {
         v_flex().w_full().child(head).children(filter).into_any_element()
     }
 
+    /// With the JSON preview on, every row is as tall as N lines: gpui-component's table takes the
+    /// row height from the row element itself (`render_tr`) and its list measures the first row.
+    fn render_tr(&mut self, row_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> Stateful<Div> {
+        let tr = div().id(("row", row_ix));
+        if self.tall() { tr.h(self.row_h) } else { tr }
+    }
+
     fn render_td(&mut self, row: usize, col: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let Some(v) = self.value(row, col) else { return div().into_any_element() };
-        let text = cell_display(v, &self.null_text, self.preview_bytes);
         let t = cx.theme();
+        if let Some(lines) = self.order.get(row).and_then(|&r| self.previews.get(&(r, col))) {
+            let (mono, size, line_h) = (t.mono_font_family.clone(), t.mono_font_size, self.line_h);
+            return div()
+                .w_full()
+                .font_family(mono)
+                .text_size(size)
+                .children(lines.iter().map(|l| div().w_full().h(line_h).truncate().child(l.clone())))
+                .into_any_element();
+        }
+        let text = cell_display(v, &self.null_text, self.preview_bytes);
         div()
             .w_full()
             .truncate()
@@ -248,8 +301,10 @@ pub struct Ui {
     filter_cols: Vec<String>,
     filter_subs: Vec<Subscription>,
     pub filters_open: bool,
-    /// (statement, result id, filter row visible): what the table currently holds.
-    shown: Option<(Key, u64, bool)>,
+    /// (statement, result id, filter row visible, JSON preview lines): what the table currently holds.
+    shown: Option<(Key, u64, bool, usize)>,
+    /// The header's JSON preview toggle for this session; `None` follows `results.json_preview_lines`.
+    pub json_on: Option<bool>,
     pub pinned: Option<Key>,
     pub popup: Option<Entity<crate::value_popup::Popup>>,
     _subs: Vec<Subscription>,
@@ -272,7 +327,7 @@ impl Ui {
                 this.open_popup(*r, Some(*c), window, cx);
             }
         })];
-        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, pinned: None, popup: None, _subs: subs }
+        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, _subs: subs }
     }
 }
 
@@ -354,16 +409,30 @@ impl Siesta {
         self.entry(key)?.done.clone()
     }
 
+    /// Lines of JSON per cell while the preview is on, else 0: the header toggle (from the setting
+    /// at first); a setting of 0 gives 4 when the toggle is switched on.
+    fn json_lines(&self) -> usize {
+        let n = self.settings.settings.results.json_preview_lines;
+        if self.ui.json_on.unwrap_or(n > 0) { if n == 0 { 4 } else { n } } else { 0 }
+    }
+
+    pub(crate) fn toggle_json_preview(&mut self, cx: &mut Context<Self>) {
+        self.ui.json_on = Some(self.json_lines() == 0);
+        cx.notify();
+    }
+
     /// Load the table (and the filter fields, and the Messages / Query text) when what is shown changed.
     pub(crate) fn sync_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.shown_key(cx);
+        let json_lines = self.json_lines();
         let e = key.as_ref().and_then(|k| self.entry(k));
-        let sig = key.clone().zip(e).map(|(k, e)| (k, e.id, self.ui.filters_open));
+        let sig = key.clone().zip(e).map(|(k, e)| (k, e.id, self.ui.filters_open, json_lines));
         let (done, page) = e.map(|e| (e.done.clone(), e.page.clone())).unwrap_or_default();
         if sig != self.ui.shown {
             self.ui.shown = sig;
             let st = &self.settings.settings.results;
             let (null_text, preview, fs) = (st.null_text.clone(), st.cell_preview_kb * 1024, cx.theme().font_size);
+            let mono = cx.theme().mono_font_size;
             let cols: Vec<String> = done.as_ref().and_then(|d| d.outcome()).map(|o| o.columns.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
             if cols != self.ui.filter_cols {
                 self.rebuild_filter_inputs(&cols, window, cx);
@@ -383,7 +452,7 @@ impl Siesta {
                 let g = t.delegate_mut();
                 g.show_filters = open;
                 match done {
-                    Some(d) => g.load(d, local_sort, &null_text, preview, fs),
+                    Some(d) => g.load(d, local_sort, &null_text, preview, fs, json_lines, mono),
                     None => *g = Grid { filters: std::mem::take(&mut g.filters), ..Grid::new(g.view.clone()) },
                 }
                 t.clear_selection(cx);
@@ -648,6 +717,18 @@ impl Siesta {
             status = status.child(if key.is_some() { format!("{RUN_KEY} to run") } else { "No statement under the cursor".to_string() });
         }
         let mut actions = h_flex().flex_none().gap_1();
+        if self.ui.table.read(cx).delegate().has_json {
+            let on = self.json_lines() > 0;
+            actions = actions.child(
+                Button::new("json-preview")
+                    .label("{ }")
+                    .ghost()
+                    .xsmall()
+                    .selected(on)
+                    .tooltip(if on { "JSON preview on: click for one line per row" } else { "Preview JSON cells over several lines" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_json_preview(cx))),
+            );
+        }
         if done.as_ref().is_some_and(|d| d.outcome().is_some_and(|o| !o.columns.is_empty())) {
             actions = actions
                 .child(

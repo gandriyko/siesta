@@ -68,6 +68,18 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
+/// A MySQL / MariaDB text value. MariaDB has no real JSON type (`JSON` is `LONGTEXT` with a
+/// `json_valid` check), so its documents arrive as text. Heuristic: text whose trimmed content starts
+/// with `{` or `[` and parses as JSON becomes [`Value::Json`]; anything else stays [`Value::Text`].
+/// (A `VARCHAR` that merely holds JSON-looking text is converted too; that is the price.)
+pub(crate) fn mysql_text(s: String) -> Value {
+    let t = s.trim_start();
+    if t.starts_with(['{', '[']) && let Ok(j) = serde_json::from_str(t) {
+        return Value::Json(j);
+    }
+    Value::Text(s)
+}
+
 /// Normalizes a sqlx Postgres type name: lowercase; arrays as `elem[]`.
 pub(crate) fn pg_type_name(sqlx_name: &str) -> String {
     let n = sqlx_name.to_lowercase();
@@ -204,6 +216,15 @@ mod tests {
         assert_eq!(from_pg_text("mood[]", "{happy,sad}"), Value::Json(json!(["happy", "sad"])));
         assert_eq!(from_pg_text("int4[]", "[0:1]={5,6}"), Value::Json(json!([5, 6])));
         assert!(matches!(from_pg_text("int4[]", "garbage"), Value::Other { .. }));
+    }
+
+    #[test]
+    fn mysql_json_heuristic() {
+        assert_eq!(mysql_text(" {\"a\": [1]}\n".into()), Value::Json(json!({"a": [1]})));
+        assert_eq!(mysql_text("[1, 2]".into()), Value::Json(json!([1, 2])));
+        for t in ["plain", "{not json", "[1,", "123", "\"s\"", ""] {
+            assert_eq!(mysql_text(t.into()), Value::Text(t.into()));
+        }
     }
 
     #[test]

@@ -109,15 +109,11 @@ impl Spec {
     }
 }
 
-/// The confirmation dialog is needed for `-- @confirm`, and per `run.confirm_destructive` for
-/// destructive statements (`prod`: on a connection matching `prod_pattern` or `read_only`).
-pub fn needs_confirm(spec: &Spec, mode: ConfirmDestructive, prod: bool, dialect: Dialect) -> bool {
-    spec.confirm
-        || match mode {
-            ConfirmDestructive::Never => false,
-            ConfirmDestructive::Always => sql_split::is_destructive(&spec.text, dialect),
-            ConfirmDestructive::Prod => prod && sql_split::is_destructive(&spec.text, dialect),
-        }
+/// The confirmation dialog of a non-prod connection: `-- @confirm`, and destructive statements when
+/// `run.confirm_destructive` is `always`. (A `prod` connection asks for every run, see [`Siesta::start`];
+/// the setting's `prod` value therefore adds nothing here.)
+pub fn needs_confirm(spec: &Spec, mode: ConfirmDestructive, dialect: Dialect) -> bool {
+    spec.confirm || (mode == ConfirmDestructive::Always && sql_split::is_destructive(&spec.text, dialect))
 }
 
 /// The statements of the selected text (`range` of `src`), split with the file's dialect.
@@ -387,14 +383,16 @@ impl Siesta {
             Ok(c) => c,
             Err(e) => return window.push_notification(e, cx),
         };
-        let st = &self.settings.settings;
-        let prod = st.connections.is_prod(&name) || conn.read_only;
         let dialect = crate::doc::dialect_of(conn.driver);
-        let ask: Vec<&Spec> = specs.iter().filter(|s| needs_confirm(s, st.run.confirm_destructive, prod, dialect)).collect();
+        // A prod connection asks for every run, one dialog listing the whole batch. Page, sort,
+        // filter and "Count all" re-run an already confirmed result and do not come through here.
+        let mode = self.settings.settings.run.confirm_destructive;
+        let ask: Vec<&Spec> = specs.iter().filter(|s| conn.prod || needs_confirm(s, mode, dialect)).collect();
         if ask.is_empty() {
             return self.execute(path, name, conn, specs, window, cx);
         }
-        let message = format!("Run {} on {name}?", if ask.len() == 1 { "this statement".to_string() } else { format!("these {} statements", ask.len()) });
+        let what = if ask.len() == 1 { "this statement".to_string() } else { format!("these {} statements", ask.len()) };
+        let message = if conn.prod { format!("Run {what} on PRODUCTION {name}?") } else { format!("Run {what} on {name}?") };
         let detail = ask.iter().map(|s| s.text.trim()).collect::<Vec<_>>().join("\n\n");
         let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Run", "Cancel"], cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -464,7 +462,10 @@ impl Siesta {
             slot.in_tx = report.in_tx;
             slot.dot = if report.live && report.results.last().is_some_and(Result::is_ok) { Dot::Green } else { Dot::Red };
         }
-        let color = conn.color.clone();
+        let color = conn.display_color().map(str::to_string);
+        // DDL that worked leaves the cached schema stale.
+        let dialect = crate::doc::dialect_of(conn.driver);
+        let schema_changed = stmts.iter().zip(&report.results).any(|(s, r)| r.is_ok() && sql_split::is_schema_changing(&s.text, dialect));
         let mut position = None;
         for (i, (stmt, key)) in stmts.into_iter().zip(keys).enumerate() {
             let Some(e) = self.store.entries.get_mut(&key) else { continue };
@@ -481,9 +482,8 @@ impl Siesta {
         if let Some((text, range, p, msg)) = position {
             self.underline_error(&path, &text, range, p, &msg, cx);
         }
-        // The first live session of a connection reads its schema, once per run of the app.
-        let first = !self.schemas.borrow().fresh.contains(&crate::schema_cache::key(&conn));
-        if first && report.live && report.results.last().is_some_and(Result::is_ok) {
+        // ponytail: skipped while an earlier read is still in flight (it may predate the DDL); "Refresh" fixes it.
+        if schema_changed {
             self.load_schema(path.clone(), name.clone(), conn.clone(), window, cx);
         }
         if report.results.iter().any(|r| r.as_ref().is_err_and(|e| e.connection_lost)) {
@@ -588,6 +588,18 @@ impl Siesta {
         }
         if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, &self.root, key)) {
             cache.schemas.insert(key.to_string(), Arc::new(s));
+        }
+    }
+
+    /// A connection was just picked (or restored) for `path`: read its schema in the background,
+    /// unless this run of the app already has it. Opens the file's session for that.
+    pub(crate) fn autoload_schema(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.docs.iter().any(|d| *d.path == path && d.sql) {
+            return;
+        }
+        let Ok((name, conn)) = self.connection_of(path) else { return };
+        if !self.schemas.borrow().fresh.contains(&crate::schema_cache::key(&conn)) {
+            self.load_schema(path.to_path_buf(), name, conn, window, cx);
         }
     }
 
@@ -752,6 +764,7 @@ mod tests {
             password: None,
             ssl: Default::default(),
             read_only: false,
+            prod: false,
             schema: None,
             init_sql: None,
             color: None,
@@ -807,13 +820,13 @@ mod tests {
         use ConfirmDestructive::*;
         let (del, sel) = (spec("DELETE FROM t", false), spec("SELECT 1", false));
         let d = Dialect::Postgres;
-        assert!(needs_confirm(&del, Prod, true, d)); // destructive on prod
-        assert!(!needs_confirm(&del, Prod, false, d)); // not on a dev connection
-        assert!(needs_confirm(&del, Always, false, d));
-        assert!(!needs_confirm(&del, Never, true, d));
-        assert!(!needs_confirm(&sel, Always, true, d));
-        assert!(needs_confirm(&spec("SELECT 1", true), Never, false, d)); // `-- @confirm` always asks
-        assert!(!needs_confirm(&spec("DELETE FROM t WHERE id = 1", false), Prod, true, d));
+        // (A prod connection asks for everything before this is even consulted.)
+        assert!(!needs_confirm(&del, Prod, d));
+        assert!(needs_confirm(&del, Always, d));
+        assert!(!needs_confirm(&del, Never, d));
+        assert!(!needs_confirm(&sel, Always, d));
+        assert!(needs_confirm(&spec("SELECT 1", true), Never, d)); // `-- @confirm` always asks
+        assert!(!needs_confirm(&spec("DELETE FROM t WHERE id = 1", false), Always, d));
     }
 
     /// The job pipeline against a real Postgres: `scripts/test-db.sh` sets `SIESTA_TEST_PG_URL`.
@@ -833,6 +846,7 @@ mod tests {
             password: None,
             ssl: Default::default(),
             read_only: false,
+            prod: false,
             schema: None,
             init_sql: None,
             color: None,
