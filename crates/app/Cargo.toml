@@ -1,0 +1,12 @@
+[package]
+name = "siesta"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Same pinned versions as Respite.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders"] } # runtime_shaders: no Xcode `metal` needed
+gpui-component = { version = "=0.9.1", features = ["tree-sitter-sql"] }
+gpui-kit-assets = "=0.9.1"
