@@ -1,1 +1,495 @@
-//! Connections: finds and merges `siesta.json` / `siesta.private.json`, resolves `${env:}`.
+//! Connections: finds and merges `siesta.json` / `siesta.private.json`, resolves `${env:}` / `${dotenv:}`.
+//!
+//! Files are read from the workspace root down to the `.sql` file's folder (public, then private in
+//! each folder), then the extra files; later ones win. Merging is per connection key, field by field
+//! (`ssl` deeply). A broken connection lands in `errors`, a broken file in `warnings`; the rest loads.
+//! Variables are resolved, and relative `ssl` paths made absolute, per file before merging, so
+//! `.env` and relative paths belong to the file that holds the value.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+
+const KEYS: [&str; 12] = ["driver", "url", "host", "port", "database", "user", "password", "ssl", "read_only", "schema", "init_sql", "color"];
+const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Driver {
+    Postgres,
+    /// MySQL and MariaDB.
+    MySql,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslMode {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ssl {
+    /// `None`: the driver's default.
+    pub mode: Option<SslMode>,
+    /// Absolute (relative paths were resolved against the file that set them).
+    pub ca: Option<PathBuf>,
+    pub cert: Option<PathBuf>,
+    pub key: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+    pub name: String,
+    pub driver: Driver,
+    pub url: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub ssl: Ssl,
+    pub read_only: bool,
+    /// Postgres `search_path`.
+    pub schema: Option<String>,
+    pub init_sql: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct Connections {
+    /// Sorted by name.
+    pub connections: BTreeMap<String, Connection>,
+    /// Connections that could not be built (unresolved variable, no driver, bad value).
+    pub errors: BTreeMap<String, String>,
+    /// Non-fatal: invalid JSON (file skipped), unknown keys, literal password in a public file.
+    pub warnings: Vec<String>,
+}
+
+impl Connections {
+    /// Files from `root` down to the `.sql` file's folder, then `extra` (`~` expanded), later ones
+    /// overriding earlier ones.
+    pub fn load(sql_file: &Path, root: &Path, extra: &[PathBuf]) -> Self {
+        let dir = sql_file.parent().unwrap_or(root);
+        let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| d.starts_with(root)).collect();
+        if dirs.is_empty() {
+            dirs.push(dir);
+        }
+        dirs.reverse();
+        let mut files: Vec<(PathBuf, bool)> = dirs.iter().flat_map(|d| [(d.join("siesta.json"), false), (d.join("siesta.private.json"), true)]).collect();
+        // An extra file counts as public only when it is named like the public one.
+        files.extend(extra.iter().map(|p| {
+            let p = expand_home(p);
+            let private = p.file_name().is_none_or(|n| n != "siesta.json");
+            (p, private)
+        }));
+
+        let mut out = Self::default();
+        let mut merged: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+        for (path, private) in files {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let json = match serde_json::from_str::<Map<String, Value>>(&text) {
+                Ok(j) => j,
+                Err(e) => {
+                    out.warnings.push(format!("{}: invalid JSON, skipped: {e}", path.display()));
+                    continue;
+                }
+            };
+            let fdir = path.parent().unwrap_or(Path::new("."));
+            for (name, v) in json {
+                let Value::Object(obj) = v else {
+                    out.warnings.push(format!("{}: '{name}' is not an object, skipped", path.display()));
+                    continue;
+                };
+                let fields = read_entry(&obj, fdir, private, &path, &name, &mut out.warnings);
+                merge(merged.entry(name).or_default(), fields);
+            }
+        }
+        for (name, fields) in merged {
+            match build(&name, &fields) {
+                Ok(c) => {
+                    out.connections.insert(name, c);
+                }
+                Err(e) => {
+                    out.errors.insert(name, e);
+                }
+            }
+        }
+        out
+    }
+
+    /// Names for the picker, sorted.
+    pub fn names(&self) -> Vec<&str> {
+        self.connections.keys().map(String::as_str).collect()
+    }
+}
+
+/// Nearest ancestor of `file` with `.git` or `.siesta`; else the file's folder.
+pub fn workspace_root(file: &Path) -> PathBuf {
+    let dir = file.parent().unwrap_or(Path::new("."));
+    dir.ancestors().find(|d| d.join(".git").exists() || d.join(".siesta").exists()).unwrap_or(dir).to_path_buf()
+}
+
+/// The connection as JSON for CLI output: `password` and the password inside `url` become `***`.
+pub fn masked(c: &Connection) -> Value {
+    let mut m = Map::new();
+    let mut put = |k: &str, v: Option<Value>| {
+        if let Some(v) = v {
+            m.insert(k.into(), v);
+        }
+    };
+    let s = |o: &Option<String>| o.clone().map(Value::from);
+    let p = |o: &Option<PathBuf>| o.as_ref().map(|p| Value::from(p.to_string_lossy().into_owned()));
+    put("name", Some(c.name.clone().into()));
+    put("driver", Some(if c.driver == Driver::Postgres { "postgres" } else { "mysql" }.into()));
+    put("url", c.url.as_ref().map(|u| mask_url(u).into()));
+    put("host", s(&c.host));
+    put("port", c.port.map(Value::from));
+    put("database", s(&c.database));
+    put("user", s(&c.user));
+    put("password", c.password.as_ref().map(|_| "***".into()));
+    let mut ssl = Map::new();
+    if let Some(mode) = c.ssl.mode {
+        ssl.insert("mode".into(), mode_name(mode).into());
+    }
+    for (k, v) in [("ca", p(&c.ssl.ca)), ("cert", p(&c.ssl.cert)), ("key", p(&c.ssl.key))] {
+        if let Some(v) = v {
+            ssl.insert(k.into(), v);
+        }
+    }
+    put("ssl", (!ssl.is_empty()).then(|| ssl.into()));
+    put("read_only", Some(c.read_only.into()));
+    put("schema", s(&c.schema));
+    put("init_sql", s(&c.init_sql));
+    put("color", s(&c.color));
+    Value::Object(m)
+}
+
+fn mode_name(m: SslMode) -> &'static str {
+    match m {
+        SslMode::Disable => "disable",
+        SslMode::Prefer => "prefer",
+        SslMode::Require => "require",
+        SslMode::VerifyCa => "verify-ca",
+        SslMode::VerifyFull => "verify-full",
+    }
+}
+
+/// Byte range of the password in `scheme://user:password@host/…`.
+fn url_password(url: &str) -> Option<std::ops::Range<usize>> {
+    let start = url.find("://")? + 3;
+    let end = url[start..].find(['/', '?', '#']).map_or(url.len(), |i| start + i);
+    let at = url[start..end].rfind('@')? + start;
+    let colon = url[start..at].find(':')? + start;
+    Some(colon + 1..at)
+}
+
+fn mask_url(url: &str) -> String {
+    match url_password(url) {
+        Some(r) => format!("{}***{}", &url[..r.start], &url[r.end..]),
+        None => url.to_string(),
+    }
+}
+
+fn expand_home(p: &Path) -> PathBuf {
+    match (p.strip_prefix("~"), std::env::home_dir()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Merges one file's fields over the earlier ones; `ssl` field by field.
+fn merge(into: &mut Map<String, Value>, from: Map<String, Value>) {
+    for (k, v) in from {
+        match (into.get_mut(&k), v) {
+            (Some(Value::Object(old)), Value::Object(new)) if k == "ssl" => old.extend(new),
+            (_, v) => {
+                into.insert(k, v);
+            }
+        }
+    }
+}
+
+/// One connection of one file: variables substituted, ssl paths made absolute, warnings noted.
+fn read_entry(obj: &Map<String, Value>, dir: &Path, private: bool, file: &Path, name: &str, warnings: &mut Vec<String>) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if !KEYS.contains(&k.as_str()) {
+            warnings.push(format!("{}: '{name}': unknown key '{k}'", file.display()));
+            continue;
+        }
+        let literal = |s: &str| !s.contains("${");
+        match (k.as_str(), v) {
+            ("ssl", Value::Object(ssl)) => {
+                let mut o = Map::new();
+                for (sk, sv) in ssl {
+                    if !SSL_KEYS.contains(&sk.as_str()) {
+                        warnings.push(format!("{}: '{name}': unknown key 'ssl.{sk}'", file.display()));
+                        continue;
+                    }
+                    let mut sv = subst_value(sv, dir);
+                    if let (true, Value::String(p)) = (sk != "mode", &sv) {
+                        let p = expand_home(Path::new(p));
+                        sv = dir.join(p).to_string_lossy().into_owned().into();
+                    }
+                    o.insert(sk.clone(), sv);
+                }
+                out.insert(k.clone(), o.into());
+            }
+            ("password", Value::String(s)) if !private && !s.is_empty() && literal(s) => {
+                warnings.push(format!("{}: '{name}': literal password in a public file, move it to siesta.private.json", file.display()));
+                out.insert(k.clone(), subst_value(v, dir));
+            }
+            ("url", Value::String(u)) if !private && url_password(u).is_some_and(|r| literal(&u[r])) => {
+                warnings.push(format!("{}: '{name}': literal password in url of a public file, move it to siesta.private.json", file.display()));
+                out.insert(k.clone(), subst_value(v, dir));
+            }
+            _ => {
+                out.insert(k.clone(), subst_value(v, dir));
+            }
+        }
+    }
+    out
+}
+
+/// A failed substitution becomes `{"$unresolved": message}`: a later file setting the same field
+/// replaces it, and `build` fails the connection only if it survives the merge.
+fn subst_value(v: &Value, dir: &Path) -> Value {
+    match v {
+        Value::String(s) => subst(s, dir).map_or_else(|e| Value::Object(Map::from_iter([("$unresolved".to_string(), e.into())])), Value::String),
+        other => other.clone(),
+    }
+}
+
+fn unresolved(v: &Value) -> Option<&str> {
+    v.as_object()?.get("$unresolved")?.as_str()
+}
+
+/// `${env:NAME}` from the process, `${dotenv:NAME}` from `.env` in `dir`.
+fn subst(text: &str, dir: &Path) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("${") {
+        let Some(close) = rest[open..].find('}').map(|c| c + open) else { break };
+        out.push_str(&rest[..open]);
+        let expr = rest[open + 2..close].trim();
+        let value = match expr.split_once(':') {
+            Some(("env", n)) => std::env::var(n.trim()).ok(),
+            Some(("dotenv", n)) => dotenvy::from_path_iter(dir.join(".env")).ok().and_then(|it| it.flatten().find(|(k, _)| k == n.trim()).map(|(_, v)| v)),
+            _ => return Err(format!("unsupported variable '${{{expr}}}'")),
+        };
+        out.push_str(&value.ok_or_else(|| format!("unresolved variable '${{{expr}}}'"))?);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
+    let ssl_fields = f.get("ssl").and_then(Value::as_object).into_iter().flatten();
+    if let Some(e) = f.values().chain(ssl_fields.map(|(_, v)| v)).find_map(unresolved) {
+        return Err(e.to_string());
+    }
+    let str_of = |k: &str| match f.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("'{k}' must be a string")),
+    };
+    let url = str_of("url")?;
+    let driver = match str_of("driver")?.as_deref() {
+        Some("postgres") => Driver::Postgres,
+        Some("mysql") => Driver::MySql,
+        Some(d) => return Err(format!("unknown driver '{d}' (postgres or mysql)")),
+        None => match url.as_deref().and_then(|u| u.split_once("://")).map(|(s, _)| s) {
+            Some("postgres" | "postgresql") => Driver::Postgres,
+            Some("mysql" | "mariadb") => Driver::MySql,
+            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// url".into()),
+        },
+    };
+    let port = match f.get("port") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(n.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or("'port' out of range")?),
+        Some(Value::String(s)) => Some(s.trim().parse().map_err(|_| format!("'port' is not a number: '{s}'"))?),
+        Some(_) => return Err("'port' must be a number".into()),
+    };
+    let read_only = match f.get("read_only") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("'read_only' must be true or false".into()),
+    };
+    let mut ssl = Ssl::default();
+    if let Some(Value::Object(o)) = f.get("ssl") {
+        let path = |k: &str| o.get(k).and_then(Value::as_str).map(PathBuf::from);
+        ssl.mode = match o.get("mode").and_then(Value::as_str) {
+            None => None,
+            Some("disable") => Some(SslMode::Disable),
+            Some("prefer") => Some(SslMode::Prefer),
+            Some("require") => Some(SslMode::Require),
+            Some("verify-ca") => Some(SslMode::VerifyCa),
+            Some("verify-full") => Some(SslMode::VerifyFull),
+            Some(m) => return Err(format!("unknown ssl.mode '{m}'")),
+        };
+        (ssl.ca, ssl.cert, ssl.key) = (path("ca"), path("cert"), path("key"));
+    }
+    Ok(Connection {
+        name: name.to_string(),
+        driver,
+        url,
+        host: str_of("host")?,
+        port,
+        database: str_of("database")?,
+        user: str_of("user")?,
+        password: str_of("password")?,
+        ssl,
+        read_only,
+        schema: str_of("schema")?,
+        init_sql: str_of("init_sql")?,
+        color: str_of("color")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn load(root: &Path, file: &str) -> Connections {
+        Connections::load(&root.join(file), root, &[])
+    }
+
+    #[test]
+    fn chain_merge_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("svc")).unwrap();
+        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "postgres", "host": "root", "port": 1, "user": "u"}}"#).unwrap();
+        fs::write(r.join("siesta.private.json"), r#"{"a": {"host": "root-private", "password": "p"}}"#).unwrap();
+        fs::write(r.join("svc/siesta.json"), r#"{"a": {"port": 2}, "b": {"driver": "mysql"}}"#).unwrap();
+        let c = load(r, "svc/q.sql");
+        let a = &c.connections["a"];
+        assert_eq!((a.host.as_deref(), a.port, a.user.as_deref(), a.password.as_deref()), (Some("root-private"), Some(2), Some("u"), Some("p")));
+        assert_eq!(c.names(), ["a", "b"]);
+        // From the root folder the leaf's connections are not visible.
+        assert_eq!(load(r, "q.sql").names(), ["a"]);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+
+        // Extra files come last.
+        let extra = r.join("extra.private.json");
+        fs::write(&extra, r#"{"a": {"host": "extra"}}"#).unwrap();
+        let c = Connections::load(&r.join("svc/q.sql"), r, &[extra]);
+        assert_eq!(c.connections["a"].host.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn ssl_merge_and_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("svc")).unwrap();
+        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "mysql", "ssl": {"mode": "verify-full", "ca": "./certs/ca.pem"}}}"#).unwrap();
+        fs::write(r.join("svc/siesta.private.json"), r#"{"a": {"ssl": {"cert": "c.pem", "key": "/abs/k.pem", "mode": "require"}}}"#).unwrap();
+        let ssl = &load(r, "svc/q.sql").connections["a"].ssl;
+        assert_eq!(ssl.mode, Some(SslMode::Require));
+        assert_eq!(ssl.ca, Some(r.join("./certs/ca.pem")));
+        assert_eq!(ssl.cert, Some(r.join("svc/c.pem")));
+        assert_eq!(ssl.key, Some(PathBuf::from("/abs/k.pem")));
+    }
+
+    #[test]
+    fn env_and_dotenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("svc")).unwrap();
+        fs::write(r.join("svc/.env"), "DB_PASS=from-dotenv\n").unwrap();
+        fs::write(r.join(".env"), "DB_PASS=wrong\n").unwrap();
+        fs::write(r.join("svc/siesta.private.json"), r#"{"a": {"driver": "postgres", "password": "${dotenv:DB_PASS}", "user": "${env:PATH}"}}"#).unwrap();
+        let c = load(r, "svc/q.sql");
+        let a = &c.connections["a"];
+        assert_eq!(a.password.as_deref(), Some("from-dotenv"));
+        assert_eq!(a.user, std::env::var("PATH").ok());
+    }
+
+    #[test]
+    fn unresolved_variable_fails_only_that_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::write(r.join("siesta.private.json"), r#"{"bad": {"driver": "mysql", "password": "${env:SIESTA_TEST_SURELY_UNSET}"}, "ok": {"driver": "mysql"}, "nodot": {"driver": "mysql", "user": "${dotenv:X}"}}"#).unwrap();
+        let c = load(r, "q.sql");
+        assert_eq!(c.names(), ["ok"]);
+        assert!(c.errors["bad"].contains("SIESTA_TEST_SURELY_UNSET"), "{}", c.errors["bad"]);
+        assert!(c.errors["nodot"].contains("dotenv:X"));
+    }
+
+    #[test]
+    fn unresolved_variable_overridden_by_later_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "mysql", "password": "${env:SIESTA_TEST_SURELY_UNSET}", "ssl": {"ca": "${env:SIESTA_TEST_SURELY_UNSET}"}}}"#).unwrap();
+        assert!(load(r, "q.sql").errors["a"].contains("SIESTA_TEST_SURELY_UNSET"));
+        fs::write(r.join("siesta.private.json"), r#"{"a": {"password": "lit", "ssl": {"ca": "ca.pem"}}}"#).unwrap();
+        let c = load(r, "q.sql");
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(c.connections["a"].password.as_deref(), Some("lit"));
+    }
+
+    #[test]
+    fn driver_from_url_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::write(
+            r.join("siesta.json"),
+            r#"{"p": {"url": "postgresql://h/db"}, "m": {"url": "mariadb://h/db"}, "n": {"host": "h"}, "x": {"driver": "oracle"}}"#,
+        )
+        .unwrap();
+        let c = load(r, "q.sql");
+        assert_eq!((c.connections["p"].driver, c.connections["m"].driver), (Driver::Postgres, Driver::MySql));
+        assert!(c.errors["n"].contains("no driver"));
+        assert!(c.errors["x"].contains("oracle"));
+    }
+
+    #[test]
+    fn warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("svc")).unwrap();
+        fs::write(r.join("siesta.json"), r#"{"a": {"driver": "postgres", "password": "hunter2", "colour": "red"}, "b": {"url": "mysql://u:pw@h/d"}, "c": {"driver": "mysql", "password": "${env:PATH}"}}"#).unwrap();
+        fs::write(r.join("siesta.private.json"), r#"{"a": {"password": "fine"}}"#).unwrap();
+        fs::write(r.join("svc/siesta.json"), "{ not json").unwrap();
+        let c = load(r, "svc/q.sql");
+        let w = c.warnings.join("\n");
+        assert!(w.contains("'a': literal password"), "{w}");
+        assert!(w.contains("'b': literal password in url"), "{w}");
+        assert!(!w.contains("'c'"), "{w}");
+        assert!(w.contains("unknown key 'colour'"), "{w}");
+        assert!(w.contains("svc/siesta.json") && w.contains("invalid JSON"), "{w}");
+        // The rest still loaded.
+        assert_eq!(c.connections["a"].password.as_deref(), Some("fine"));
+    }
+
+    #[test]
+    fn masking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::write(r.join("siesta.private.json"), r#"{"a": {"url": "mysql://ro:s3cret@db:3306/shop?x=a@b", "password": "s3cret", "read_only": true}}"#).unwrap();
+        let c = load(r, "q.sql");
+        let m = masked(&c.connections["a"]);
+        assert_eq!(m["url"], "mysql://ro:***@db:3306/shop?x=a@b");
+        assert_eq!((m["password"].as_str(), m["read_only"].as_bool(), m["driver"].as_str()), (Some("***"), Some(true), Some("mysql")));
+        assert!(!m.to_string().contains("s3cret"));
+        assert_eq!(mask_url("postgres://user@h/db"), "postgres://user@h/db");
+    }
+
+    #[test]
+    fn root_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        fs::create_dir_all(t.join("repo/.git")).unwrap();
+        fs::create_dir_all(t.join("repo/api/v1")).unwrap();
+        fs::create_dir_all(t.join("other/.siesta")).unwrap();
+        fs::create_dir_all(t.join("plain/sub")).unwrap();
+        assert_eq!(workspace_root(&t.join("repo/api/v1/a.sql")), t.join("repo"));
+        assert_eq!(workspace_root(&t.join("other/a.sql")), t.join("other"));
+        assert_eq!(workspace_root(&t.join("plain/sub/a.sql")), t.join("plain/sub"));
+    }
+}
