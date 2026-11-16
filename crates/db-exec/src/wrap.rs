@@ -157,8 +157,37 @@ fn pg_text_list(cols: &[Column]) -> String {
     list.join(", ")
 }
 
+/// Some filter has a condition (an operator with no value yet is not one).
+pub(crate) fn has_filters(page: &Page) -> bool {
+    page.filters.iter().any(|(_, t)| parse_filter(t).is_some())
+}
+
+/// MySQL / MariaDB, plain page (no filters, no sort), no top-level `LIMIT`: the page's
+/// `LIMIT … OFFSET …` is appended to the statement itself. Wrapping would drop its `ORDER BY`
+/// (MariaDB ignores it in a derived table without `LIMIT`) and fail on repeated column names.
+pub(crate) fn appends(sql: &str, d: Dialect, page: &Page) -> bool {
+    if d != Dialect::MySql || has_filters(page) || !page.sort.is_empty() {
+        return false;
+    }
+    let tl = sql_split::top_level(strip(sql), d);
+    !(tl.limit || tl.lock || tl.values)
+}
+
+/// The first column name that appears twice (`SELECT * FROM a JOIN b` with `id` in both):
+/// such a statement cannot be a derived table in MySQL, and its columns are ambiguous in filters.
+pub(crate) fn duplicate_column(cols: &[Column], d: Dialect) -> Option<&str> {
+    // MySQL column names are case-insensitive.
+    let same = |a: &str, b: &str| if d == Dialect::MySql { a.eq_ignore_ascii_case(b) } else { a == b };
+    cols.iter().enumerate().find(|(i, c)| cols[..*i].iter().any(|p| same(&p.name, &c.name))).map(|(_, c)| c.name.as_str())
+}
+
 pub(crate) fn build(sql: &str, d: Dialect, page: &Page, cols: &[Column]) -> Wrapped {
     let inner = strip(sql);
+    if appends(inner, d, page) {
+        // The newline keeps a trailing `-- comment` from swallowing the `LIMIT`.
+        let sql = format!("{inner}\nLIMIT {} OFFSET {}", page.size + 1, page.offset);
+        return Wrapped { sql, params: Vec::new(), prefix_chars: 0, inner_chars: inner.chars().count() };
+    }
     let mut params = Vec::new();
     let wh = where_clause(d, &page.filters, cols, &mut params);
     let list = if d == Dialect::Postgres && !params.is_empty() { pg_text_list(cols) } else { "*".into() };
@@ -169,8 +198,15 @@ pub(crate) fn build(sql: &str, d: Dialect, page: &Page, cols: &[Column]) -> Wrap
         let items: Vec<String> = page.sort.iter().map(|(c, desc)| format!("q.{}{}", quote_ident(d, c), if *desc { " DESC" } else { "" })).collect();
         format!("\nORDER BY {}", items.join(", "))
     };
+    // MariaDB drops the inner `ORDER BY` of a derived table without `LIMIT`; with no user sort
+    // (which would decide the order itself) the idiom below keeps it.
+    let keep_order = d == Dialect::MySql && page.sort.is_empty() && {
+        let tl = sql_split::top_level(inner, d);
+        tl.order_by && !tl.limit
+    };
+    let keep = if keep_order { "\nLIMIT 18446744073709551615" } else { "" };
     // The newline keeps a trailing `-- comment` in the statement from swallowing `)`.
-    let sql = format!("{prefix}{inner}\n) AS q{wh}{order}\nLIMIT {} OFFSET {}", page.size + 1, page.offset);
+    let sql = format!("{prefix}{inner}{keep}\n) AS q{wh}{order}\nLIMIT {} OFFSET {}", page.size + 1, page.offset);
     Wrapped { sql, params, prefix_chars: prefix.chars().count(), inner_chars: inner.chars().count() }
 }
 
@@ -238,7 +274,39 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM (SELECT 1\n) AS q\nLIMIT 101 OFFSET 0");
         assert!(p.is_empty());
         let page = Page { offset: 200, size: 50, ..Page::default() };
-        assert_eq!(wrap("select 1;;", Dialect::MySql, &page, &[]).0, "SELECT * FROM (select 1\n) AS q\nLIMIT 51 OFFSET 200");
+        // MySQL / MariaDB: the page's LIMIT goes onto the statement itself.
+        assert_eq!(wrap("select 1;;", Dialect::MySql, &page, &[]).0, "select 1\nLIMIT 51 OFFSET 200");
+    }
+
+    #[test]
+    fn mysql_keeps_order_by_of_the_statement() {
+        let my = Dialect::MySql;
+        let page = Page { size: 10, offset: 20, ..Page::default() };
+        // No filters, no sort, no LIMIT: appended, so MariaDB cannot drop the ORDER BY.
+        let w = build("SELECT a FROM t ORDER BY a DESC -- c\n;", my, &page, &[]);
+        assert_eq!((w.sql.as_str(), w.prefix_chars), ("SELECT a FROM t ORDER BY a DESC -- c\nLIMIT 11 OFFSET 20", 0));
+        // A top-level LIMIT stays inside a derived table (it keeps the order there).
+        assert_eq!(wrap("SELECT a FROM t ORDER BY a LIMIT 5", my, &page, &[]).0, "SELECT * FROM (SELECT a FROM t ORDER BY a LIMIT 5\n) AS q\nLIMIT 11 OFFSET 20");
+        // A LIMIT in a subquery or a string is not top-level.
+        assert_eq!(wrap("SELECT 'limit 1' FROM (SELECT 1 LIMIT 1) x", my, &page, &[]).0, "SELECT 'limit 1' FROM (SELECT 1 LIMIT 1) x\nLIMIT 11 OFFSET 20");
+        // Filters force the wrapper: the inner ORDER BY gets the idiom that keeps it.
+        let filtered = Page { filters: vec![f("a", "=1")], ..page.clone() };
+        let (sql, _) = wrap("SELECT a FROM t ORDER BY a", my, &filtered, &[col("a", "INT")]);
+        assert_eq!(sql, "SELECT * FROM (SELECT a FROM t ORDER BY a\nLIMIT 18446744073709551615\n) AS q\nWHERE q.`a` = ?\nLIMIT 11 OFFSET 20");
+        // A user sort decides the order itself.
+        let sorted = Page { sort: vec![("a".into(), true)], ..page.clone() };
+        assert_eq!(wrap("SELECT a FROM t ORDER BY a", my, &sorted, &[]).0, "SELECT * FROM (SELECT a FROM t ORDER BY a\n) AS q\nORDER BY q.`a` DESC\nLIMIT 11 OFFSET 20");
+        // Postgres keeps wrapping.
+        assert_eq!(wrap("SELECT a FROM t ORDER BY a", Dialect::Postgres, &page, &[]).0, "SELECT * FROM (SELECT a FROM t ORDER BY a\n) AS q\nLIMIT 11 OFFSET 20");
+    }
+
+    #[test]
+    fn duplicate_columns_are_found() {
+        let (pg, my) = (Dialect::Postgres, Dialect::MySql);
+        assert_eq!(duplicate_column(&[col("id", "INT"), col("name", "TEXT"), col("id", "INT")], pg), Some("id"));
+        assert_eq!(duplicate_column(&[col("id", "INT"), col("Id", "INT")], pg), None);
+        assert_eq!(duplicate_column(&[col("id", "INT"), col("Id", "INT")], my), Some("Id"));
+        assert_eq!(duplicate_column(&[], my), None);
     }
 
     #[test]

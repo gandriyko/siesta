@@ -267,9 +267,10 @@ impl Siesta {
         let note = |text: String| div().flex_1().px_3().pt_2().text_sm().text_color(muted).child(text).into_any_element();
         let Some(d) = self.doc().filter(|d| d.sql) else { return note("Open a .sql file to see its connection's schema".into()) };
         let Some(conn) = d.connection().map(str::to_string) else { return note("No connection: pick one in the top-right corner".into()) };
+        let key = d.schema_key().unwrap_or_default();
         let (schema, loading, error) = {
             let c = self.schemas.borrow();
-            (c.schemas.get(&conn).cloned(), c.loading.contains(&conn), c.errors.get(&conn).cloned())
+            (c.schemas.get(&key).cloned(), c.loading.contains(&key), c.errors.get(&key).cloned())
         };
         let action = |id: &'static str, label: &'static str, cx: &mut Context<Self>| {
             Button::new(id).label(label).small().on_click(cx.listener(|this, _, window, cx| this.refresh_schema(window, cx)))

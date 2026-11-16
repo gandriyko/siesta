@@ -58,6 +58,30 @@ pub struct Connection {
     pub color: Option<String>,
 }
 
+impl Connection {
+    /// A stable id of the server this connection points at (driver, url without its password,
+    /// host, port, database, user), for caches that must not mix two connections that merely
+    /// share a name (the same name in two `siesta.json` files). FNV-1a: stable across Rust versions.
+    pub fn fingerprint(&self) -> u64 {
+        let parts = [
+            Some(if self.driver == Driver::Postgres { "postgres" } else { "mysql" }.to_string()),
+            self.url.as_deref().map(mask_url),
+            self.host.clone(),
+            self.port.map(|p| p.to_string()),
+            self.database.clone(),
+            self.user.clone(),
+        ];
+        let mut h: u64 = 0xcbf29ce484222325;
+        for p in parts {
+            // `\0` between fields, `\1` for an absent one: ("a", None) differs from (None, "a").
+            for b in p.as_deref().map_or(&b"\x01"[..], str::as_bytes).iter().chain(&[0u8]) {
+                h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Connections {
     /// Sorted by name.
@@ -177,20 +201,35 @@ fn mode_name(m: SslMode) -> &'static str {
     }
 }
 
-/// Byte range of the password in `scheme://user:password@host/…`.
-fn url_password(url: &str) -> Option<std::ops::Range<usize>> {
-    let start = url.find("://")? + 3;
+/// Byte ranges of the passwords in `scheme://user:password@host/…?password=…`, in order.
+fn url_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let Some(start) = url.find("://").map(|i| i + 3) else { return out };
     let end = url[start..].find(['/', '?', '#']).map_or(url.len(), |i| start + i);
-    let at = url[start..end].rfind('@')? + start;
-    let colon = url[start..at].find(':')? + start;
-    Some(colon + 1..at)
+    if let Some(at) = url[start..end].rfind('@').map(|i| i + start)
+        && let Some(colon) = url[start..at].find(':').map(|i| i + start)
+    {
+        out.push(colon + 1..at);
+    }
+    if let Some(q) = url.find('?').map(|i| i + 1) {
+        let qend = url[q..].find('#').map_or(url.len(), |i| q + i);
+        let mut pos = q;
+        for part in url[q..qend].split('&') {
+            if let Some(v) = part.strip_prefix("password=") {
+                out.push(pos + "password=".len()..pos + "password=".len() + v.len());
+            }
+            pos += part.len() + 1;
+        }
+    }
+    out
 }
 
 fn mask_url(url: &str) -> String {
-    match url_password(url) {
-        Some(r) => format!("{}***{}", &url[..r.start], &url[r.end..]),
-        None => url.to_string(),
+    let mut out = url.to_string();
+    for r in url_passwords(url).into_iter().rev() {
+        out.replace_range(r, "***");
     }
+    out
 }
 
 fn expand_home(p: &Path) -> PathBuf {
@@ -242,7 +281,7 @@ fn read_entry(obj: &Map<String, Value>, dir: &Path, private: bool, file: &Path, 
                 warnings.push(format!("{}: '{name}': literal password in a public file, move it to siesta.private.json", file.display()));
                 out.insert(k.clone(), subst_value(v, dir));
             }
-            ("url", Value::String(u)) if !private && url_password(u).is_some_and(|r| literal(&u[r])) => {
+            ("url", Value::String(u)) if !private && url_passwords(u).into_iter().any(|r| literal(&u[r])) => {
                 warnings.push(format!("{}: '{name}': literal password in url of a public file, move it to siesta.private.json", file.display()));
                 out.insert(k.clone(), subst_value(v, dir));
             }
@@ -478,6 +517,45 @@ mod tests {
         assert_eq!((m["password"].as_str(), m["read_only"].as_bool(), m["driver"].as_str()), (Some("***"), Some(true), Some("mysql")));
         assert!(!m.to_string().contains("s3cret"));
         assert_eq!(mask_url("postgres://user@h/db"), "postgres://user@h/db");
+        assert_eq!(mask_url("postgres://u@h/db?sslmode=require&password=x%40y&a=b#f"), "postgres://u@h/db?sslmode=require&password=***&a=b#f");
+        assert_eq!(mask_url("postgres://u:p@h/db?password=q"), "postgres://u:***@h/db?password=***");
+    }
+
+    #[test]
+    fn password_in_url_query_is_masked_and_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::write(r.join("siesta.json"), r#"{"a": {"url": "postgres://u@h/db?password=hunter2"}, "b": {"url": "postgres://u@h/db?password=${env:PATH}"}}"#).unwrap();
+        let c = load(r, "q.sql");
+        assert!(!masked(&c.connections["a"]).to_string().contains("hunter2"));
+        let w = c.warnings.join("\n");
+        assert!(w.contains("'a': literal password in url"), "{w}");
+        assert!(!w.contains("'b'"), "{w}");
+    }
+
+    #[test]
+    fn fingerprint_tells_same_named_connections_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("a")).unwrap();
+        fs::create_dir_all(r.join("b")).unwrap();
+        fs::write(r.join("a/siesta.json"), r#"{"dev": {"driver": "postgres", "host": "h1", "database": "x", "password": "p1"}}"#).unwrap();
+        fs::write(r.join("b/siesta.json"), r#"{"dev": {"driver": "postgres", "host": "h2", "database": "x", "password": "p2"}}"#).unwrap();
+        let (a, b) = (load(r, "a/q.sql").connections["dev"].clone(), load(r, "b/q.sql").connections["dev"].clone());
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.fingerprint(), load(r, "a/q.sql").connections["dev"].fingerprint());
+        // The password (also in the url) is not part of it; the user and the field a value is in are.
+        let (mut c, mut d) = (a.clone(), a.clone());
+        c.password = Some("other".into());
+        assert_eq!(a.fingerprint(), c.fingerprint());
+        d.user = Some("someone".into());
+        assert_ne!(a.fingerprint(), d.fingerprint());
+        let (mut u1, mut u2) = (a.clone(), a.clone());
+        (u1.url, u2.url) = (Some("postgres://u:one@h/db".into()), Some("postgres://u:two@h/db".into()));
+        assert_eq!(u1.fingerprint(), u2.fingerprint());
+        let (mut x, mut y) = (a.clone(), a.clone());
+        (x.host, x.database, y.host, y.database) = (Some("ab".into()), None, None, Some("ab".into()));
+        assert_ne!(x.fingerprint(), y.fingerprint());
     }
 
     #[test]

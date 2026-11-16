@@ -120,6 +120,12 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     assert_eq!(code, 5);
     let (code, _) = f.json(&with(&["exec", "-c", "ro", "SELECT 1"]));
     assert_eq!(code, 0);
+    // Switching the session to read-write is refused by siesta itself: exit 4, nothing sent.
+    let (code, v) = f.json(&with(&["exec", "-c", "ro", "START TRANSACTION READ WRITE; DELETE FROM siesta_cli_t WHERE id = 1"]));
+    assert_eq!(code, 4, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("not a security boundary"), "{v}");
+    let (_, v) = f.json(&with(&["exec", "-c", "c", "SELECT count(*) FROM siesta_cli_t"]));
+    assert_eq!(v["rows"][0][0], 4);
 
     // run: @connection, @name, :LINE, #N, whole file, @confirm.
     let file = f.file(

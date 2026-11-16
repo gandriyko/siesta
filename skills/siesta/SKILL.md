@@ -14,7 +14,8 @@ From an agent, use the CLI only; never launch the GUI.
   gives the columns, types, primary key and indexes. Do not guess column names.
 - Pass `--output json` (or `jsonl`) when you read the result; without a TTY JSON is the default.
 - Prefer a read-only connection. Add `--read-only` to anything that must not change data: the
-  server rejects writes. Use it for every exploratory query.
+  server rejects writes. Use it for every exploratory query. It is a safety default, not a security
+  boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
 - Never write passwords into `siesta.json`; they belong in `siesta.private.json` (git-ignored) or
@@ -65,11 +66,12 @@ Exit codes:
 | `0` | OK |
 | `2` | Connection error: cannot connect, authentication failed, connection lost |
 | `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, bad arguments |
-| `4` | Refused: confirmation needed and `--yes` not given |
+| `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to switch to read-write |
 | `5` | SQL error from the server |
 
 With several statements the first failure stops the run (setting `run.stop_on_error`); the exit code is
-that of the failure.
+that of the failure. With `run.stop_on_error` off the run goes on and the exit code is the first
+failure's code.
 
 ## JSON output
 
@@ -96,8 +98,10 @@ that of the failure.
 - `rows_truncated` is true when `--max-rows` cut the result.
 - `rows_affected` is a number for INSERT / UPDATE / DELETE / DDL, `null` for queries.
 - `file` is `null` for `exec`; `line` counts from the start of the SQL given.
-- A failed statement has `"error": { "code": "sql_error" | "connection_lost", "sqlstate", "message", "detail", "hint", "position" }`
-  instead of the result fields, and the exit code is `5` (or `2`).
+- A failed statement has `"error": { "code": "sql_error" | "connection_lost" | "read_only_refused", "sqlstate", "message", "detail", "hint", "position" }`
+  instead of the result fields, and the exit code is `5` (`2` for a lost connection, `4` for `read_only_refused`).
+- `notices` carries server warnings and siesta's notes, e.g. `2 more result sets not shown`: only the first
+  result set of a statement that returns several (`CALL p()`) is printed.
 - Errors before any statement runs (exit `2`, `3`, `4`) print `{"error": {"code", "message", "file", "line", "hint"}}`.
   Read `hint`: it names the fix, for example the available connections.
 
@@ -157,8 +161,11 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
   (`prod` | `always` | `never`) widens or turns off the second rule.
 - Without a terminal the CLI never asks: it exits `4` before running anything, so a batch is never half-run.
   In a terminal it asks `[y/N]`. `--yes` skips the question.
-- `--read-only` and `"read_only": true` are enforced by the server, not by parsing the SQL; they are the
-  real protection.
+- `--read-only` and `"read_only": true` are a safety default of the session, enforced by the server
+  (not by parsing the SQL), plus a cheap guard: statements that switch the session to read-write
+  (`BEGIN READ WRITE`, `SET TRANSACTION READ WRITE`, `SET default_transaction_read_only`, `RESET ALL`, …)
+  are refused with exit `4` and error code `read_only_refused`. It is **not a security boundary**: for real
+  protection connect with a read-only database user.
 
 ## Workflow for a query
 

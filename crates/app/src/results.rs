@@ -46,6 +46,8 @@ pub struct Done {
     pub kind: Kind,
     /// The page that was asked for (offset, size, sort, filters).
     pub page: Page,
+    /// Where the statement was in the editor when it ran.
+    pub range: Option<std::ops::Range<usize>>,
     pub conn: String,
     pub color: Option<String>,
     pub driver: Driver,
@@ -59,6 +61,12 @@ impl Done {
 
     pub fn dialect(&self) -> Dialect {
         dialect_of(self.driver)
+    }
+
+    /// The server pages, sorts and filters this result. Not so for statements that cannot be
+    /// wrapped, nor for queries that ran unwrapped (repeated column names): those sort locally.
+    pub fn paged(&self) -> bool {
+        self.kind == Kind::Query && self.outcome().is_none_or(|o| o.wrapped)
     }
 }
 
@@ -139,7 +147,7 @@ impl Grid {
         let (mut numeric, mut widths) = (vec![], vec![]);
         if let Some(o) = done.outcome() {
             // The server sorted wrappable statements; the others are sorted here ("local").
-            order = if done.kind == Kind::Query { (0..o.rows.len()).collect() } else { sort_order(&o.rows, &o.columns, &sort) };
+            order = if done.paged() { (0..o.rows.len()).collect() } else { sort_order(&o.rows, &o.columns, &sort) };
             for (i, c) in o.columns.iter().enumerate() {
                 let sample = o.rows.iter().take(50).map(|r| cell_display(&r[i], null_text, 64).chars().count());
                 let chars = sample.chain([c.name.chars().count() + 3, c.type_name.chars().count()]).max().unwrap_or(4);
@@ -178,7 +186,7 @@ impl TableDelegate for Grid {
         });
         let view = self.view.clone();
         let name = col.name.clone();
-        let local = self.done.as_ref().is_some_and(|d| d.kind != Kind::Query);
+        let local = self.done.as_ref().is_some_and(|d| !d.paged());
         let head = div()
             .id(("th", ix))
             .w_full()
@@ -430,7 +438,7 @@ impl Siesta {
             return;
         }
         change(e);
-        let local = e.done.as_ref().is_some_and(|d| d.kind != Kind::Query);
+        let local = e.done.as_ref().is_some_and(|d| !d.paged());
         if local {
             // Not wrappable: the sort happens in memory.
             e.id += 1;
@@ -452,7 +460,7 @@ impl Siesta {
     pub(crate) fn step_page(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.shown_key(cx) else { return };
         let Some(e) = self.entry(&key) else { return };
-        let Some(done) = e.done.as_ref().filter(|d| d.kind == Kind::Query) else { return };
+        let Some(done) = e.done.as_ref().filter(|d| d.paged()) else { return };
         // The page on screen, not one that is still being fetched.
         let (offset, size, more) = (done.page.offset, done.page.size, done.outcome().is_some_and(|o| o.has_more));
         if (forward && !more) || (!forward && offset == 0) {
@@ -786,7 +794,7 @@ impl Siesta {
         let t = cx.theme();
         let muted = t.muted_foreground;
         let mut row = h_flex().flex_none().gap_2().items_center().px_3().py_1().border_t_1().border_color(t.border).text_xs().text_color(muted);
-        if done.kind != Kind::Query {
+        if !done.paged() {
             let sorted = !e.page.sort.is_empty();
             row = row.child(format!("{}{}", rows_label(o), if sorted { " · sorted locally" } else { "" }));
             if o.truncated {

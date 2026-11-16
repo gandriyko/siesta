@@ -367,3 +367,88 @@ async fn bad_credentials_are_an_error_not_a_panic() {
     let e = Session::open(&c).await.err().expect("must fail");
     assert!(e.code.is_some() || !e.message.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn explain_analyze_dml_is_never_rerun_after_a_lost_connection() {
+    let mut s = open_pg().await;
+    let old = s.backend_id();
+    let mut other = open_pg().await;
+    run(&mut other, &format!("SELECT pg_terminate_backend({old})")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Classified Other (it executes the DELETE), so the reconnect reports instead of rerunning.
+    let e = try_run(&mut s, "EXPLAIN ANALYZE DELETE FROM pg_temp.siesta_nothing WHERE false").await.unwrap_err();
+    assert!(e.connection_lost && e.message.contains("may or may not have run"), "{e:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn repeated_column_names_with_filter_and_sort_run_unwrapped() {
+    let mut s = open_pg().await;
+    let join = "SELECT * FROM (SELECT 1 AS id, 'a' AS x) a JOIN (SELECT 1 AS id, 'b' AS y) b ON a.id = b.id";
+    // A plain page works as a wrapper.
+    assert!(run(&mut s, join).await.wrapped);
+    // Filter / sort on a repeated name would be "ambiguous": unwrapped, with a note.
+    for p in [page(&[("id", "=1")]), sorted(&[("id", true)])] {
+        let o = run_page(&mut s, join, &p).await;
+        assert!(!o.wrapped && !o.has_more && o.rows.len() == 1, "{:?}", o.executed_sql);
+        assert!(o.notices.iter().any(|n| n.contains("`id` repeats")), "{:?}", o.notices);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn only_the_first_of_several_result_sets_is_shown() {
+    let mut s = open_pg().await;
+    // Simple protocol: three statements, three result sets with different columns.
+    let o = s.run("SELECT 1 AS a; SELECT 'x' AS b, 2 AS c; SELECT 3 AS d", Kind::Other, &Page::default()).await.unwrap();
+    assert_eq!(o.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert_eq!(ints(&o), [1]);
+    assert!(o.notices.contains(&"2 more result sets not shown".to_string()), "{:?}", o.notices);
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn read_only_refuses_switching_to_read_write() {
+    let mut c = connection(PG);
+    c.read_only = true;
+    let mut s = Session::open(&c).await.unwrap();
+    for sql in [
+        "BEGIN READ WRITE",
+        "SET default_transaction_read_only = off",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        "RESET ALL",
+        "SELECT set_config('default_transaction_read_only', 'off', false)",
+    ] {
+        let e = try_run(&mut s, sql).await.unwrap_err();
+        assert!(e.refused && e.code.is_none(), "{sql}: {e:?}");
+    }
+    assert_eq!(texts(&run(&mut s, "SHOW default_transaction_read_only").await), ["on"]);
+    let e = try_run(&mut s, "CREATE TABLE ro_denied2 (a int)").await.unwrap_err();
+    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn statement_timeout_survives_a_reconnect_and_cancel_follows_it() {
+    let mut s = open_pg().await;
+    s.set_statement_timeout(Some(1500)).await.unwrap();
+    assert_eq!(texts(&run(&mut s, "SHOW statement_timeout").await), ["1500ms"]);
+    let handle = s.cancel_handle();
+    let old = s.backend_id();
+    let mut other = open_pg().await;
+    run(&mut other, &format!("SELECT pg_terminate_backend({old})")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(texts(&run(&mut s, "SHOW statement_timeout").await), ["1500ms"]); // reapplied
+    assert_ne!(s.backend_id(), old);
+    // The handle taken before the reconnect cancels the new backend.
+    s.set_statement_timeout(None).await.unwrap();
+    let started = Instant::now();
+    let (res, cancelled) = tokio::join!(try_run(&mut s, "SELECT pg_sleep(10)"), async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.cancel().await
+    });
+    cancelled.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert_eq!(res.unwrap_err().code.as_deref(), Some("57014"));
+}

@@ -112,7 +112,7 @@ pub(crate) struct Item<'a> {
 
 pub(crate) fn error_json(e: &DbError) -> Value {
     json!({
-        "code": if e.connection_lost { "connection_lost" } else { "sql_error" },
+        "code": if e.connection_lost { "connection_lost" } else if e.refused { "read_only_refused" } else { "sql_error" },
         "sqlstate": e.code, "message": e.message, "detail": e.detail, "hint": e.hint, "position": e.position,
     })
 }
@@ -198,6 +198,7 @@ mod tests {
         Outcome {
             columns: vec![Column { name: "id".into(), type_name: "int8".into() }, Column { name: "payload".into(), type_name: "jsonb".into() }],
             rows: vec![vec![Value::Int(1), Value::Json(json!({"ip": "10.0.0.1", "tags": [1, 2]}))], vec![Value::Int(2), Value::Null]],
+            wrapped: true,
             has_more: true,
             truncated: false,
             rows_affected: None,
@@ -245,6 +246,9 @@ mod tests {
         assert_eq!(v["error"]["sqlstate"], "42P01");
         assert_eq!(v["error"]["code"], "sql_error");
         assert!(v.get("rows").is_none());
+        let r = Err(DbError { message: "no".into(), refused: true, ..Default::default() });
+        let v = item_json(&Item { file: None, name: None, line: 1, connection: "dev", result: &r, max_rows: 1 });
+        assert_eq!(v["error"]["code"], "read_only_refused");
     }
 
     #[test]

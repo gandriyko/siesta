@@ -309,6 +309,7 @@ mod tests {
         let mut o = Outcome {
             columns: vec![],
             rows: vec![],
+            wrapped: false,
             has_more: false,
             truncated: false,
             rows_affected: Some(3),

@@ -34,7 +34,7 @@ Statements are addressed by `-- @name`, `:LINE` or `#N`. Some useful flags:
 ```sh
 siesta run reports.sql users_by_day --output json     # machine-readable output (default when piped)
 siesta exec -c dev-pg 'SELECT count(*) FROM users'    # no file needed
-siesta exec -c prod-mysql --read-only 'SELECT 1'      # the server refuses writes
+siesta exec -c prod-mysql --read-only 'SELECT 1'      # the server refuses writes (a safety default, not a security boundary)
 siesta run cleanup.sql --yes                          # confirm a destructive statement on a prod connection
 siesta schema -c dev-pg users                         # columns before writing a query
 ```

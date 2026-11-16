@@ -102,6 +102,11 @@ impl Doc {
         self.file.connection.as_deref().or(self.picked.as_deref())
     }
 
+    /// Schema cache key of the file's connection (`None`: no connection, or an unusable one).
+    pub fn schema_key(&self) -> Option<String> {
+        self.conns.connections.get(self.connection()?).map(crate::schema_cache::key)
+    }
+
     /// Dialect of a named connection; Postgres without one (or when it is unknown).
     fn dialect_for(&self, name: Option<&str>) -> Dialect {
         name.and_then(|n| self.conns.connections.get(n)).map_or_else(Dialect::default, |c| dialect_of(c.driver))
@@ -125,7 +130,7 @@ impl Doc {
         let connection = self.connection().map(str::to_string);
         let default_schema = connection.as_deref().and_then(|c| self.conns.connections.get(c)).and_then(default_schema);
         let mut lang = self.lang.borrow_mut();
-        (lang.dialect, lang.connection, lang.default_schema) = (self.dialect, connection, default_schema);
+        (lang.dialect, lang.connection, lang.default_schema) = (self.dialect, self.schema_key(), default_schema);
         drop(lang);
         self.publish_diagnostics(cx);
         self.sync_active(cx);

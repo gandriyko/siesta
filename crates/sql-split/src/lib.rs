@@ -81,6 +81,13 @@ impl SqlFile {
 pub const DIRECTIVES: &[&str] = &["connection", "name", "page-size", "confirm"];
 
 pub fn split(src: &str, dialect: Dialect) -> SqlFile {
+    split_words(src, dialect, false).0
+}
+
+type Words<'a> = Vec<(u32, &'a str)>;
+
+/// `split`, plus (with `keep`) the unquoted words with their parenthesis depth of every statement.
+fn split_words(src: &str, dialect: Dialect, keep: bool) -> (SqlFile, Vec<Words<'_>>) {
     Splitter {
         src,
         b: src.as_bytes(),
@@ -93,6 +100,8 @@ pub fn split(src: &str, dialect: Dialect) -> SqlFile {
         depth: 0,
         pending: Pending::default(),
         lines: (0, 1),
+        keep,
+        kept: Vec::new(),
     }
     .run()
 }
@@ -121,10 +130,12 @@ struct Splitter<'a> {
     pending: Pending,
     /// (offset, line) of the last line lookup: lines are counted incrementally.
     lines: (usize, usize),
+    keep: bool,
+    kept: Vec<Words<'a>>,
 }
 
 impl<'a> Splitter<'a> {
-    fn run(mut self) -> SqlFile {
+    fn run(mut self) -> (SqlFile, Vec<Words<'a>>) {
         let b = self.b;
         let (mut i, mut line_start) = (0, true);
         while i < b.len() {
@@ -194,7 +205,7 @@ impl<'a> Splitter<'a> {
             self.last = i;
         }
         self.finish();
-        self.out
+        (self.out, self.kept)
     }
 
     /// A statement token at `i`: starts a statement if none is open.
@@ -217,6 +228,13 @@ impl<'a> Splitter<'a> {
                 confirm: pending.confirm,
                 kind: classify(&self.words),
             });
+            if let (Some(reason @ ("UPDATE without WHERE" | "DELETE without WHERE")), Some(&(_, first))) = (reason(&self.words), self.words.first()) {
+                let what = if reason.starts_with("UPDATE") { "changes" } else { "deletes" };
+                self.diag(start..start + first.len(), Severity::Warning, format!("{reason}: every row {what}"));
+            }
+        }
+        if self.keep {
+            self.kept.push(std::mem::take(&mut self.words));
         }
         self.words.clear();
         self.depth = 0;
@@ -320,10 +338,34 @@ impl<'a> Splitter<'a> {
     }
 }
 
+fn is(w: &str, list: &[&str]) -> bool {
+    list.iter().any(|k| w.eq_ignore_ascii_case(k))
+}
+
+/// The statement an `EXPLAIN [ANALYZE | (options)] …` or MariaDB `ANALYZE …` wraps, and whether
+/// it actually runs (`ANALYZE`). `EXPLAIN` without it only plans.
+fn explain_inner<'w, 'a>(words: &'w [(u32, &'a str)]) -> Option<(&'w [(u32, &'a str)], bool)> {
+    let first = words.first()?.1;
+    let analyze_first = is(first, &["analyze", "analyse"]);
+    if !analyze_first && !is(first, &["explain"]) {
+        return None;
+    }
+    let options = ["analyze", "analyse", "verbose", "extended", "partitions", "format", "json", "tree", "traditional"];
+    let at = 1 + words[1..].iter().position(|(d, w)| *d == 0 && !is(w, &options))?;
+    let runs = analyze_first || words[1..at].iter().any(|(_, w)| is(w, &["analyze", "analyse"]));
+    Some((&words[at..], runs))
+}
+
 fn classify(words: &[(u32, &str)]) -> Kind {
-    let is = |w: &str, list: &[&str]| list.iter().any(|k| w.eq_ignore_ascii_case(k));
     let Some(&(_, first)) = words.first() else { return Kind::Other };
-    if is(first, &["show", "explain", "describe", "desc"]) {
+    if is(first, &["explain"]) {
+        // `EXPLAIN ANALYZE <DML>` executes the DML: never "just a read".
+        return match explain_inner(words) {
+            Some((inner, true)) if classify(inner) != Kind::Query => Kind::Other,
+            _ => Kind::Read,
+        };
+    }
+    if is(first, &["show", "describe", "desc"]) {
         return Kind::Read;
     }
     if is(first, &["with"]) {
@@ -351,47 +393,38 @@ pub fn is_destructive(text: &str, dialect: Dialect) -> bool {
 
 /// Why [`is_destructive`] says yes (`"DROP"`, `"UPDATE without WHERE"`, …).
 pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> {
-    let b = text.as_bytes();
-    let (mut i, mut depth) = (0, 0u32);
-    let mut words: Vec<(u32, &str)> = Vec::new();
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b'-' if b[i..].starts_with(b"--") => i = line_end(b, i),
-            b'#' if dialect == Dialect::MySql => i = line_end(b, i),
-            b'/' if b[i..].starts_with(b"/*") => i = text[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2),
-            b'\'' | b'"' | b'`' => {
-                i += 1;
-                while i < b.len() && b[i] != c {
-                    i += if b[i] == b'\\' && c == b'\'' && dialect == Dialect::MySql { 2 } else { 1 };
-                }
-                i += 1; // closing quote (a doubled quote reopens on the next loop turn)
-            }
-            b'$' if dialect == Dialect::Postgres => {
-                let end = b[i + 1..].iter().position(|&x| x == b'$').map(|p| i + 1 + p);
-                match end.filter(|&e| text[i + 1..e].chars().all(|ch| ch.is_alphanumeric() || ch == '_')) {
-                    Some(e) => i = text[e + 1..].find(&text[i..=e]).map_or(b.len(), |p| e + 1 + p + (e - i) + 1),
-                    None => i += 1,
-                }
-            }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            _ if is_word_start(c) => {
-                let e = word_end(b, i);
-                words.push((depth, &text[i..e]));
-                i = e;
-            }
-            _ => i += 1,
-        }
+    // The splitter's own lexer (strings, comments, dollar quotes), so both agree on what is a word.
+    split_words(text, dialect, true).1.iter().find_map(|w| reason(w))
+}
+
+/// What the top level of a SELECT-like statement has, for the page wrapper.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopLevel {
+    /// `LIMIT`, `OFFSET` or `FETCH` outside parentheses.
+    pub limit: bool,
+    pub order_by: bool,
+    /// `LOCK IN SHARE MODE` / `FOR UPDATE|SHARE`: a clause that must stay last.
+    pub lock: bool,
+    /// A `VALUES …` statement.
+    pub values: bool,
+}
+
+pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
+    let (_, all) = split_words(text, dialect, true);
+    let top: Vec<&str> = all.first().map(|w| w.iter().filter(|(d, _)| *d == 0).map(|(_, w)| *w).collect()).unwrap_or_default();
+    TopLevel {
+        limit: top.iter().any(|w| is(w, &["limit", "offset", "fetch"])),
+        order_by: top.windows(2).any(|p| is(p[0], &["order"]) && is(p[1], &["by"])),
+        lock: top.iter().any(|w| is(w, &["lock", "for"])),
+        values: top.first().is_some_and(|w| is(w, &["values"])),
     }
-    let is = |w: &str, list: &[&str]| list.iter().any(|k| w.eq_ignore_ascii_case(k));
+}
+
+fn reason(words: &[(u32, &str)]) -> Option<&'static str> {
     let &(_, first) = words.first()?;
+    if let Some((inner, runs)) = explain_inner(words) {
+        return if runs { reason(inner) } else { None };
+    }
     if is(first, &["drop", "truncate", "alter"]) {
         return Some(match first.to_ascii_lowercase().as_str() {
             "drop" => "DROP",
@@ -514,6 +547,14 @@ mod tests {
             ("SELECT * FROM t FOR NO KEY UPDATE", Kind::Other),
             ("SHOW tables", Kind::Read),
             ("EXPLAIN SELECT 1", Kind::Read),
+            ("EXPLAIN ANALYZE SELECT 1", Kind::Read),
+            ("EXPLAIN (ANALYZE) WITH a AS (SELECT 1) SELECT * FROM a", Kind::Read),
+            ("EXPLAIN DELETE FROM t", Kind::Read),
+            ("EXPLAIN (VERBOSE, COSTS OFF) UPDATE t SET a = 1", Kind::Read),
+            ("EXPLAIN ANALYZE DELETE FROM t", Kind::Other),
+            ("EXPLAIN ANALYZE VERBOSE UPDATE t SET a = 1", Kind::Other),
+            ("EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t VALUES (1)", Kind::Other),
+            ("ANALYZE SELECT 1", Kind::Other),
             ("DESCRIBE t", Kind::Read),
             ("INSERT INTO t VALUES (1) RETURNING id", Kind::Other),
             ("UPDATE t SET a = 1", Kind::Other),
@@ -589,6 +630,38 @@ mod tests {
     }
 
     #[test]
+    fn update_and_delete_without_where_warn() {
+        let src = "UPDATE t SET a = 1;\nDELETE FROM t WHERE id = 1;\nupdate t set a = 1 where id = 1;\nDELETE FROM u";
+        let f = split(src, PG);
+        let got: Vec<_> = f.diagnostics.iter().map(|d| (d.severity, &src[d.range.clone()], d.message.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Warning, "UPDATE", "UPDATE without WHERE: every row changes"),
+                (Severity::Warning, "DELETE", "DELETE without WHERE: every row deletes")
+            ]
+        );
+        assert!(split("DROP TABLE t; EXPLAIN DELETE FROM t", PG).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn top_level_clauses() {
+        let tl = |s: &str, d| top_level(s, d);
+        assert_eq!(tl("SELECT 1", MY), TopLevel::default());
+        assert!(tl("SELECT a FROM t ORDER BY a DESC", MY).order_by);
+        assert!(!tl("SELECT a FROM t ORDER BY a DESC", MY).limit);
+        assert!(tl("SELECT a FROM t LIMIT 5", MY).limit);
+        assert!(tl("SELECT a FROM t LIMIT 5, 10 -- x", MY).limit);
+        // Nested, quoted and commented ones are not top-level.
+        let nested = tl("SELECT 'limit', `order` FROM (SELECT a FROM t ORDER BY a LIMIT 1) x /* limit */ -- order by", MY);
+        assert_eq!((nested.limit, nested.order_by), (false, false));
+        assert!(tl("SELECT a FROM t ORDER BY a FETCH FIRST 3 ROWS ONLY", MY).limit);
+        assert!(tl("SELECT a FROM t LOCK IN SHARE MODE", MY).lock);
+        assert!(tl("VALUES ROW(1)", MY).values);
+        assert!(tl("(SELECT 1) UNION (SELECT 2) ORDER BY 1", MY).order_by);
+    }
+
+    #[test]
     fn destructive() {
         for (sql, d, want) in [
             ("DELETE FROM t", PG, true),
@@ -616,6 +689,23 @@ mod tests {
             (r"UPDATE t SET a = 'it\'s where' ", MY, true),
             ("DELETE FROM t # where\n", MY, true),
             ("DELETE FROM t WHERE a = `where`", MY, false),
+            // The main lexer's string rules: Postgres E'…' and MySQL backslash escapes.
+            (r"UPDATE t SET a = E'\' where '", PG, true),
+            (r"UPDATE t SET a = e'\' where ' WHERE id = 1", PG, false),
+            (r#"UPDATE t SET a = "\" where ""#, MY, true),
+            (r"UPDATE t SET a = '\' where '", MY, true),
+            (r"UPDATE t SET a = 'a\' where '", PG, false), // a backslash is a plain char in a Postgres string
+            // EXPLAIN ANALYZE / MariaDB ANALYZE run the statement.
+            ("EXPLAIN ANALYZE DELETE FROM t", PG, true),
+            ("EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET a = 1", PG, true),
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1 WHERE id = 1", PG, false),
+            ("EXPLAIN DELETE FROM t", PG, false),
+            ("EXPLAIN (VERBOSE) DELETE FROM t", PG, false),
+            ("EXPLAIN ANALYZE SELECT 1", PG, false),
+            ("EXPLAIN ANALYZE DELETE FROM t", MY, true),
+            ("ANALYZE DELETE FROM t", MY, true),
+            ("ANALYZE FORMAT=JSON UPDATE t SET a = 1", MY, true),
+            ("ANALYZE TABLE t", MY, false),
         ] {
             assert_eq!(is_destructive(sql, d), want, "{sql}");
         }

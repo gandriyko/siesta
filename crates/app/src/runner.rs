@@ -6,15 +6,16 @@
 //! (a dropped future would leave a connection mid-query): it is cancelled on the server instead.
 
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use db_conn::{Connection, Driver};
+use db_conn::Connection;
 use db_exec::{CancelHandle, DbError, Outcome, Page, Session};
 use gpui::*;
 use gpui_component::WindowExt as _;
@@ -46,22 +47,48 @@ pub struct Slot {
 }
 
 /// What the tokio side shares with the GUI: the session (runs take its lock, so they go one by
-/// one), the cancel handle (usable while a run holds the lock) and the "stop the batch" flag.
+/// one), the cancel handle (usable while a run holds the lock; it follows the session across
+/// reconnects) and the generation.
+///
+/// Every job remembers the generation it was started in. Cancel and close bump it, which
+/// invalidates all jobs of the file that are still queued (or mid-batch): they end as "Cancelled"
+/// without running more. A job started after the bump is unaffected.
 #[derive(Clone)]
 pub struct Handles {
     session: Arc<AsyncMutex<Option<Session>>>,
     cancel: Arc<Mutex<Option<CancelHandle>>>,
-    stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+}
+
+impl Handles {
+    fn new() -> Self {
+        Handles { session: Arc::new(AsyncMutex::new(None)), cancel: Arc::new(Mutex::new(None)), generation: Arc::new(AtomicU64::new(0)) }
+    }
+
+    /// The generation a job started now belongs to.
+    fn token(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Cancel / close: every job started so far is invalid.
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn valid(&self, token: u64) -> bool {
+        self.token() == token
+    }
 }
 
 impl Slot {
     fn new() -> Self {
-        Slot {
-            handles: Handles { session: Arc::new(AsyncMutex::new(None)), cancel: Arc::new(Mutex::new(None)), stop: Arc::new(AtomicBool::new(false)) },
-            dot: Dot::Grey,
-            in_tx: false,
-        }
+        Slot { handles: Handles::new(), dot: Dot::Grey, in_tx: false }
     }
+}
+
+/// What a run that was cancelled before it started reports.
+fn cancelled() -> DbError {
+    DbError { message: "Cancelled".into(), ..Default::default() }
 }
 
 /// One statement to run.
@@ -72,11 +99,13 @@ pub struct Spec {
     pub page_size: Option<usize>,
     /// `-- @confirm`
     pub confirm: bool,
+    /// Where the statement was in the editor when it was picked (to place a server error).
+    pub range: Option<Range<usize>>,
 }
 
 impl Spec {
     pub fn of(st: &sql_split::Statement, src: &str) -> Self {
-        Spec { text: st.text(src).to_string(), kind: st.kind, page_size: st.page_size, confirm: st.confirm }
+        Spec { text: st.text(src).to_string(), kind: st.kind, page_size: st.page_size, confirm: st.confirm, range: Some(st.range.clone()) }
     }
 }
 
@@ -93,8 +122,13 @@ pub fn needs_confirm(spec: &Spec, mode: ConfirmDestructive, prod: bool, dialect:
 
 /// The statements of the selected text (`range` of `src`), split with the file's dialect.
 pub fn selection_specs(src: &str, range: std::ops::Range<usize>, dialect: Dialect) -> Vec<Spec> {
-    let Some(text) = src.get(range) else { return vec![] };
-    sql_split::split(text, dialect).statements.iter().map(|s| Spec::of(s, text)).collect()
+    let Some(text) = src.get(range.clone()) else { return vec![] };
+    let shift = |r: Range<usize>| r.start + range.start..r.end + range.start;
+    sql_split::split(text, dialect)
+        .statements
+        .iter()
+        .map(|s| Spec { range: Some(shift(s.range.clone())), ..Spec::of(s, text) })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -102,6 +136,7 @@ pub struct Stmt {
     pub text: String,
     pub kind: Kind,
     pub page: Page,
+    pub range: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,62 +152,61 @@ pub struct Report {
     pub in_tx: bool,
     /// A session exists (false: it could not be opened).
     pub live: bool,
+    /// Cancelled before it started: it ran nothing and says nothing about the session.
+    pub skipped: bool,
 }
 
-async fn acquire(h: &Handles, conn: &Connection, opts: Opts) -> Result<OwnedMutexGuard<Option<Session>>, DbError> {
+/// The session of `h`, opened if needed, with the settings applied. `Ok(None)`: the job's
+/// generation was invalidated while it waited for the lock (cancel / close): nothing is opened.
+async fn acquire(h: &Handles, conn: &Connection, opts: Opts, token: u64) -> Result<Option<OwnedMutexGuard<Option<Session>>>, DbError> {
     let mut g = h.session.clone().lock_owned().await;
+    if !h.valid(token) {
+        return Ok(None);
+    }
     if g.is_none() {
-        let mut s = Session::open(conn).await?;
-        if let Some(ms) = opts.timeout_ms {
-            let sql = match conn.driver {
-                Driver::Postgres => format!("SET statement_timeout = {ms}"),
-                Driver::MySql => format!("SET SESSION max_execution_time = {ms}"),
-            };
-            s.run(&sql, Kind::Other, &Page::default()).await?;
-        }
+        let s = Session::open(conn).await?;
+        // One handle for the life of the session: it follows the session across reconnects.
         *h.cancel.lock().unwrap() = Some(s.cancel_handle());
         *g = Some(s);
     }
     if let Some(s) = g.as_mut() {
         s.max_rows = opts.max_rows;
+        s.set_statement_timeout(opts.timeout_ms).await?;
     }
-    Ok(g)
+    Ok(Some(g))
 }
 
-async fn run_job(h: Handles, conn: Connection, stmts: Vec<Stmt>, opts: Opts) -> Report {
-    let mut g = match acquire(&h, &conn, opts).await {
-        Ok(g) => g,
-        Err(e) => return Report { results: vec![Err(e)], in_tx: false, live: false },
+async fn run_job(h: Handles, conn: Connection, stmts: Vec<Stmt>, opts: Opts, token: u64) -> Report {
+    let mut g = match acquire(&h, &conn, opts, token).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return Report { results: vec![Err(cancelled())], in_tx: false, live: false, skipped: true },
+        Err(e) => return Report { results: vec![Err(e)], in_tx: false, live: false, skipped: false },
     };
-    // A cancel that arrived while this job waited for the lock was meant for the run before it.
-    h.stop.store(false, Ordering::Relaxed);
     let s = g.as_mut().expect("session opened");
     let mut results = vec![];
     for st in stmts {
-        if h.stop.load(Ordering::Relaxed) {
+        if !h.valid(token) {
             break;
         }
         let r = s.run(&st.text, st.kind, &st.page).await;
-        // A reconnect inside `run` changes the backend id.
-        *h.cancel.lock().unwrap() = Some(s.cancel_handle());
         let failed = r.is_err();
         results.push(r);
         if failed && opts.stop_on_error {
             break;
         }
     }
-    Report { results, in_tx: s.in_transaction(), live: true }
+    Report { results, in_tx: s.in_transaction(), live: true, skipped: false }
 }
 
-async fn count_job(h: Handles, conn: Connection, text: String, filters: Vec<(String, String)>, opts: Opts) -> Result<u64, DbError> {
-    let mut g = acquire(&h, &conn, opts).await?;
+async fn count_job(h: Handles, conn: Connection, text: String, filters: Vec<(String, String)>, opts: Opts, token: u64) -> Result<u64, DbError> {
+    let mut g = acquire(&h, &conn, opts, token).await?.ok_or_else(cancelled)?;
     g.as_mut().expect("session opened").count(&text, &filters).await
 }
 
 /// Reads the structure on the file's session (queued behind a running statement) and saves it
 /// to the disk cache.
-async fn schema_job(h: Handles, conn: Connection, opts: Opts, file: Option<PathBuf>) -> Result<db_exec::Schema, DbError> {
-    let mut g = acquire(&h, &conn, opts).await?;
+async fn schema_job(h: Handles, conn: Connection, opts: Opts, file: Option<PathBuf>, token: u64) -> Result<db_exec::Schema, DbError> {
+    let mut g = acquire(&h, &conn, opts, token).await?.ok_or_else(cancelled)?;
     let schema = g.as_mut().expect("session opened").schema().await?;
     if let Some(file) = file {
         let copy = schema.clone();
@@ -181,15 +215,16 @@ async fn schema_job(h: Handles, conn: Connection, opts: Opts, file: Option<PathB
     Ok(schema)
 }
 
-async fn ddl_job(h: Handles, conn: Connection, opts: Opts, schema: String, table: String) -> Result<String, DbError> {
-    let mut g = acquire(&h, &conn, opts).await?;
+async fn ddl_job(h: Handles, conn: Connection, opts: Opts, schema: String, table: String, token: u64) -> Result<String, DbError> {
+    let mut g = acquire(&h, &conn, opts, token).await?.ok_or_else(cancelled)?;
     g.as_mut().expect("session opened").table_ddl(&schema, &table).await
 }
 
-/// Close the session on the runtime; `finish` (`COMMIT` / `ROLLBACK`) runs first.
-fn close_slot(slot: Slot, finish: Option<&'static str>) {
+/// Close the session on the runtime; `finish` (`COMMIT` / `ROLLBACK`) runs first. The handle
+/// completes when the session is closed.
+fn close_slot(slot: Slot, finish: Option<&'static str>) -> tokio::task::JoinHandle<()> {
     let Slot { handles, .. } = slot;
-    handles.stop.store(true, Ordering::Relaxed);
+    handles.invalidate(); // queued runs of this session end as "Cancelled"
     let cancel = handles.cancel.lock().unwrap().clone();
     RT.spawn(async move {
         // A running statement would keep the lock: cancel it first.
@@ -202,7 +237,13 @@ fn close_slot(slot: Slot, finish: Option<&'static str>) {
             }
             s.close().await;
         }
-    });
+    })
+}
+
+/// Byte offset of the statement `text` in `src`: at `range` when the text there is still the
+/// statement, else its first copy (the file was edited since the run).
+fn statement_start(src: &str, text: &str, range: Option<Range<usize>>) -> Option<usize> {
+    range.filter(|r| src.get(r.clone()) == Some(text)).map(|r| r.start).or_else(|| src.find(text))
 }
 
 fn first_line(s: &str) -> String {
@@ -273,7 +314,8 @@ impl Siesta {
             if *p != path {
                 continue;
             }
-            slot.handles.stop.store(true, Ordering::Relaxed);
+            // Queued runs of the file die with it; the cancel handle hits the one that executes.
+            slot.handles.invalidate();
             if let Some(c) = slot.handles.cancel.lock().unwrap().clone() {
                 RT.spawn(async move {
                     let _ = c.cancel().await;
@@ -307,22 +349,33 @@ impl Siesta {
         .detach();
     }
 
-    /// "Disconnect": drop the sessions of the current file (an open transaction is rolled back by the server).
+    /// "Disconnect": drop the sessions of the current file; an open transaction is asked about
+    /// (Commit / Rollback / Cancel) like when the file is closed.
     pub(crate) fn disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        let done = |window: &mut Window, cx: &mut Context<Self>| {
+            window.push_notification("Disconnected", cx);
+            cx.notify();
+        };
+        if self.in_tx(&path) {
+            return self.ask_transaction(path, move |_, window, cx| done(window, cx), window, cx);
+        }
         self.close_sessions(&path, None);
-        window.push_notification("Disconnected", cx);
-        cx.notify();
+        done(window, cx);
     }
 
-    /// Close every session of `path` (`finish` runs first) and forget its results.
-    pub(crate) fn close_sessions(&mut self, path: &Path, finish: Option<&'static str>) {
+    /// Close every session of `path` (`finish` runs first); the handles complete when they are closed.
+    pub(crate) fn close_sessions(&mut self, path: &Path, finish: Option<&'static str>) -> Vec<tokio::task::JoinHandle<()>> {
         let keys: Vec<_> = self.slots.keys().filter(|(p, _)| p == path).cloned().collect();
-        for k in keys {
-            if let Some(slot) = self.slots.remove(&k) {
-                close_slot(slot, finish);
-            }
-        }
+        keys.into_iter().filter_map(|k| self.slots.remove(&k)).map(|slot| close_slot(slot, finish)).collect()
+    }
+
+    /// Paths with an open transaction in any session.
+    pub(crate) fn paths_in_tx(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.slots.iter().filter(|(_, s)| s.in_tx).map(|((p, _), _)| p.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// Resolve the pipeline up to the confirmation, then run.
@@ -363,7 +416,7 @@ impl Siesta {
             e.count = None;
             e.running = Some(Instant::now());
             e.tab = Tab::Result;
-            stmts.push(Stmt { text: s.text.clone(), kind: s.kind, page: e.page.clone() });
+            stmts.push(Stmt { text: s.text.clone(), kind: s.kind, page: e.page.clone(), range: s.range.clone() });
             keys.push(key);
         }
         self.store.batches.insert(path.clone(), if keys.len() > 1 { keys.clone() } else { vec![] });
@@ -380,7 +433,7 @@ impl Siesta {
         let conn = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).cloned()).unwrap_or(conn);
         let e = self.store.entries.get_mut(key).expect("entry");
         e.running = Some(Instant::now());
-        let stmt = Stmt { text: done.text.clone(), kind: done.kind, page: e.page.clone() };
+        let stmt = Stmt { text: done.text.clone(), kind: done.kind, page: e.page.clone(), range: done.range.clone() };
         self.spawn_job(key.0.clone(), done.conn.clone(), conn, vec![stmt], vec![key.clone()], window, cx);
     }
 
@@ -389,12 +442,13 @@ impl Siesta {
         let slot = self.slots.entry((path.clone(), name.clone())).or_insert_with(Slot::new);
         let handles = slot.handles.clone();
         let opts = self.opts();
-        let handle = RT.spawn(run_job(handles, conn.clone(), stmts.clone(), opts));
+        let token = handles.token(); // taken here, not on the runtime: a Cancel right after this must reach the job
+        let handle = RT.spawn(run_job(handles, conn.clone(), stmts.clone(), opts, token));
         self.ensure_ticker(window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let report = match handle.await {
                 Ok(r) => r,
-                Err(e) => Report { results: vec![Err(DbError { message: format!("Internal error: {e}"), ..Default::default() })], in_tx: false, live: false },
+                Err(e) => Report { results: vec![Err(DbError { message: format!("Internal error: {e}"), ..Default::default() })], in_tx: false, live: false, skipped: true },
             };
             this.update_in(cx, |this, window, cx| this.finish(path, name, conn, stmts, keys, report, window, cx)).ok();
         })
@@ -404,7 +458,9 @@ impl Siesta {
 
     #[allow(clippy::too_many_arguments)]
     fn finish(&mut self, path: PathBuf, name: String, conn: Connection, stmts: Vec<Stmt>, keys: Vec<Key>, report: Report, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(slot) = self.slots.get_mut(&(path.clone(), name.clone())) {
+        if let Some(slot) = self.slots.get_mut(&(path.clone(), name.clone()))
+            && !report.skipped
+        {
             slot.in_tx = report.in_tx;
             slot.dot = if report.live && report.results.last().is_some_and(Result::is_ok) { Dot::Green } else { Dot::Red };
         }
@@ -417,16 +473,16 @@ impl Siesta {
             if let Err(err) = &result
                 && let Some(p) = err.position
             {
-                position = Some((stmt.text.clone(), p, err.message.clone()));
+                position = Some((stmt.text.clone(), stmt.range.clone(), p, err.message.clone()));
             }
             e.id += 1;
-            e.done = Some(Arc::new(Done { text: stmt.text, kind: stmt.kind, page: stmt.page, conn: name.clone(), color: color.clone(), driver: conn.driver, result }));
+            e.done = Some(Arc::new(Done { text: stmt.text, kind: stmt.kind, page: stmt.page, range: stmt.range, conn: name.clone(), color: color.clone(), driver: conn.driver, result }));
         }
-        if let Some((text, p, msg)) = position {
-            self.underline_error(&path, &text, p, &msg, cx);
+        if let Some((text, range, p, msg)) = position {
+            self.underline_error(&path, &text, range, p, &msg, cx);
         }
         // The first live session of a connection reads its schema, once per run of the app.
-        let first = !self.schemas.borrow().fresh.contains(&name);
+        let first = !self.schemas.borrow().fresh.contains(&crate::schema_cache::key(&conn));
         if first && report.live && report.results.last().is_some_and(Result::is_ok) {
             self.load_schema(path.clone(), name.clone(), conn.clone(), window, cx);
         }
@@ -437,12 +493,13 @@ impl Siesta {
     }
 
     /// A server error with a position: red underline at that character until the next edit
-    /// (the editor drops diagnostics on every change).
-    pub(crate) fn underline_error(&mut self, path: &Path, text: &str, pos: usize, msg: &str, cx: &mut Context<Self>) {
+    /// (the editor drops diagnostics on every change). `range` is where the statement was in the
+    /// editor when it ran; if the text there changed since, the first copy of the statement is used.
+    pub(crate) fn underline_error(&mut self, path: &Path, text: &str, range: Option<Range<usize>>, pos: usize, msg: &str, cx: &mut Context<Self>) {
         let Some(d) = self.docs.iter().find(|d| *d.path == path) else { return };
         d.editor.update(cx, |s, cx| {
             let src = s.value();
-            let Some(start) = src.find(text) else { return };
+            let Some(start) = statement_start(&src, text, range) else { return };
             let at = |n: usize| text.char_indices().nth(n).map_or(text.len(), |(b, _)| b);
             let (a, b) = (at(pos.saturating_sub(1)), at(pos));
             // "At end of input": the last character is the culprit.
@@ -501,7 +558,8 @@ impl Siesta {
         let filters = e.page.filters.clone();
         let Some(conn) = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).cloned()) else { return };
         let slot = self.slots.entry((key.0.clone(), done.conn.clone())).or_insert_with(Slot::new);
-        let handle = RT.spawn(count_job(slot.handles.clone(), conn, done.text.clone(), filters.clone(), self.opts()));
+        let token = slot.handles.token();
+        let handle = RT.spawn(count_job(slot.handles.clone(), conn, done.text.clone(), filters.clone(), self.opts(), token));
         cx.spawn_in(window, async move |this, cx| {
             let r = handle.await.unwrap_or_else(|e| Err(DbError { message: e.to_string(), ..Default::default() }));
             this.update_in(cx, |this, window, cx| {
@@ -520,15 +578,16 @@ impl Siesta {
         .detach();
     }
 
-    /// The disk cache of `name`, read once, so the DB tab and completion work before any session.
-    pub(crate) fn load_cached_schema(&mut self, name: &str) {
+    /// The disk cache of the connection with cache `key` (`schema_cache::key`), read once, so the
+    /// DB tab and completion work before any session.
+    pub(crate) fn load_cached_schema(&mut self, key: &str) {
         let Some(base) = self.base.as_deref() else { return };
         let mut cache = self.schemas.borrow_mut();
-        if cache.schemas.contains_key(name) || !cache.disk_tried.insert(name.to_string()) {
+        if cache.schemas.contains_key(key) || !cache.disk_tried.insert(key.to_string()) {
             return;
         }
-        if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, &self.root, name)) {
-            cache.schemas.insert(name.to_string(), Arc::new(s));
+        if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, &self.root, key)) {
+            cache.schemas.insert(key.to_string(), Arc::new(s));
         }
     }
 
@@ -543,28 +602,31 @@ impl Siesta {
 
     /// Reads the schema in the background; the old one (cache) stays until the new one arrives.
     fn load_schema(&mut self, path: PathBuf, name: String, conn: Connection, window: &mut Window, cx: &mut Context<Self>) {
+        // Keyed by what the connection points at, not by its name (two files may share a name).
+        let key = crate::schema_cache::key(&conn);
         {
             let mut c = self.schemas.borrow_mut();
-            if !c.loading.insert(name.clone()) {
+            if !c.loading.insert(key.clone()) {
                 return;
             }
-            c.errors.remove(&name);
+            c.errors.remove(&key);
         }
-        let handles = self.slots.entry((path, name.clone())).or_insert_with(Slot::new).handles.clone();
-        let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &self.root, &name));
-        let handle = RT.spawn(schema_job(handles, conn, self.opts(), file));
+        let handles = self.slots.entry((path, name)).or_insert_with(Slot::new).handles.clone();
+        let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &self.root, &key));
+        let token = handles.token();
+        let handle = RT.spawn(schema_job(handles, conn, self.opts(), file, token));
         cx.spawn_in(window, async move |this, cx| {
             let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
             this.update(cx, |this, cx| {
                 let mut c = this.schemas.borrow_mut();
-                c.loading.remove(&name);
+                c.loading.remove(&key);
                 match r {
                     Ok(s) => {
-                        c.fresh.insert(name.clone());
-                        c.schemas.insert(name, Arc::new(s));
+                        c.fresh.insert(key.clone());
+                        c.schemas.insert(key, Arc::new(s));
                     }
                     Err(e) => {
-                        c.errors.insert(name, e.to_string());
+                        c.errors.insert(key, e.to_string());
                     }
                 }
                 drop(c);
@@ -584,7 +646,8 @@ impl Siesta {
             Err(e) => return window.push_notification(e, cx),
         };
         let handles = self.slots.entry((path, name)).or_insert_with(Slot::new).handles.clone();
-        let handle = RT.spawn(ddl_job(handles, conn, self.opts(), schema.to_string(), table.to_string()));
+        let token = handles.token();
+        let handle = RT.spawn(ddl_job(handles, conn, self.opts(), schema.to_string(), table.to_string(), token));
         let table = table.to_string();
         cx.spawn_in(window, async move |_, cx| {
             let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
@@ -600,8 +663,10 @@ impl Siesta {
         .detach();
     }
 
-    /// Closing a file with an open transaction: Commit / Rollback / Cancel, then the close goes on.
-    pub(crate) fn ask_transaction(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// A file with an open transaction is about to lose its session (close, Disconnect): Commit /
+    /// Rollback / Cancel. Commit and Rollback close the sessions with that statement and then run
+    /// `then`; Cancel runs nothing.
+    pub(crate) fn ask_transaction(&mut self, path: PathBuf, then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
         let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -613,19 +678,52 @@ impl Siesta {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(answer) = answer.await else { return };
             this.update_in(cx, |this, window, cx| {
-                let finish = match answer {
-                    0 => "COMMIT",
-                    1 => "ROLLBACK",
-                    _ => return,
-                };
+                let Some(finish) = finish_statement(answer) else { return };
                 this.close_sessions(&path, Some(finish));
-                if let Some(ix) = this.docs.iter().position(|d| *d.path == path) {
-                    this.close(ix, window, cx);
-                }
+                then(this, window, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Quit with open transactions: one Commit / Rollback / Cancel for all of them. The sessions
+    /// are closed (and the statement has run) before the app exits.
+    pub(crate) fn quit_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.paths_in_tx();
+        if open.is_empty() {
+            return cx.quit();
+        }
+        let names: Vec<String> = open.iter().map(|p| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).collect();
+        let message = match names.len() {
+            1 => format!("{} has an open transaction", names[0]),
+            n => format!("{n} files have an open transaction"),
+        };
+        let detail = (names.len() > 1).then(|| names.join("\n"));
+        let answer = window.prompt(PromptLevel::Warning, &message, detail.as_deref().or(Some("Commit or roll it back before quitting?")), &["Commit", "Rollback", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = answer.await else { return };
+            let Some(finish) = finish_statement(answer) else { return };
+            let Ok(closing) = this.update(cx, |this, _| open.iter().flat_map(|p| this.close_sessions(p, Some(finish))).collect::<Vec<_>>()) else { return };
+            // Wait (at most a few seconds) for COMMIT / ROLLBACK to reach the server.
+            let wait = RT.spawn(async move {
+                for h in closing {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+                }
+            });
+            let _ = wait.await;
+            this.update(cx, |_, cx| cx.quit()).ok();
+        })
+        .detach();
+    }
+}
+
+/// The prompt's answer (`Commit`, `Rollback`, `Cancel`) as the statement that ends the transaction.
+fn finish_statement(answer: usize) -> Option<&'static str> {
+    match answer {
+        0 => Some("COMMIT"),
+        1 => Some("ROLLBACK"),
+        _ => None,
     }
 }
 
@@ -633,11 +731,75 @@ impl Siesta {
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
     use super::{Spec, needs_confirm, selection_specs};
+    // (the modules `super::Handles` etc. are named where used)
     use siesta_settings::ConfirmDestructive;
     use sql_split::{Dialect, Kind};
 
     fn spec(text: &str, confirm: bool) -> Spec {
-        Spec { text: text.into(), kind: Kind::Other, page_size: None, confirm }
+        Spec { text: text.into(), kind: Kind::Other, page_size: None, confirm, range: None }
+    }
+
+    fn fake_conn() -> db_conn::Connection {
+        // Nothing listens there: a job that tried to connect would fail loudly.
+        db_conn::Connection {
+            name: "t".into(),
+            driver: db_conn::Driver::Postgres,
+            url: Some("postgres://nobody@127.0.0.1:1/none".into()),
+            host: None,
+            port: None,
+            database: None,
+            user: None,
+            password: None,
+            ssl: Default::default(),
+            read_only: false,
+            schema: None,
+            init_sql: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn cancel_invalidates_queued_runs_without_running_them() {
+        use super::{Handles, Opts, Stmt, run_job};
+        let (h, rt) = (Handles::new(), &*super::RT);
+        let opts = Opts { stop_on_error: true, timeout_ms: None, max_rows: 10 };
+        let stmts = || vec![Stmt { text: "SELECT 1".into(), kind: Kind::Query, page: Default::default(), range: None }];
+        // A run holds the session; a second one queues behind it.
+        let running = rt.block_on(h.session.clone().lock_owned());
+        let queued = rt.spawn(run_job(h.clone(), fake_conn(), stmts(), opts, h.token()));
+        // Esc (or closing the file) while it waits, then the first run ends.
+        h.invalidate();
+        drop(running);
+        let r = rt.block_on(queued).unwrap();
+        assert!(r.skipped && !r.live, "the queued run must not execute (or even connect)");
+        assert_eq!(r.results.len(), 1);
+        assert_eq!(r.results[0].as_ref().unwrap_err().message, "Cancelled");
+        assert!(h.session.try_lock().unwrap().is_none(), "no session was opened for it");
+        // A run started after the cancel is a new generation.
+        assert!(h.valid(h.token()));
+        let r = rt.block_on(run_job(h.clone(), fake_conn(), stmts(), opts, h.token()));
+        assert!(!r.skipped, "a fresh run is not cancelled: it tries to connect (and fails here)");
+    }
+
+    #[test]
+    fn transaction_prompt_answers() {
+        use super::finish_statement;
+        // Commit / Rollback end the transaction before the session closes; Cancel (and a dismissed prompt) keep everything.
+        assert_eq!([finish_statement(0), finish_statement(1), finish_statement(2), finish_statement(9)], [Some("COMMIT"), Some("ROLLBACK"), None, None]);
+    }
+
+    #[test]
+    fn error_is_underlined_at_its_own_statement() {
+        use super::statement_start;
+        let src = "SELECT 1;\nSELEC 2;\nSELEC 2;\n";
+        let (a, b) = (10..17, 19..26);
+        assert_eq!(&src[a.clone()], "SELEC 2");
+        assert_eq!(statement_start(src, "SELEC 2", Some(b.clone())), Some(19)); // the second copy
+        assert_eq!(statement_start(src, "SELEC 2", Some(a)), Some(10));
+        // The text moved since the run: the first copy is the best guess.
+        assert_eq!(statement_start(src, "SELEC 2", Some(0..7)), Some(10));
+        assert_eq!(statement_start(src, "SELEC 2", None), Some(10));
+        assert_eq!(statement_start(src, "nope", Some(b)), None);
     }
 
     #[test]
@@ -676,7 +838,7 @@ mod tests {
             color: None,
         };
         let opts = Opts { stop_on_error: true, timeout_ms: Some(5000), max_rows: 1000 };
-        let stmt = |text: &str, kind| Stmt { text: text.into(), kind, page: db_exec::Page { size: 2, ..Default::default() } };
+        let stmt = |text: &str, kind| Stmt { text: text.into(), kind, page: db_exec::Page { size: 2, ..Default::default() }, range: None };
         let slot = Slot::new();
         let h = slot.handles.clone();
         let rt = &*super::RT;
@@ -686,6 +848,7 @@ mod tests {
             conn.clone(),
             vec![stmt("SHOW statement_timeout", Kind::Read), stmt("SELECT g FROM generate_series(1, 5) g", Kind::Query), stmt("SELEC 1", Kind::Other), stmt("SELECT 1", Kind::Query)],
             opts,
+            h.token(),
         ));
         assert!(r.live);
         assert_eq!(r.results.len(), 3); // stopped at the error
@@ -694,19 +857,27 @@ mod tests {
         assert_eq!((page.rows.len(), page.has_more), (2, true));
         assert_eq!(r.results[2].as_ref().unwrap_err().position, Some(1)); // `SELEC` is at character 1
         // The same session keeps its state; count runs on it too.
-        let n = rt.block_on(count_job(h.clone(), conn.clone(), "SELECT g FROM generate_series(1, 5) g".into(), vec![("g".into(), ">2".into())], opts));
+        let n = rt.block_on(count_job(h.clone(), conn.clone(), "SELECT g FROM generate_series(1, 5) g".into(), vec![("g".into(), ">2".into())], opts, h.token()));
         assert_eq!(n.unwrap(), 3);
         // Cancel from outside while a statement runs: it fails with 57014 and the session survives.
         let cancel = h.cancel.lock().unwrap().clone().unwrap();
-        let slow = rt.spawn(run_job(h.clone(), conn.clone(), vec![stmt("SELECT pg_sleep(4)", Kind::Other)], Opts { timeout_ms: None, ..opts }));
+        let slow = rt.spawn(run_job(h.clone(), conn.clone(), vec![stmt("SELECT pg_sleep(4)", Kind::Other)], Opts { timeout_ms: None, ..opts }, h.token()));
         rt.block_on(async {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             cancel.cancel().await.unwrap();
         });
         let r = rt.block_on(slow).unwrap();
         assert_eq!(r.results[0].as_ref().unwrap_err().code.as_deref(), Some("57014"));
-        let r = rt.block_on(run_job(h, conn, vec![stmt("SELECT 1", Kind::Query)], opts));
+        let r = rt.block_on(run_job(h.clone(), conn.clone(), vec![stmt("SELECT 1", Kind::Query)], opts, h.token()));
         assert!(r.results[0].is_ok());
+        // Esc while a batch runs: the rest of it is not executed.
+        let batch = rt.spawn(run_job(h.clone(), conn.clone(), vec![stmt("SELECT pg_sleep(1)", Kind::Other), stmt("SELECT 2", Kind::Query)], Opts { timeout_ms: None, ..opts }, h.token()));
+        rt.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        h.invalidate();
+        let r = rt.block_on(batch).unwrap();
+        assert_eq!(r.results.len(), 1);
     }
 
     #[test]
@@ -714,6 +885,9 @@ mod tests {
         let src = "SELECT 1;\nSELECT 2; SELECT 3;\n";
         let got = selection_specs(src, 10..src.len(), Dialect::Postgres);
         assert_eq!(got.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), ["SELECT 2", "SELECT 3"]);
+        // Ranges are in the whole file, not in the selection.
+        assert_eq!(got.iter().map(|s| s.range.clone().unwrap()).collect::<Vec<_>>(), [10..18, 20..28]);
+        assert!(got.iter().all(|s| src[s.range.clone().unwrap()] == s.text));
         assert!(selection_specs(src, 0..0, Dialect::Postgres).is_empty());
     }
 }

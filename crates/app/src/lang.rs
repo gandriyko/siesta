@@ -15,6 +15,7 @@ use crate::schema_cache::Shared;
 /// What the provider needs besides the text; the doc updates it when its connection changes.
 pub struct Ctx {
     pub dialect: Dialect,
+    /// Schema cache key of the file's connection (`schema_cache::key`).
     pub connection: Option<String>,
     /// Tables of this schema are written without a prefix.
     pub default_schema: Option<String>,

@@ -13,6 +13,8 @@ mod wrap;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use db_conn::{Connection, Driver, SslMode};
@@ -42,6 +44,10 @@ pub struct Column {
 pub struct Outcome {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Value>>,
+    /// The server paged this query (wrapper or appended `LIMIT`); `false` for statements that
+    /// cannot be paged, and for queries run unwrapped because their column names repeat
+    /// (sorting and filters are then local or off, see `notices`).
+    pub wrapped: bool,
     /// Wrapped queries only: a row beyond the page exists.
     pub has_more: bool,
     /// Unwrapped statements only: rows were cut at `max_rows`.
@@ -69,6 +75,8 @@ pub struct DbError {
     pub position: Option<usize>,
     /// The connection is gone (I/O error, server shutdown / terminate).
     pub connection_lost: bool,
+    /// Refused by siesta itself, not sent (the `read_only` guard).
+    pub refused: bool,
 }
 
 impl fmt::Display for DbError {
@@ -125,24 +133,30 @@ enum Opts {
 
 /// Cancels the running statement of a session from a separate short connection.
 /// The session stays usable (the cancelled run fails with SQLSTATE `57014` / `70100`).
+/// It follows the session's live connection: after an automatic reconnect it targets the new
+/// backend, and while the connection is being reopened it does nothing (the old id may be reused).
 #[derive(Clone)]
 pub struct CancelHandle {
     opts: std::sync::Arc<Opts>,
-    backend_id: u64,
+    backend_id: Arc<AtomicU64>,
 }
 
 impl CancelHandle {
     pub async fn cancel(&self) -> Result<(), DbError> {
+        let id = self.backend_id.load(Ordering::SeqCst);
+        if id == 0 {
+            return Ok(());
+        }
         let e = |e| DbError::from_sqlx(e, 0, 0);
         match &*self.opts {
             Opts::Pg(o) => {
                 let mut c = PgConnection::connect_with(o).await.map_err(e)?;
-                sqlx::query("SELECT pg_cancel_backend($1)").bind(self.backend_id as i32).execute(&mut c).await.map_err(e)?;
+                sqlx::query("SELECT pg_cancel_backend($1)").bind(id as i32).execute(&mut c).await.map_err(e)?;
                 let _ = c.close().await;
             }
             Opts::My(o) => {
                 let mut c = MySqlConnection::connect_with(o).await.map_err(e)?;
-                sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {}", self.backend_id))).execute(&mut c).await.map_err(e)?;
+                sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {id}"))).execute(&mut c).await.map_err(e)?;
                 let _ = c.close().await;
             }
         }
@@ -154,8 +168,16 @@ pub struct Session {
     conn: Conn,
     opts: std::sync::Arc<Opts>,
     spec: Connection,
-    backend_id: u64,
+    /// Shared with the [`CancelHandle`]s; 0 while there is no live connection.
+    backend_id: Arc<AtomicU64>,
     in_tx: bool,
+    /// MySQL `SET autocommit = 0`: every statement belongs to an open transaction.
+    autocommit_off: bool,
+    /// MariaDB (not MySQL): it has `max_statement_time` instead of `max_execution_time`.
+    mariadb: bool,
+    /// Wanted statement timeout; `timeout_applied` is what the server has.
+    timeout_ms: Option<u64>,
+    timeout_applied: Option<u64>,
     pg_types: HashMap<u32, String>,
     /// Row cap for statements that cannot be wrapped (default [`MAX_ROWS`]).
     pub max_rows: usize,
@@ -270,15 +292,51 @@ impl Session {
                 (Conn::My(MySqlConnection::connect_with(&o).await.map_err(e)?), Opts::My(o))
             }
         };
-        let mut s = Session { conn, opts: opts.into(), spec: c.clone(), backend_id: 0, in_tx: false, pg_types: HashMap::new(), max_rows: MAX_ROWS };
+        let mut s = Session {
+            conn,
+            opts: opts.into(),
+            spec: c.clone(),
+            backend_id: Arc::new(AtomicU64::new(0)),
+            in_tx: false,
+            autocommit_off: false,
+            mariadb: false,
+            timeout_ms: None,
+            timeout_applied: None,
+            pg_types: HashMap::new(),
+            max_rows: MAX_ROWS,
+        };
         s.init().await.map_err(e)?;
         Ok(s)
+    }
+
+    /// The statement timeout of this session (`None` = none), applied now and again after a
+    /// reconnect: Postgres `statement_timeout`, MySQL `max_execution_time` (SELECT only),
+    /// MariaDB `max_statement_time`.
+    pub async fn set_statement_timeout(&mut self, ms: Option<u64>) -> Result<(), DbError> {
+        self.timeout_ms = ms;
+        self.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))
+    }
+
+    async fn apply_timeout(&mut self) -> SqlxResult<()> {
+        if self.timeout_applied == self.timeout_ms {
+            return Ok(());
+        }
+        let ms = self.timeout_ms.unwrap_or(0);
+        let sql = match (&self.conn, self.mariadb) {
+            (Conn::Pg(_), _) => format!("SET statement_timeout = {ms}"),
+            (Conn::My(_), false) => format!("SET SESSION max_execution_time = {ms}"),
+            // Seconds, fractions allowed.
+            (Conn::My(_), true) => format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0),
+        };
+        self.simple(&sql).await?;
+        self.timeout_applied = self.timeout_ms;
+        Ok(())
     }
 
     async fn init(&mut self) -> SqlxResult<()> {
         match &mut self.conn {
             Conn::Pg(c) => {
-                self.backend_id = sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut *c).await?.try_get::<i32, _>(0)? as u64;
+                self.backend_id.store(sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut *c).await?.try_get::<i32, _>(0)? as u64, Ordering::SeqCst);
                 if let Some(s) = &self.spec.schema {
                     sqlx::query("SELECT set_config('search_path', $1, false)").bind(s).execute(&mut *c).await?;
                 }
@@ -287,7 +345,9 @@ impl Session {
                 }
             }
             Conn::My(c) => {
-                self.backend_id = sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut *c).await?.try_get::<u64, _>(0)?;
+                self.backend_id.store(sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut *c).await?.try_get::<u64, _>(0)?, Ordering::SeqCst);
+                let version = sqlx::query("SELECT VERSION()").fetch_one(&mut *c).await?.try_get::<String, _>(0)?;
+                self.mariadb = version.to_ascii_lowercase().contains("mariadb");
                 if self.spec.read_only {
                     sqlx::raw_sql("SET SESSION TRANSACTION READ ONLY").execute(&mut *c).await?;
                 }
@@ -305,9 +365,13 @@ impl Session {
     async fn simple(&mut self, sql: &str) -> SqlxResult<()> {
         let q = sqlx::raw_sql(AssertSqlSafe(sql.to_string()));
         match &mut self.conn {
-            Conn::Pg(c) => q.execute(c).await.map(drop),
-            Conn::My(c) => q.execute(c).await.map(drop),
+            Conn::Pg(c) => q.execute(c).await.map(drop)?,
+            Conn::My(c) => q.execute(c).await.map(drop)?,
         }
+        if let Some(on) = autocommit_setting(sql, self.dialect()) {
+            self.autocommit_off = !on;
+        }
+        Ok(())
     }
 
     pub fn dialect(&self) -> Dialect {
@@ -316,17 +380,32 @@ impl Session {
 
     /// `pg_backend_pid()` / `CONNECTION_ID()` of the current connection.
     pub fn backend_id(&self) -> u64 {
-        self.backend_id
+        self.backend_id.load(Ordering::SeqCst)
     }
 
     /// An open transaction, tracked from the executed `BEGIN` / `COMMIT` / `ROLLBACK`
-    /// statements (sqlx does not expose the server's transaction state).
+    /// statements (sqlx does not expose the server's transaction state). MySQL with
+    /// `autocommit = 0` is always in one.
     pub fn in_transaction(&self) -> bool {
-        self.in_tx
+        self.in_tx || self.autocommit_off
     }
 
     pub fn cancel_handle(&self) -> CancelHandle {
-        CancelHandle { opts: self.opts.clone(), backend_id: self.backend_id }
+        CancelHandle { opts: self.opts.clone(), backend_id: self.backend_id.clone() }
+    }
+
+    /// Replaces a dead connection with a new one: same settings, same cancel handles.
+    async fn reopen(&mut self) -> Result<(), DbError> {
+        let shared = self.backend_id.clone();
+        shared.store(0, Ordering::SeqCst); // a cancel must not hit a reused id
+        let mut new = Session::open(&self.spec.clone()).await?;
+        new.max_rows = self.max_rows;
+        new.timeout_ms = self.timeout_ms;
+        new.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
+        shared.store(new.backend_id(), Ordering::SeqCst);
+        new.backend_id = shared;
+        *self = new;
+        Ok(())
     }
 
     pub async fn close(self) {
@@ -339,12 +418,18 @@ impl Session {
     /// Runs one statement (or, for unwrapped kinds, a script). If the connection turned out to be
     /// dead it is reopened once and the statement rerun, with a notice that session state was lost.
     pub async fn run(&mut self, sql: &str, kind: Kind, page: &Page) -> Result<Outcome, DbError> {
+        if self.spec.read_only && read_write_switch(sql, self.dialect()) {
+            return Err(DbError {
+                message: "Refused on a read_only connection: the statement switches the session to read-write. \
+                          read_only is a safety default of the session, not a security boundary; use a read-only database user for real protection."
+                    .into(),
+                refused: true,
+                ..Default::default()
+            });
+        }
         match self.run_once(sql, kind, page).await {
             Err(e) if e.connection_lost => {
-                let spec = self.spec.clone();
-                let max_rows = self.max_rows;
-                *self = Session::open(&spec).await?;
-                self.max_rows = max_rows;
+                self.reopen().await?;
                 if kind == Kind::Other {
                     // The statement may have run before the connection died: never rerun it blindly.
                     return Err(DbError {
@@ -364,7 +449,11 @@ impl Session {
     /// `SELECT count(*)` over the same statement and filters (no paging).
     pub async fn count(&mut self, sql: &str, filters: &[(String, String)]) -> Result<u64, DbError> {
         let d = self.dialect();
-        let cols = if filters.iter().any(|f| !f.1.trim().is_empty()) { self.columns_of(strip(sql)).await? } else { Vec::new() };
+        let filtered = filters.iter().any(|f| wrap::parse_filter(&f.1).is_some());
+        let cols = if filtered || d == Dialect::MySql { self.columns_of(strip(sql)).await? } else { Vec::new() };
+        if let Some(c) = wrap::duplicate_column(&cols, d).filter(|_| d == Dialect::MySql || filtered) {
+            return Err(DbError::msg(format!("Cannot count: the column name `{c}` repeats; alias the columns of the statement")));
+        }
         let w = wrap::build_count(sql, d, filters, &cols);
         let types = (d == Dialect::Postgres).then(|| vec!["int8".to_string()]);
         let raw = self.fetch(&w.sql, &w.params, types.as_deref(), None, 1, false).await.map_err(|e| DbError::from_sqlx(e, w.prefix_chars, w.inner_chars))?;
@@ -377,10 +466,25 @@ impl Session {
     async fn run_once(&mut self, sql: &str, kind: Kind, page: &Page) -> Result<Outcome, DbError> {
         let started = Instant::now();
         let d = self.dialect();
-        let (exec_sql, params, prefix, len, known, limit) = if kind == Kind::Query {
-            let cols = if page.filters.iter().any(|f| !f.1.trim().is_empty()) { self.columns_of(strip(sql)).await? } else { Vec::new() };
-            let w = wrap::build(sql, d, page, &cols);
-            (w.sql, w.params, w.prefix_chars, w.inner_chars, (!cols.is_empty()).then_some(cols), page.size as usize + 1)
+        let mut notices = Vec::new();
+        let mut wrapped = kind == Kind::Query;
+        let (exec_sql, params, prefix, len, known, limit) = if wrapped {
+            // Columns are needed for filters, and (MySQL) to see repeated names before wrapping.
+            let need_cols = wrap::has_filters(page) || !page.sort.is_empty() || (d == Dialect::MySql && !wrap::appends(sql, d, page));
+            let cols = if need_cols { self.columns_of(strip(sql)).await? } else { Vec::new() };
+            match wrap::duplicate_column(&cols, d).map(str::to_string).filter(|_| need_cols && !wrap::appends(sql, d, page)) {
+                // `SELECT * FROM a JOIN b` with two `id`s cannot be a derived table (MySQL) and its
+                // filters / sort would be ambiguous: run it as it is, like an unwrappable statement.
+                Some(dup) => {
+                    wrapped = false;
+                    notices.push(format!("The column name `{dup}` repeats, so the statement runs unwrapped: rows are cut at results.max_rows, sorting is local, filters are off. Alias the columns for server-side paging."));
+                    (sql.to_string(), Vec::new(), 0, usize::MAX - 1, None, self.max_rows)
+                }
+                None => {
+                    let w = wrap::build(sql, d, page, &cols);
+                    (w.sql, w.params, w.prefix_chars, w.inner_chars, (!cols.is_empty()).then_some(cols), page.size as usize + 1)
+                }
+            }
         } else {
             (sql.to_string(), Vec::new(), 0, usize::MAX - 1, None, self.max_rows)
         };
@@ -391,30 +495,36 @@ impl Session {
             .await
             .map_err(|e| DbError::from_sqlx(e, prefix, len))?;
         let mut has_more = false;
-        if kind == Kind::Query {
+        if wrapped {
             has_more = raw.rows.len() > page.size as usize;
             raw.rows.truncate(page.size as usize);
             raw.truncated = false;
         }
-        let mut notices = Vec::new();
+        if raw.extra_sets > 0 {
+            notices.push(format!("{} more result set{} not shown", raw.extra_sets, if raw.extra_sets == 1 { "" } else { "s" }));
+        }
         if kind == Kind::Other && d == Dialect::MySql {
-            notices = self.mysql_warnings().await;
+            notices.extend(self.mysql_warnings().await);
         }
         // MariaDB reports 0 affected rows for `DELETE … RETURNING`: the returned rows are the count.
         if d == Dialect::MySql && raw.affected == 0 {
             raw.affected = raw.rows.len() as u64;
         }
         self.in_tx = tx_state(self.in_tx, sql, d);
+        if let Some(on) = autocommit_setting(sql, d) {
+            self.autocommit_off = !on;
+        }
         Ok(Outcome {
             columns: raw.columns,
             rows: raw.rows,
+            wrapped,
             has_more,
             truncated: raw.truncated,
             rows_affected: (kind == Kind::Other).then_some(raw.affected),
             notices,
             executed_sql: exec_sql,
             params,
-            in_transaction: self.in_tx,
+            in_transaction: self.in_transaction(),
             duration: started.elapsed(),
         })
     }
@@ -472,7 +582,7 @@ impl Session {
                     // Prepared statements are used for filtered pages only: one statement, rows only.
                     params.iter().fold(sqlx::query(AssertSqlSafe(sql.to_string())), |q, p| q.bind(p.clone())).fetch(&mut *c).map(|r| r.map(Either::Right)).boxed()
                 };
-                let (rows, affected, truncated) = drain(stream, limit, |q| q.rows_affected()).await?;
+                let (rows, affected, truncated, extra_sets) = drain(stream, limit, |q| q.rows_affected()).await?;
                 let meta: Vec<(String, String, Option<u32>)> = match (rows.first(), known) {
                     (_, Some(k)) => k.iter().map(|c| (c.name.clone(), c.type_name.clone(), None)).collect(),
                     (Some(r), None) => r.columns().iter().map(|c| (c.name().to_string(), pg_name(c.type_info()), c.type_info().oid().map(|o| o.0))).collect(),
@@ -501,7 +611,7 @@ impl Session {
                             .collect()
                     })
                     .collect();
-                Ok(Raw { columns, rows, affected, truncated })
+                Ok(Raw { columns, rows, affected, truncated, extra_sets })
             }
             Conn::My(c) => {
                 let stream = if params.is_empty() {
@@ -509,7 +619,7 @@ impl Session {
                 } else {
                     params.iter().fold(sqlx::query(AssertSqlSafe(sql.to_string())), |q, p| q.bind(p.clone())).fetch(&mut *c).map(|r| r.map(Either::Right)).boxed()
                 };
-                let (rows, affected, truncated) = drain(stream, limit, |q| q.rows_affected()).await?;
+                let (rows, affected, truncated, extra_sets) = drain(stream, limit, |q| q.rows_affected()).await?;
                 let columns: Vec<Column> = match rows.first() {
                     Some(r) => r.columns().iter().map(|c| Column { name: c.name().to_string(), type_name: c.type_info().name().to_string() }).collect(),
                     None if describe_empty => match c.prepare(sql_str(sql)).await {
@@ -519,7 +629,7 @@ impl Session {
                     None => Vec::new(),
                 };
                 let rows = rows.iter().map(|r| columns.iter().enumerate().map(|(i, c)| my_value(r, i, &c.type_name)).collect()).collect();
-                Ok(Raw { columns, rows, affected, truncated })
+                Ok(Raw { columns, rows, affected, truncated, extra_sets })
             }
         }
     }
@@ -542,24 +652,38 @@ struct Raw {
     rows: Vec<Vec<Value>>,
     affected: u64,
     truncated: bool,
+    /// Result sets with rows after the first one (they are dropped).
+    extra_sets: usize,
 }
 
-/// Collects rows up to `limit`; a further row sets `truncated` and stops reading (sqlx drains
-/// the rest of the result before the connection's next use).
-async fn drain<Q, R>(mut s: impl Stream<Item = SqlxResult<Either<Q, R>>> + Unpin, limit: usize, affected: impl Fn(&Q) -> u64) -> SqlxResult<(Vec<R>, u64, bool)> {
+/// Collects the rows of the first result set up to `limit`; a further row sets `truncated` and
+/// stops reading (sqlx drains the rest of the result before the connection's next use). Rows of
+/// later sets (`CALL p()`, several statements in one run) have other columns and are dropped,
+/// the sets are counted.
+async fn drain<Q, R>(mut s: impl Stream<Item = SqlxResult<Either<Q, R>>> + Unpin, limit: usize, affected: impl Fn(&Q) -> u64) -> SqlxResult<(Vec<R>, u64, bool, usize)> {
     let (mut rows, mut n, mut truncated) = (Vec::new(), 0, false);
+    // `Left` closes a result set. `first_closed`: the first set with rows is over.
+    let (mut first_closed, mut in_extra, mut extra) = (false, false, 0);
     while let Some(item) = s.next().await {
         match item? {
-            Either::Left(q) => n += affected(&q),
-            Either::Right(r) if rows.len() >= limit => {
-                let _ = r;
+            Either::Left(q) => {
+                n += affected(&q);
+                first_closed |= !rows.is_empty();
+                in_extra = false;
+            }
+            Either::Right(_) if first_closed => {
+                if !std::mem::replace(&mut in_extra, true) {
+                    extra += 1;
+                }
+            }
+            Either::Right(_) if rows.len() >= limit => {
                 truncated = true;
                 break;
             }
             Either::Right(r) => rows.push(r),
         }
     }
-    Ok((rows, n, truncated))
+    Ok((rows, n, truncated, extra))
 }
 
 fn pg_name(t: &sqlx::postgres::PgTypeInfo) -> String {
@@ -639,9 +763,119 @@ pub(crate) fn tx_state(mut in_tx: bool, sql: &str, d: Dialect) -> bool {
     in_tx
 }
 
+/// `Some(true)` / `Some(false)` when `sql` (MySQL) turns `autocommit` on / off.
+pub(crate) fn autocommit_setting(sql: &str, d: Dialect) -> Option<bool> {
+    if d != Dialect::MySql {
+        return None;
+    }
+    let mut out = None;
+    for st in sql_split::split(sql, d).statements {
+        let text = st.text(sql).to_ascii_uppercase();
+        let w: Vec<&str> = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+        if w.first() != Some(&"SET") {
+            continue;
+        }
+        if let Some(i) = w.iter().position(|x| *x == "AUTOCOMMIT") {
+            match w.get(i + 1) {
+                Some(&"0" | &"OFF" | &"FALSE") => out = Some(false),
+                Some(&"1" | &"ON" | &"TRUE") => out = Some(true),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// A statement that would lift the session's read-only state (the cheap guard behind
+/// `read_only`): `BEGIN` / `START TRANSACTION` / `SET … TRANSACTION` `READ WRITE`,
+/// `SET [default_]transaction_read_only`, `SET SESSION CHARACTERISTICS … READ WRITE`,
+/// `RESET ALL` / `DISCARD ALL`, `set_config('…transaction_read_only', …)`.
+pub(crate) fn read_write_switch(sql: &str, d: Dialect) -> bool {
+    sql_split::split(sql, d).statements.iter().any(|st| {
+        let text = st.text(sql).to_ascii_lowercase();
+        let w: Vec<&str> = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+        let has = |x: &str| w.contains(&x);
+        let read_write = w.windows(2).any(|p| p == ["read", "write"]);
+        let ro_var = has("transaction_read_only") || has("default_transaction_read_only") || has("tx_read_only");
+        match w.first().copied() {
+            Some("begin" | "start") => read_write,
+            Some("set") => read_write || ro_var,
+            Some("reset") => has("all") || ro_var,
+            Some("discard") => has("all"),
+            Some("select" | "with") => has("set_config") && ro_var,
+            _ => false,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Dialect::{MySql as MY, Postgres as PG};
+
+    #[test]
+    fn read_only_guard_refuses_read_write_switches() {
+        for (sql, d, want) in [
+            ("BEGIN READ WRITE", PG, true),
+            ("begin transaction isolation level serializable, read write", PG, true),
+            ("START TRANSACTION READ WRITE", MY, true),
+            ("SET TRANSACTION READ WRITE", PG, true),
+            ("SET SESSION TRANSACTION READ WRITE", MY, true),
+            ("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE", PG, true),
+            ("SET default_transaction_read_only = off", PG, true),
+            ("set transaction_read_only to off", PG, true),
+            ("SET SESSION transaction_read_only = 0", MY, true),
+            ("SET @@session.tx_read_only = 0", MY, true),
+            ("RESET ALL", PG, true),
+            ("RESET default_transaction_read_only", PG, true),
+            ("DISCARD ALL", PG, true),
+            ("SELECT set_config('default_transaction_read_only', 'off', false)", PG, true),
+            ("SELECT 1; BEGIN READ WRITE; DROP TABLE t", PG, true),
+            ("BEGIN", PG, false),
+            ("BEGIN READ ONLY", PG, false),
+            ("START TRANSACTION READ ONLY", MY, false),
+            ("SET search_path = a", PG, false),
+            ("SET TRANSACTION READ ONLY", PG, false),
+            ("RESET search_path", PG, false),
+            ("SHOW default_transaction_read_only", PG, false),
+            ("SELECT 'read write'", PG, false),
+            ("DROP TABLE t", PG, false),
+        ] {
+            assert_eq!(read_write_switch(sql, d), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn autocommit_is_tracked() {
+        for (sql, want) in [
+            ("SET autocommit = 0", Some(false)),
+            ("set SESSION autocommit=OFF", Some(false)),
+            ("SET @@autocommit = 1", Some(true)),
+            ("SET @@session.autocommit = 0", Some(false)),
+            ("SET autocommit = 0; SET autocommit = 1", Some(true)),
+            ("SET names utf8mb4", None),
+            ("SELECT 'autocommit'", None),
+        ] {
+            assert_eq!(autocommit_setting(sql, MY), want, "{sql}");
+        }
+        assert_eq!(autocommit_setting("SET autocommit = 0", PG), None);
+    }
+
+    #[tokio::test]
+    async fn only_the_first_result_set_is_kept() {
+        use futures_util::stream;
+        let items = |v: Vec<Either<u64, i32>>| stream::iter(v.into_iter().map(Ok::<_, sqlx::Error>));
+        // rows 1,2 | rows 3 | rows 4,5 | OK
+        let s = items(vec![Either::Right(1), Either::Right(2), Either::Left(0), Either::Right(3), Either::Left(0), Either::Right(4), Either::Right(5), Either::Left(7)]);
+        let (rows, n, truncated, extra) = drain(s, 100, |q| *q).await.unwrap();
+        assert_eq!((rows, n, truncated, extra), (vec![1, 2], 7, false, 2));
+        // One set: nothing extra. A leading statement without rows (DML) is not a result set.
+        let s = items(vec![Either::Left(3), Either::Right(1), Either::Left(0)]);
+        assert_eq!(drain(s, 100, |q| *q).await.unwrap(), (vec![1], 3, false, 0));
+        // The row cap applies to the first set.
+        let s = items(vec![Either::Right(1), Either::Right(2), Either::Right(3), Either::Left(0)]);
+        assert_eq!(drain(s, 2, |q| *q).await.unwrap(), (vec![1, 2], 0, true, 0));
+    }
 
     #[test]
     fn transaction_tracking() {

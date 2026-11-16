@@ -167,11 +167,12 @@ impl Siesta {
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             view.update(cx, |this, cx| {
-                let dirty = this.docs.iter().any(|d| d.dirty);
-                if dirty {
+                // Unsaved files and open transactions both need an answer first.
+                let busy = this.docs.iter().any(|d| d.dirty) || !this.paths_in_tx().is_empty();
+                if busy {
                     this.confirm_quit(window, cx);
                 }
-                !dirty
+                !busy
             })
             .unwrap_or(true)
         });
@@ -503,8 +504,8 @@ impl Siesta {
                             d.dirty = true;
                             d.reparse(cx);
                             // `-- @connection` may have just changed.
-                            if let Some(c) = d.connection().map(str::to_string) {
-                                this.load_cached_schema(&c);
+                            if let Some(key) = d.schema_key() {
+                                this.load_cached_schema(&key);
                             }
                         }
                     }),
@@ -521,8 +522,8 @@ impl Siesta {
                 let picked = self.picks.get(&path).cloned().flatten();
                 self.docs.push(Doc::new(path.clone(), editor, Arc::new(conns), picked, self.schemas.clone(), subs, cx));
                 let ix = self.docs.len() - 1;
-                if let Some(c) = self.docs[ix].connection().map(str::to_string) {
-                    self.load_cached_schema(&c);
+                if let Some(key) = self.docs[ix].schema_key() {
+                    self.load_cached_schema(&key);
                 }
                 ix
             }
@@ -590,8 +591,8 @@ impl Siesta {
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dirty: Vec<String> = self.docs.iter().filter(|d| d.dirty).map(|d| d.name()).collect();
         if dirty.is_empty() {
-            cx.quit();
-            return;
+            // Nothing unsaved: only open transactions can still stop the quit.
+            return self.quit_checked(window, cx);
         }
         let message = match dirty.len() {
             1 => format!("Save changes to {} before quitting?", dirty[0]),
@@ -606,10 +607,10 @@ impl Siesta {
                     let all_saved = (0..this.docs.len()).filter(|&ix| this.docs[ix].dirty).collect::<Vec<_>>().into_iter().all(|ix| this.save_doc(ix, window, cx));
                     // A failed save (shown as a notification) keeps the app open.
                     if all_saved {
-                        cx.quit();
+                        this.quit_checked(window, cx);
                     }
                 }
-                1 => cx.quit(),
+                1 => this.quit_checked(window, cx),
                 _ => {}
             })
             .ok();
@@ -672,13 +673,26 @@ impl Siesta {
             window.push_notification(msg, cx);
             return;
         }
-        // An open transaction: Commit / Rollback / Cancel first; the answer closes the file again.
-        if self.in_tx(&d.path.clone()) {
-            let path = (*d.path).clone();
-            self.close_armed = None;
-            return self.ask_transaction(path, window, cx);
-        }
+        let path = (*d.path).clone();
         self.close_armed = None;
+        // An open transaction: Commit / Rollback / Cancel first. The unsaved-changes question has
+        // been answered by now, so the answer closes the file without asking it again.
+        if self.in_tx(&path) {
+            let then = {
+                let path = path.clone();
+                move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    if let Some(ix) = this.docs.iter().position(|d| *d.path == path) {
+                        this.close_now(ix, window, cx);
+                    }
+                }
+            };
+            return self.ask_transaction(path, then, window, cx);
+        }
+        self.close_now(ix, window, cx);
+    }
+
+    /// Closes tab `ix` for good: its sessions, results and outline go with it.
+    fn close_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let path = (*self.docs.remove(ix).path).clone();
         self.close_sessions(&path, None);
         self.store.entries.retain(|k, _| k.0 != path);
@@ -730,8 +744,8 @@ impl Siesta {
         self.picks.insert((*self.docs[ix].path).clone(), name.clone());
         self.docs[ix].picked = name;
         self.docs[ix].reparse(cx);
-        if let Some(c) = self.docs[ix].connection().map(str::to_string) {
-            self.load_cached_schema(&c);
+        if let Some(key) = self.docs[ix].schema_key() {
+            self.load_cached_schema(&key);
         }
         self.remember(cx);
         cx.notify();
@@ -1319,12 +1333,14 @@ mod tests {
             text: text.into(),
             kind: sql_split::Kind::Query,
             page: db_exec::Page::default(),
+            range: None,
             conn: "dev".into(),
             color: None,
             driver: db_conn::Driver::Postgres,
             result: Ok(db_exec::Outcome {
                 columns: cols.iter().map(|(n, t)| db_exec::Column { name: n.to_string(), type_name: t.to_string() }).collect(),
                 rows,
+                wrapped: true,
                 has_more,
                 truncated: false,
                 rows_affected: None,
@@ -1565,11 +1581,17 @@ mod tests {
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.select_connection(Some("dev".into()), window, cx);
-                this.schemas.borrow_mut().schemas.insert("dev".into(), std::sync::Arc::new(demo_schema()));
+                let key = this.doc().unwrap().schema_key().unwrap();
+                this.schemas.borrow_mut().schemas.insert(key, std::sync::Arc::new(demo_schema()));
             })
         });
         // The tree: `public` is the default schema, both are listed.
-        let rows = cx.update(|_, cx| app.update(cx, |this, _| crate::dbtab::rows(&this.schemas.borrow().schemas["dev"], "", &this.db_toggled)));
+        let rows = cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                let key = this.doc().unwrap().schema_key().unwrap();
+                crate::dbtab::rows(&this.schemas.borrow().schemas[&key], "", &this.db_toggled)
+            })
+        });
         assert_eq!(rows.len(), 4);
         // The cursor is on the first statement: the new one goes right below it and becomes the active one.
         let ok = cx.update(|window, cx| app.update(cx, |this, cx| this.insert_select("public", "users", window, cx)));
@@ -1610,7 +1632,8 @@ mod tests {
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.select_connection(Some("dev".into()), window, cx);
-                this.schemas.borrow_mut().schemas.insert("dev".into(), std::sync::Arc::new(demo_schema()));
+                let key = this.doc().unwrap().schema_key().unwrap();
+                this.schemas.borrow_mut().schemas.insert(key, std::sync::Arc::new(demo_schema()));
             })
         });
         let lang = cx.update(|_, cx| crate::lang::Lang(app.read(cx).doc().unwrap().lang.clone()));

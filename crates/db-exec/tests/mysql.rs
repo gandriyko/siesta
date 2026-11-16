@@ -64,7 +64,7 @@ async fn every_value_type() {
     assert_eq!(g("a_set").1, &Value::Text("p,q".into()));
     assert_eq!(g("a_bit"), ("BIT", &Value::Int(5)));
     assert_eq!(g("a_null"), ("INT", &Value::Null));
-    assert!(o.executed_sql.starts_with("SELECT * FROM (SELECT * FROM vt"));
+    assert!(o.executed_sql.starts_with("SELECT * FROM vt\nLIMIT 101"), "{}", o.executed_sql);
     // The same row through the filtered (prepared, binary protocol) path decodes identically.
     let filtered = run_page(&mut s, "SELECT * FROM vt", &page(&[("id", "=1"), ("a_varchar", "ELL")])).await;
     assert_eq!(filtered.rows, o.rows);
@@ -337,4 +337,141 @@ async fn bad_credentials_are_an_error_not_a_panic() {
     c.password = Some("wrong".into());
     let e = Session::open(&c).await.err().expect("must fail");
     assert!(!e.message.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn repeated_column_names_run_unwrapped() {
+    let mut s = open_my().await;
+    let join = "SELECT * FROM (SELECT 1 AS id, 'a' AS x) a JOIN (SELECT 1 AS id, 'b' AS y) b ON a.id = b.id";
+    // A plain page needs no wrapper: the LIMIT is appended.
+    let o = run(&mut s, join).await;
+    assert!(o.wrapped && o.notices.is_empty() && o.executed_sql.ends_with("LIMIT 101 OFFSET 0"), "{:?}", o.executed_sql);
+    assert_eq!(o.rows.len(), 1);
+    // Sort and filters would need `SELECT * FROM (…) q`, which MySQL refuses (42S21): unwrapped, with a note.
+    for p in [sorted(&[("id", true)]), page(&[("x", "a")])] {
+        let o = run_page(&mut s, join, &p).await;
+        assert!(!o.wrapped && !o.has_more, "{:?}", o.executed_sql);
+        assert_eq!(o.executed_sql, join);
+        assert_eq!(o.rows.len(), 1);
+        assert!(o.notices.iter().any(|n| n.contains("`id` repeats")), "{:?}", o.notices);
+    }
+    let e = s.count(join, &[]).await.unwrap_err();
+    assert!(e.message.contains("`id` repeats"), "{e:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn order_by_survives_paging() {
+    let mut s = open_my().await;
+    run(&mut s, "CREATE TEMPORARY TABLE ord (a INT)").await;
+    run(&mut s, "INSERT INTO ord VALUES (3), (1), (5), (2), (4)").await;
+    let p = |offset, size| Page { offset, size, ..Page::default() };
+    let sql = "SELECT a FROM ord ORDER BY a DESC";
+    // No filters, no sort: MariaDB would drop the ORDER BY of a derived table.
+    assert_eq!(ints(&run_page(&mut s, sql, &p(0, 3)).await), [5, 4, 3]);
+    assert_eq!(ints(&run_page(&mut s, sql, &p(3, 3)).await), [2, 1]);
+    // Filters wrap, and still keep the order.
+    let filtered = Page { filters: vec![("a".into(), ">1".into())], ..p(0, 3) };
+    assert_eq!(ints(&run_page(&mut s, sql, &filtered).await), [5, 4, 3]);
+    // The user's sort wins over the statement's.
+    let sorted = Page { sort: vec![("a".into(), false)], ..p(0, 3) };
+    assert_eq!(ints(&run_page(&mut s, sql, &sorted).await), [1, 2, 3]);
+    // A statement's own LIMIT is kept.
+    assert_eq!(ints(&run_page(&mut s, "SELECT a FROM ord ORDER BY a DESC LIMIT 4", &p(0, 2)).await), [5, 4]);
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn statement_timeout_is_applied_on_both_servers_and_after_reconnect() {
+    let mut s = open_my().await;
+    let mariadb = texts(&run(&mut s, "SELECT VERSION()").await)[0].to_lowercase().contains("mariadb");
+    let var = if mariadb { "@@max_statement_time" } else { "@@max_execution_time" };
+    // MariaDB counts seconds (1.5), MySQL milliseconds (1500).
+    let want = if mariadb { 1.5 } else { 1500.0 };
+    let num = |o: &db_exec::Outcome| texts(o)[0].parse::<f64>().unwrap();
+    s.set_statement_timeout(Some(1500)).await.unwrap();
+    assert_eq!(num(&run(&mut s, &format!("SELECT {var}")).await), want);
+    // A killed connection is reopened with the same timeout.
+    let old = s.backend_id();
+    let mut other = open_my().await;
+    run(&mut other, &format!("KILL CONNECTION {old}")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let o = run(&mut s, &format!("SELECT {var}")).await;
+    assert!(o.notices.iter().any(|n| n.contains("lost")), "{:?}", o.notices);
+    assert_eq!(num(&o), want);
+    if mariadb {
+        // MariaDB really stops the statement.
+        let e = try_run(&mut s, "SELECT SLEEP(5)").await.unwrap_err();
+        assert_eq!(e.code.as_deref(), Some("70100"), "{e:?}");
+    }
+    s.set_statement_timeout(None).await.unwrap();
+    assert_eq!(num(&run(&mut s, &format!("SELECT {var}")).await), 0.0);
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn only_the_first_of_several_result_sets_is_shown() {
+    let mut s = open_my().await;
+    let create = "CREATE PROCEDURE siesta_multi() BEGIN SELECT 1 AS a; SELECT 'x' AS b, 2 AS c; SELECT 3 AS d; END";
+    s.run("DROP PROCEDURE IF EXISTS siesta_multi", Kind::Other, &Page::default()).await.unwrap();
+    s.run(create, Kind::Other, &Page::default()).await.unwrap();
+    let o = run(&mut s, "CALL siesta_multi()").await;
+    assert_eq!(o.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert_eq!(ints(&o), [1]);
+    assert!(o.notices.contains(&"2 more result sets not shown".to_string()), "{:?}", o.notices);
+    s.run("DROP PROCEDURE siesta_multi", Kind::Other, &Page::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn read_only_refuses_switching_to_read_write() {
+    let mut s = open_my().await;
+    run(&mut s, "DROP TABLE IF EXISTS siesta_ro_guard").await;
+    run(&mut s, "CREATE TABLE siesta_ro_guard (a INT)").await;
+    let mut c = connection(MY);
+    c.read_only = true;
+    let mut ro = Session::open(&c).await.unwrap();
+    for sql in ["SET SESSION TRANSACTION READ WRITE", "START TRANSACTION READ WRITE", "SET @@session.tx_read_only = 0", "SET SESSION transaction_read_only = OFF"] {
+        let e = try_run(&mut ro, sql).await.unwrap_err();
+        assert!(e.refused && e.code.is_none() && e.message.contains("not a security boundary"), "{sql}: {e:?}");
+    }
+    // Still read-only afterwards.
+    let e = try_run(&mut ro, "INSERT INTO siesta_ro_guard VALUES (1)").await.unwrap_err();
+    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
+    run(&mut s, "DROP TABLE siesta_ro_guard").await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn autocommit_off_counts_as_a_transaction() {
+    let mut s = open_my().await;
+    assert!(run(&mut s, "SET autocommit = 0").await.in_transaction);
+    assert!(s.in_transaction());
+    assert!(run(&mut s, "SELECT 1").await.in_transaction);
+    assert!(!run(&mut s, "SET autocommit = 1").await.in_transaction);
+    assert!(!s.in_transaction());
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn cancel_handle_follows_the_reconnected_backend() {
+    let mut s = open_my().await;
+    let handle = s.cancel_handle(); // taken before the reconnect
+    let old = s.backend_id();
+    let mut other = open_my().await;
+    run(&mut other, &format!("KILL CONNECTION {old}")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    run(&mut s, "SELECT 1").await; // reconnects
+    assert_ne!(s.backend_id(), old);
+    let started = Instant::now();
+    let (res, cancelled) = tokio::join!(try_run(&mut s, "SELECT SLEEP(10)"), async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.cancel().await
+    });
+    cancelled.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    if let Err(e) = res {
+        assert_eq!(e.code.as_deref(), Some("70100"));
+    }
 }

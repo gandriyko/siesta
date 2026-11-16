@@ -12,7 +12,7 @@ use std::{
 
 use db_exec::Schema;
 
-/// Per connection name.
+/// Per connection [`key`].
 #[derive(Default)]
 pub struct Cache {
     pub schemas: HashMap<String, Arc<Schema>>,
@@ -20,13 +20,20 @@ pub struct Cache {
     pub errors: HashMap<String, String>,
     /// Read from the server in this run (the first live session does it once; "Refresh" again).
     pub fresh: HashSet<String>,
-    /// Names whose disk cache was already looked at.
+    /// Keys whose disk cache was already looked at.
     pub disk_tried: HashSet<String>,
 }
 
 pub type Shared = Rc<RefCell<Cache>>;
 
-/// `base/cache/<project>/<connection>.json`; names are made safe for a file name.
+/// The cache key of a connection, in memory and on disk: its name plus a hash of what it points at
+/// (driver, url, host, port, database, user), so the same name in two `siesta.json` files of a
+/// monorepo keeps two schemas.
+pub fn key(c: &db_conn::Connection) -> String {
+    format!("{}-{:016x}", c.name, c.fingerprint())
+}
+
+/// `base/cache/<project>/<key>.json`; names are made safe for a file name.
 pub fn path(base: &Path, root: &Path, connection: &str) -> PathBuf {
     let safe = |s: &str| {
         let s: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
@@ -54,6 +61,32 @@ pub fn save(path: &Path, schema: &Schema) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use db_exec::{ColumnInfo, Index, SchemaNode, Table, TableKind};
+
+    #[test]
+    fn same_name_different_server_is_a_different_key() {
+        let conn = |host: &str| db_conn::Connection {
+            name: "dev".into(),
+            driver: db_conn::Driver::Postgres,
+            url: None,
+            host: Some(host.into()),
+            port: None,
+            database: Some("app".into()),
+            user: None,
+            password: None,
+            ssl: Default::default(),
+            read_only: false,
+            schema: None,
+            init_sql: None,
+            color: None,
+        };
+        let (a, b) = (key(&conn("h1")), key(&conn("h2")));
+        assert_ne!(a, b);
+        assert_eq!(a, key(&conn("h1")));
+        assert!(a.starts_with("dev-"));
+        // Two files on disk, not one.
+        let base = Path::new("/b");
+        assert_ne!(path(base, Path::new("/w/p"), &a), path(base, Path::new("/w/p"), &b));
+    }
 
     #[test]
     fn round_trip_on_disk() {

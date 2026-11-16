@@ -39,7 +39,9 @@ pub struct ExecOpts {
     /// Skip the confirmation of `-- @confirm` and destructive statements on prod connections
     #[arg(long)]
     pub yes: bool,
-    /// Force the connection read-only (the server rejects writes)
+    /// Force the connection read-only: a safety default of the session (the server rejects writes,
+    /// siesta refuses switching to read-write), not a security boundary; use a read-only DB user
+    /// for real protection
     #[arg(long)]
     pub read_only: bool,
 }
@@ -174,9 +176,21 @@ pub(crate) fn find(src: &str, file: &SqlFile, addr: &str, path: &Path) -> Result
     })
 }
 
-/// Exit code of a failed statement: 2 when the connection is gone, 5 for an SQL error.
+/// Exit code of a failed statement: 2 when the connection is gone, 4 when siesta refused it
+/// (the `read_only` guard), 5 for an SQL error.
 pub(crate) fn sql_exit(e: &DbError) -> u8 {
-    if e.connection_lost { 2 } else { 5 }
+    if e.connection_lost {
+        2
+    } else if e.refused {
+        4
+    } else {
+        5
+    }
+}
+
+/// The exit code of a batch is the first error's (later errors, with `stop_on_error` off, keep it).
+fn first_exit(so_far: u8, e: &DbError) -> u8 {
+    if so_far == 0 { sql_exit(e) } else { so_far }
 }
 
 fn ask(question: &str) -> bool {
@@ -250,7 +264,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
         let result = rt.block_on(session.run(&j.text, j.kind, &page));
         let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, result: &result, max_rows: cap };
         if let Err(e) = &result {
-            exit = exit.max(sql_exit(e));
+            exit = first_exit(exit, e);
         }
         match format {
             Format::Table | Format::Csv => {
@@ -356,6 +370,17 @@ mod tests {
         assert_eq!(sql_exit(&DbError { code: Some("42P01".into()), ..Default::default() }), 5);
         assert_eq!(sql_exit(&DbError { message: "decode".into(), ..Default::default() }), 5);
         assert_eq!(sql_exit(&DbError { connection_lost: true, ..Default::default() }), 2);
+        assert_eq!(sql_exit(&DbError { refused: true, ..Default::default() }), 4);
+    }
+
+    #[test]
+    fn batch_exit_code_is_the_first_errors() {
+        let sql = DbError { code: Some("42P01".into()), ..Default::default() };
+        let lost = DbError { connection_lost: true, ..Default::default() };
+        // stop_on_error = false: a later, "bigger" code must not replace the first one.
+        assert_eq!(first_exit(first_exit(0, &sql), &lost), 5);
+        assert_eq!(first_exit(first_exit(0, &lost), &sql), 2);
+        assert_eq!(first_exit(0, &sql), 5);
     }
 
     #[test]
