@@ -1,15 +1,10 @@
 //! The Connections page (a window, like Settings): a flat list of every connection, with
-//! Edit / Test / Duplicate / Delete. Edit, Duplicate and Delete run in the main window (the form is
+//! Edit / Duplicate / Delete (Test lives in the form). Edit, Duplicate and Delete run in the main window (the form is
 //! a dialog there) and never change a file's pick.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use db_conn::{Connection, Connections, Driver};
-use db_exec::Session;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Root, Sizable as _,
@@ -19,7 +14,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::{CloseTab, Siesta, format::parse_color, runner::RT};
+use crate::{CloseTab, Siesta, format::parse_color};
 
 #[derive(Debug)]
 pub(crate) struct ConnRow {
@@ -121,19 +116,12 @@ impl Siesta {
     }
 }
 
-enum Test {
-    Running,
-    Ok(String),
-    Failed(String),
-}
-
 pub(crate) struct ConnectionsPage {
     app: WeakEntity<Siesta>,
     /// The main window: forms and deletes run there.
     main: AnyWindowHandle,
     focus: FocusHandle,
     filter: Entity<InputState>,
-    tests: HashMap<String, Test>,
     _subs: Vec<Subscription>,
 }
 
@@ -151,7 +139,7 @@ impl ConnectionsPage {
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Self { app, main, focus, filter, tests: HashMap::new(), _subs }
+        Self { app, main, focus, filter, _subs }
     }
 
     /// Runs `f` on `Siesta` in the main window, which comes forward (the form is a dialog there).
@@ -163,34 +151,6 @@ impl ConnectionsPage {
                 app.update(cx, |a, cx| f(a, window, cx)).ok();
             })
             .ok();
-    }
-
-    /// A throwaway session; the result shows in the row.
-    fn test(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conn) = self.app.upgrade().and_then(|a| a.read(cx).conns_for_page().0.connections.get(&name).cloned()) else { return };
-        self.tests.insert(name.clone(), Test::Running);
-        let timeout = self.app.read_with(cx, |a, _| Duration::from_millis(a.settings.settings.run.connect_timeout_ms)).unwrap_or(db_exec::CONNECT_TIMEOUT);
-        let handle = RT.spawn(async move {
-            let t = Instant::now();
-            let s = Session::open_with(&conn, timeout).await.map_err(|e| e.to_string())?;
-            s.close().await;
-            Ok::<_, String>(t.elapsed())
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let r = handle.await;
-            this.update(cx, |this, cx| {
-                let t = match r {
-                    Ok(Ok(t)) => Test::Ok(format!("Connected in {} ms", t.as_millis())),
-                    Ok(Err(e)) => Test::Failed(e),
-                    Err(e) => Test::Failed(e.to_string()),
-                };
-                this.tests.insert(name, t);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
     }
 
     fn delete(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -222,13 +182,7 @@ impl ConnectionsPage {
         };
         let name = r.name.clone();
         let button = |id: &'static str, label: &'static str| Button::new((id, ix)).label(label).small();
-        let (n_edit, n_test, n_dup, n_del) = (name.clone(), name.clone(), name.clone(), name.clone());
-        let status = match self.tests.get(&r.name) {
-            None => None,
-            Some(Test::Running) => Some(div().text_xs().text_color(muted).child("Connecting…")),
-            Some(Test::Ok(s)) => Some(div().text_xs().text_color(t.success).child(format!("✓ {s}"))),
-            Some(Test::Failed(e)) => Some(div().text_xs().text_color(t.danger).child(format!("✗ {e}"))),
-        };
+        let (n_edit, n_dup, n_del) = (name.clone(), name.clone(), name.clone());
         v_flex()
             .id(("conn-row", ix))
             .px_3()
@@ -252,8 +206,7 @@ impl ConnectionsPage {
                         this.with_app(cx, move |app, window, cx| app.open_conn_form_for(Some(n), false, false, window, cx));
                     })))
                     .when(r.error.is_none(), |el| {
-                        el.child(button("conn-test", "Test").on_click(cx.listener(move |this, _, window, cx| this.test(n_test.clone(), window, cx))))
-                            .child(button("conn-dup", "Duplicate").on_click(cx.listener(move |this, _, _, cx| {
+                        el.child(button("conn-dup", "Duplicate").on_click(cx.listener(move |this, _, _, cx| {
                                 let n = n_dup.clone();
                                 this.with_app(cx, move |app, window, cx| app.open_conn_form_for(Some(n), true, false, window, cx));
                             })))
@@ -269,7 +222,6 @@ impl ConnectionsPage {
                     .child(div().child(if r.password { "password set" } else { "no password" })),
             )
             .children(r.error.clone().map(|e| div().text_xs().text_color(t.danger).child(e)))
-            .children(status)
             .into_any_element()
     }
 }

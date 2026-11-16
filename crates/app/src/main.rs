@@ -1049,11 +1049,38 @@ impl Siesta {
                     let row = |label: String, name: Option<String>| {
                         let color = name.as_ref().and_then(|n| colors.get(n).copied()).unwrap_or(cx.theme().muted_foreground.opacity(0.6));
                         let size = cx.theme().font_size * 0.55;
+                        // A pencil on each connection edits it without picking it: the pencil's click
+                        // runs first and marks it, then the row's own click (which also closes the
+                        // menu) opens the form instead of picking.
+                        let edit_clicked = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let pencil_name = name.clone();
+                        let flag = edit_clicked.clone();
+                        let checked = current == name;
+                        let on_pick = pick(name.clone());
+                        let view = view.clone();
                         PopupMenuItem::element(move |_, _| {
-                            h_flex().gap_2().items_center().child(div().flex_none().size(size).rounded_full().bg(color)).child(label.clone())
+                            let edit = pencil_name.as_ref().map(|n| {
+                                let flag = flag.clone();
+                                Button::new(SharedString::from(format!("edit-conn-{n}")))
+                                    .icon(Icon::default().data(include_bytes!("../assets/pencil.svg")))
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Edit connection")
+                                    .on_click(move |_, _, _| flag.set(true))
+                            });
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .child(div().flex_none().size(size).rounded_full().bg(color))
+                                .child(div().flex_1().child(label.clone()))
+                                .children(edit)
                         })
-                        .checked(current == name)
-                        .on_click(pick(name))
+                        .checked(checked)
+                        .on_click(move |ev, window, cx| match (edit_clicked.replace(false), name.clone()) {
+                            (true, Some(n)) => _ = view.update(cx, |this, cx| this.open_conn_form(Some(n), window, cx)),
+                            _ => on_pick(ev, window, cx),
+                        })
                     };
                     let mut menu = menu.item(row("No connection".into(), None)).separator();
                     if names.is_empty() {
@@ -1066,18 +1093,13 @@ impl Siesta {
                     if forced {
                         menu = menu.separator().label("Set by `-- @connection` in this file");
                     }
-                    // Global connections are made and edited in a form; Test needs a connection, Disconnect a live session.
-                    let form = |label: &'static str, edit: bool| {
+                    // Connections are made in a form (edited with the pencil on each row); Test needs a connection,
+                    // Disconnect a live session.
+                    let new = {
                         let view = view.clone();
-                        PopupMenuItem::new(label).disabled(edit && !can_test).on_click(move |_, window, cx| {
-                            view.update(cx, |this, cx| {
-                                let name = if edit { this.doc().and_then(|d| d.connection().map(str::to_string)) } else { None };
-                                this.open_conn_form(name, window, cx);
-                            })
-                            .ok();
-                        })
+                        PopupMenuItem::new("New connection…").on_click(move |_, window, cx| _ = view.update(cx, |this, cx| this.open_conn_form(None, window, cx)))
                     };
-                    menu = menu.separator().item(form("New connection…", false)).item(form("Edit connection…", true)).item(
+                    menu = menu.separator().item(new).item(
                         PopupMenuItem::new("Manage connections…").on_click({
                             let view = view.clone();
                             move |_, window, cx| _ = view.update(cx, |this, cx| this.open_connections(window, cx))
