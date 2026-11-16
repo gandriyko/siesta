@@ -65,6 +65,8 @@ pub struct Diagnostic {
 pub struct SqlFile {
     /// `-- @connection` before the first statement.
     pub connection: Option<String>,
+    /// Where that directive's comment sits in the source.
+    pub connection_at: Option<Range<usize>>,
     pub statements: Vec<Statement>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -79,6 +81,31 @@ impl SqlFile {
 }
 
 pub const DIRECTIVES: &[&str] = &["connection", "name", "page-size", "confirm"];
+
+/// `src` with the value of its `-- @connection` directive replaced by `name`, or the whole
+/// directive line removed for `None`. `None` back when the file has no directive.
+pub fn rewrite_connection(src: &str, dialect: Dialect, name: Option<&str>) -> Option<String> {
+    let at = split(src, dialect).connection_at?;
+    let text = &src[at.clone()];
+    let end = at.start + text.trim_end().len();
+    if let Some(n) = name {
+        let w = text.find("@connection")? + "@connection".len();
+        let from = at.start + w + (text[w..].len() - text[w..].trim_start().len());
+        return Some(format!("{}{n}{}", &src[..from], &src[end..]));
+    }
+    // Removal takes the whole line (its newline too) unless something else shares it.
+    let line_start = src[..at.start].rfind('\n').map_or(0, |i| i + 1);
+    let alone = src[line_start..at.start].trim().is_empty();
+    let (from, mut to) = if alone { (line_start, end) } else { (at.start, end) };
+    if alone {
+        match src[to..].find('\n') {
+            Some(l) if src[to..to + l].trim().is_empty() => to += l + 1,
+            None if src[to..].trim().is_empty() => to = src.len(),
+            _ => {}
+        }
+    }
+    Some(format!("{}{}", &src[..from], &src[to..]))
+}
 
 pub fn split(src: &str, dialect: Dialect) -> SqlFile {
     split_words(src, dialect, false).0
@@ -325,7 +352,10 @@ impl<'a> Splitter<'a> {
         let warn = |s: &mut Self, msg: String| s.diag(comment.clone(), Severity::Warning, msg);
         match (word, value) {
             ("connection" | "name", "") => warn(self, format!("`@{word}` needs a value")),
-            ("connection", _) if self.out.statements.is_empty() => self.out.connection = Some(value.into()),
+            ("connection", _) if self.out.statements.is_empty() => {
+                self.out.connection = Some(value.into());
+                self.out.connection_at = Some(comment);
+            }
             ("connection", _) => warn(self, "`@connection` applies only at the top of the file".into()),
             ("name", _) => self.pending.name = Some(value.into()),
             ("page-size", _) => match value.parse() {
@@ -592,6 +622,19 @@ mod tests {
         assert_eq!(at("SELECT 3"), "SELECT 3");
         assert_eq!(f.statement_at(src.len()).unwrap().text(src), "SELECT 3");
         assert_eq!(split("", PG).statement_at(0), None);
+    }
+
+    #[test]
+    fn rewrite_connection_keeps_the_rest_of_the_line() {
+        let r = |src: &str, n| rewrite_connection(src, PG, n);
+        assert_eq!(r("-- @connection dev\nSELECT 1;", Some("prod")).unwrap(), "-- @connection prod\nSELECT 1;");
+        assert_eq!(r("--   @connection   dev  \r\nSELECT 1;\r\n", Some("a-b")).unwrap(), "--   @connection   a-b  \r\nSELECT 1;\r\n");
+        assert_eq!(r("-- hi\n\n  -- @connection dev\nSELECT 1;", Some("x")).unwrap(), "-- hi\n\n  -- @connection x\nSELECT 1;");
+        assert_eq!(r("-- hi\n-- @connection dev\r\n-- @name n\nSELECT 1;", None).unwrap(), "-- hi\n-- @name n\nSELECT 1;");
+        assert_eq!(r("-- @connection dev", None).unwrap(), "");
+        // Not a top-of-file directive (after a statement): nothing to rewrite.
+        assert_eq!(r("SELECT 1;\n-- @connection dev\nSELECT 2;", Some("x")), None);
+        assert_eq!(r("SELECT 1;", None), None);
     }
 
     #[test]

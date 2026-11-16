@@ -749,10 +749,49 @@ impl Siesta {
     // ---- connection ----
 
     /// The picker's choice for the current file (`None` = no connection): remembered per file.
-    /// `-- @connection` in the text still wins.
+    /// With `-- @connection` in the text the stored pick is left alone: the choice rewrites the
+    /// directive instead, after a confirmation.
     pub(crate) fn select_connection(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
-        self.pick_for(&path, name, window, cx);
+        let Some(d) = self.doc() else { return };
+        let Some(old) = d.locked().map(str::to_string) else {
+            let path = (*d.path).clone();
+            return self.pick_for(&path, name, window, cx);
+        };
+        if name.as_deref() == Some(old.as_str()) {
+            return;
+        }
+        let prod = name.as_deref().and_then(|n| d.conns.connections.get(n)).is_some_and(|c| c.prod);
+        let action = match &name {
+            Some(n) => format!("Switch to `{n}`{} and rewrite that line in the file?", if prod { " (PRODUCTION)" } else { "" }),
+            None => "Remove that line from the file?".to_string(),
+        };
+        let detail = format!("This file sets its connection with `-- @connection {old}`. {action}");
+        let answer = window.prompt(PromptLevel::Warning, "Change connection in file?", Some(&detail), &["Rewrite", "Cancel"], cx);
+        let path = (*d.path).clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| this.rewrite_directive(&path, name.as_deref(), window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Replaces (or removes) the `-- @connection` line as an ordinary undoable edit; the editor's
+    /// change handling then re-splits the text and the connection follows.
+    fn rewrite_directive(&mut self, path: &Path, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
+        let d = &self.docs[ix];
+        let old = d.editor.read(cx).value().to_string();
+        let Some(new) = sql_split::rewrite_connection(&old, d.dialect, name) else { return };
+        let (range, text) = doc::changed(&old, &new);
+        d.editor.update(cx, |s, cx| {
+            let rope = s.text().clone();
+            let edit = lsp_types::TextEdit { range: lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end)), new_text: text };
+            s.apply_lsp_edits(&vec![edit], window, cx);
+        });
+        self.docs[ix].reparse(cx);
+        cx.notify();
     }
 
     /// Remembers `name` as the pick of `path` (only that file) and loads its schema in the background.
@@ -791,7 +830,9 @@ impl Siesta {
     fn connection_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
         let current = d.connection().map(str::to_string);
-        let forced = d.file.connection.is_some();
+        let forced = d.locked().is_some();
+        // A directive naming a connection that is not in the chain: shown in red.
+        let unknown = d.locked().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
         let conn_of = |n: &str| d.conns.connections.get(n);
         let prod = current.as_deref().and_then(conn_of).is_some_and(|c| c.prod);
@@ -816,8 +857,14 @@ impl Siesta {
                 .child(h_flex().gap_1p5().children(strip.map(|c| div().flex_none().w(px(3.)).h(fs).rounded_full().bg(c))).child(dot(status_color)).child(label))
                 .dropdown_caret(true)
                 .small()
-                .when(prod, |b| b.danger())
-                .when(!prod, |b| b.ghost())
+                .when(prod || unknown.is_some(), |b| b.danger())
+                .when(!(prod || unknown.is_some()), |b| b.ghost())
+                .when(forced, |b| {
+                    b.tooltip(match &unknown {
+                        Some(n) => format!("Unknown connection `{n}` (from `-- @connection`)"),
+                        None => "Set by `-- @connection` in this file".to_string(),
+                    })
+                })
                 .dropdown_menu(move |menu, _, cx| {
                     let pick = |name: Option<String>| {
                         let view = view.clone();
@@ -859,7 +906,7 @@ impl Siesta {
                     }
                     menu = names.iter().fold(menu, |menu, n| menu.item(row(n.clone(), Some(n.clone()))));
                     if forced {
-                        menu = menu.separator().label("Set by -- @connection in the file");
+                        menu = menu.separator().label("Set by `-- @connection` in this file");
                     }
                     // Global connections are made and edited in a form; Test needs a connection, Disconnect a live session.
                     let form = |label: &'static str, edit: bool| {
@@ -1588,6 +1635,53 @@ mod tests {
             this.schemas.borrow().loading.contains(&key)
         });
         assert!(loading);
+    }
+
+    #[gpui::test]
+    fn at_connection_locks_the_picker_and_keeps_the_stored_pick(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let state = |app: &Entity<Siesta>, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let d = app.read(cx).doc().unwrap();
+                (d.connection().map(str::to_string), d.locked().map(str::to_string), d.picked.clone())
+            })
+        };
+        let set_text = |cx: &mut VisualTestContext, text: &'static str| {
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.doc().unwrap().editor.update(cx, |s, cx| s.set_value(text, window, cx));
+                    this.docs[0].reparse(cx);
+                })
+            })
+        };
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
+        assert_eq!(state(&app, &mut cx), (Some("dev".into()), None, Some("dev".into())));
+        set_text(&mut cx, "-- @connection my\nSELECT 1;\n");
+        let pick = |cx: &mut VisualTestContext, n: Option<&str>| {
+            cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(n.map(Into::into), window, cx)));
+        };
+        let text = |cx: &mut VisualTestContext| text_of(&app, cx);
+        // Cancel: a question (naming the prod target), nothing changes.
+        pick(&mut cx, Some("live"));
+        assert!(cx.pending_prompt().unwrap().1.contains("PRODUCTION"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(state(&app, &mut cx), (Some("my".into()), Some("my".into()), Some("dev".into())));
+        assert_eq!(text(&mut cx), "-- @connection my\nSELECT 1;\n");
+        // Rewrite: the line changes in the buffer (undoable edit), the connection follows, the pick stays.
+        pick(&mut cx, Some("live"));
+        cx.simulate_prompt_answer("Rewrite");
+        cx.run_until_parked();
+        assert_eq!(text(&mut cx), "-- @connection live\nSELECT 1;\n");
+        assert_eq!(state(&app, &mut cx), (Some("live".into()), Some("live".into()), Some("dev".into())));
+        assert!(cx.update(|_, cx| app.read(cx).doc().unwrap().dirty));
+        // "No connection" removes the directive; the stored pick applies again.
+        pick(&mut cx, None);
+        cx.simulate_prompt_answer("Rewrite");
+        cx.run_until_parked();
+        assert_eq!(text(&mut cx), "SELECT 1;\n");
+        assert_eq!(state(&app, &mut cx), (Some("dev".into()), None, Some("dev".into())));
     }
 
     #[gpui::test]

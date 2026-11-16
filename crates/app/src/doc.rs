@@ -102,6 +102,11 @@ impl Doc {
         self.file.connection.as_deref().or(self.picked.as_deref())
     }
 
+    /// The connection a `-- @connection` directive fixes; while it is there the picker is locked.
+    pub fn locked(&self) -> Option<&str> {
+        self.file.connection.as_deref()
+    }
+
     /// Schema cache key of the file's connection (`None`: no connection, or an unusable one).
     pub fn schema_key(&self) -> Option<String> {
         self.conns.connections.get(self.connection()?).map(crate::schema_cache::key)
