@@ -340,6 +340,64 @@ fn classify(words: &[(u32, &str)]) -> Kind {
     if locks || top.iter().any(|w| is(w, &["into"])) { Kind::Other } else { Kind::Query }
 }
 
+/// The statement (text as returned by `Statement::text`) needs a confirmation on production:
+/// `DROP`, `TRUNCATE`, `ALTER`, and `UPDATE` / `DELETE` without a top-level `WHERE`.
+/// A token check, not a parser: comments, strings and quoted names are skipped, and a `WHERE`
+/// inside a subquery does not count.
+// ponytail: `WITH … DELETE` is looked up by its first top-level UPDATE / DELETE; a parser would be exact.
+pub fn is_destructive(text: &str, dialect: Dialect) -> bool {
+    let b = text.as_bytes();
+    let (mut i, mut depth) = (0, 0u32);
+    let mut words: Vec<(u32, &str)> = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'-' if b[i..].starts_with(b"--") => i = line_end(b, i),
+            b'#' if dialect == Dialect::MySql => i = line_end(b, i),
+            b'/' if b[i..].starts_with(b"/*") => i = text[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2),
+            b'\'' | b'"' | b'`' => {
+                i += 1;
+                while i < b.len() && b[i] != c {
+                    i += if b[i] == b'\\' && c == b'\'' && dialect == Dialect::MySql { 2 } else { 1 };
+                }
+                i += 1; // closing quote (a doubled quote reopens on the next loop turn)
+            }
+            b'$' if dialect == Dialect::Postgres => {
+                let end = b[i + 1..].iter().position(|&x| x == b'$').map(|p| i + 1 + p);
+                match end.filter(|&e| text[i + 1..e].chars().all(|ch| ch.is_alphanumeric() || ch == '_')) {
+                    Some(e) => i = text[e + 1..].find(&text[i..=e]).map_or(b.len(), |p| e + 1 + p + (e - i) + 1),
+                    None => i += 1,
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if is_word_start(c) => {
+                let e = word_end(b, i);
+                words.push((depth, &text[i..e]));
+                i = e;
+            }
+            _ => i += 1,
+        }
+    }
+    let is = |w: &str, list: &[&str]| list.iter().any(|k| w.eq_ignore_ascii_case(k));
+    let Some(&(_, first)) = words.first() else { return false };
+    if is(first, &["drop", "truncate", "alter"]) {
+        return true;
+    }
+    if !is(first, &["update", "delete", "with"]) {
+        return false; // SELECT … FOR UPDATE and the like
+    }
+    let top: Vec<&str> = words.iter().filter(|(d, _)| *d == 0).map(|(_, w)| *w).collect();
+    let Some(at) = top.iter().position(|w| is(w, &["update", "delete"])) else { return false };
+    !top[at..].iter().any(|w| is(w, &["where"]))
+}
+
 fn line_end(b: &[u8], i: usize) -> usize {
     b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p)
 }
@@ -516,5 +574,32 @@ mod tests {
         }
         // The rest of the file stays one statement.
         assert_eq!(texts("SELECT 'a; b", PG), ["SELECT 'a; b"]);
+    }
+
+    #[test]
+    fn destructive() {
+        for (sql, d, want) in [
+            ("DELETE FROM t", PG, true),
+            ("delete from t where id = 1", PG, false),
+            ("UPDATE t SET a = 1", PG, true),
+            ("UPDATE t SET a = (SELECT 1 FROM u WHERE u.id = 1)", PG, true), // the WHERE is a subquery's
+            ("UPDATE t SET a = 1 WHERE id IN (SELECT id FROM u)", PG, false),
+            ("-- where\nDELETE FROM t /* where */", PG, true),
+            ("UPDATE t SET a = 'where'", PG, true),
+            ("UPDATE t SET a = $q$ where $q$", PG, true),
+            ("WITH x AS (SELECT 1) DELETE FROM t", PG, true),
+            ("WITH x AS (SELECT 1) DELETE FROM t WHERE id = 1", PG, false),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", PG, false),
+            ("DROP TABLE t", PG, true),
+            ("TRUNCATE t", MY, true),
+            ("ALTER TABLE t ADD c int", MY, true),
+            ("SELECT * FROM t FOR UPDATE", PG, false),
+            ("SELECT 'drop table'", PG, false),
+            ("INSERT INTO t VALUES (1)", PG, false),
+            ("DELETE FROM `where`", MY, true),
+            ("", PG, false),
+        ] {
+            assert_eq!(is_destructive(sql, d), want, "{sql}");
+        }
     }
 }

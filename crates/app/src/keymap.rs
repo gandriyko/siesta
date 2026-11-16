@@ -35,6 +35,8 @@ enum Ctx {
     Editor,
     Both,
     Global,
+    /// A named context: the result table, the value dialog.
+    In(&'static str),
 }
 
 type Spec = (String, Box<dyn Action>, Ctx);
@@ -67,6 +69,17 @@ fn defaults() -> Vec<Spec> {
         spec(key("1"), FocusEditor, Both),
         spec(key("j"), ToggleResult, Both),
         spec(key("\\"), ToggleSplit, Both),
+        spec(key("alt-f"), ToggleFilters, Both),
+        // The result table.
+        spec(key("c"), CopyCells, In("ResultTable")),
+        spec("enter", OpenCell, In("ResultTable")),
+        spec("space", OpenCell, In("ResultTable")),
+        spec(key("shift-enter"), OpenRow, In("ResultTable")),
+        spec(key("]"), NextPage, In("ResultTable")),
+        spec(key("["), PrevPage, In("ResultTable")),
+        // The value dialog: ↑ / ↓ walk the column.
+        spec("up", PopupPrev, In("ValuePopup")),
+        spec("down", PopupNext, In("ValuePopup")),
         spec(key("q"), Quit, Global),
     ]
 }
@@ -131,6 +144,7 @@ pub fn apply(keymap: Keymap, user: Option<&Path>, cx: &mut App) -> Vec<String> {
         match ctx {
             Ctx::Editor => add(&mut bindings, &mut errors, &keys, action, Some("Input"), cx),
             Ctx::Both => add(&mut bindings, &mut errors, &keys, action, None, cx),
+            Ctx::In(c) => add(&mut bindings, &mut errors, &keys, action, Some(c), cx),
             Ctx::Global => match KeyBinding::load(&keys, action, None, false, None, cx) {
                 Ok(b) => bindings.push(b),
                 Err(e) => errors.push(format!("keymap: {keys}: {e}")),

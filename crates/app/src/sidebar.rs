@@ -273,10 +273,12 @@ impl Siesta {
                 let doc = self.docs.iter().position(|d| *d.path == *path);
                 let selected = doc.is_some() && doc == self.current && doc.is_some_and(|i| self.docs[i].active_statement().is_some_and(|s| s.line == *line));
                 let (p, line) = (path.clone(), *line);
-                // 5b: a run status (row count, ✕, …) goes here, between the label and the line number.
+                // The last run: row count, or ✕, between the label and the line number.
+                let status = self.statement_status(path, line, cx);
                 base.when(selected, |r| r.bg(active))
                     .child(spacer())
                     .child(div().flex_1().truncate().font_family(t.mono_font_family.clone()).child(label.clone()))
+                    .children(status.map(|(text, failed)| div().flex_none().text_xs().text_color(if failed { t.danger } else { muted }).child(text)))
                     .child(div().flex_none().text_xs().text_color(muted).child(line.to_string()))
                     // Click jumps to the statement; double click also runs it.
                     .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| this.click_statement(p.clone(), line, ev.click_count(), window, cx)))

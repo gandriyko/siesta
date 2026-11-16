@@ -7,14 +7,19 @@ license.workspace = true
 [dependencies]
 sql-split = { path = "../sql-split" }
 db-conn = { path = "../db-conn" }
+db-exec = { path = "../db-exec" }
+siesta-cli = { path = "../cli" }
 siesta-settings = { path = "../settings" }
 siesta-workspace = { path = "../workspace" }
 serde = "1"
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+# Value popup: JSONPath filter, as in Respite's response panel.
+serde_json_path = "0.7"
 # Same pinned versions as Respite.
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "runtime_shaders"] } # runtime_shaders: no Xcode `metal` needed
-gpui-component = { version = "=0.9.1", features = ["tree-sitter-sql"] }
+gpui-component = { version = "=0.9.1", features = ["tree-sitter", "tree-sitter-sql"] }
 gpui-kit-assets = "=0.9.1"
 # gpui-component's own base; named only for `ResizeHandleContext` (invisible panel dividers).
 gpui-base = "=0.9.1"

@@ -1,16 +1,20 @@
 //! Siesta GUI: sidebar (Files | DB), tabs of open files, a plain-text SQL editor (no run buttons or
 //! statuses in its lines), connection picker in the top-right corner, result panel on the right.
 //!
-//! Running statements (the `run_*` / `cancel_run` hooks below) and the result table arrive with the
-//! DB layer; everything else of the shell is here.
+//! Running statements lives in `runner`, the result panel and table in `results`, the value
+//! dialog in `value_popup`, pure formatting in `format`; everything else of the shell is here.
 
 mod doc;
+mod format;
 mod highlight;
 mod keymap;
 mod palette;
+mod results;
+mod runner;
 mod settings_page;
 mod sidebar;
 mod themes;
+mod value_popup;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -23,7 +27,7 @@ use db_conn::Connections;
 use doc::Doc;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable, v_resizable,
+    ActiveTheme as _, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, h_resizable, v_resizable,
     button::{Button, ButtonVariants as _},
     input::{Editor, EditorState, InputEvent, InputState, Position, RopeExt as _},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -36,7 +40,9 @@ actions!(
     [
         RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenFolder, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
-        NextStatement, FocusEditor
+        NextStatement, FocusEditor, ToggleFilters,
+        // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
+        CopyCells, OpenCell, OpenRow, NextPage, PrevPage, PopupPrev, PopupNext
     ]
 );
 
@@ -104,6 +110,14 @@ pub(crate) struct Siesta {
     mru: Vec<PathBuf>,
     /// Ctrl+Tab held down: the MRU order when it started and how far it has gone.
     tab_cycle: Option<(Vec<PathBuf>, usize)>,
+    /// Sessions per (file, connection), opened by the first run and closed with the file.
+    slots: HashMap<(PathBuf, String), runner::Slot>,
+    /// Results per (file, statement text).
+    store: results::Store,
+    /// The result panel's table, filter fields and pin.
+    ui: results::Ui,
+    /// The "Running…" clock is ticking.
+    ticking: bool,
     settings: siesta_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Siesta" context.
@@ -190,6 +204,10 @@ impl Siesta {
             picker_sub: None,
             mru: vec![],
             tab_cycle: None,
+            slots: HashMap::new(),
+            store: results::Store::default(),
+            ui: results::Ui::new(cx.entity().downgrade(), window, cx),
+            ticking: false,
             settings,
             settings_window: None,
             focus: cx.focus_handle(),
@@ -626,8 +644,20 @@ impl Siesta {
             window.push_notification(msg, cx);
             return;
         }
+        // An open transaction: Commit / Rollback / Cancel first; the answer closes the file again.
+        if self.in_tx(&d.path.clone()) {
+            let path = (*d.path).clone();
+            self.close_armed = None;
+            return self.ask_transaction(path, window, cx);
+        }
         self.close_armed = None;
         let path = (*self.docs.remove(ix).path).clone();
+        self.close_sessions(&path, None);
+        self.store.entries.retain(|k, _| k.0 != path);
+        self.store.batches.remove(&path);
+        if self.ui.pinned.as_ref().is_some_and(|k| k.0 == path) {
+            self.ui.pinned = None;
+        }
         self.outlines.remove(&path);
         self.current = match self.docs.len() {
             0 => None,
@@ -662,29 +692,6 @@ impl Siesta {
     pub(crate) fn click_statement(&mut self, path: PathBuf, line: usize, clicks: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.go_to(path, line, clicks >= 2, window, cx);
     }
-
-    // ---- run hooks (filled in with the DB layer) ----
-
-    /// Cmd+Enter, double click on a statement, the result panel's "Run": run the selection, or the
-    /// statement under the cursor (`self.doc().and_then(|d| d.active_statement())`, its text is
-    /// `st.text(&editor.value())`), on the file's connection (`self.doc().and_then(|d| d.connection())`).
-    /// The tokio runtime and its bridge to GPUI tasks plug in here, as Respite's `start`.
-    pub(crate) fn run_current(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Cmd+Shift+Enter: run every statement of the current file in order.
-    pub(crate) fn run_all(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Cmd+Alt+L: run the last statement again, in whatever file it was.
-    pub(crate) fn repeat_last(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// Esc / Cmd+.: cancel what is running (the result panel's "Stop").
-    pub(crate) fn cancel_run(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// "Test connection" in the picker.
-    pub(crate) fn test_connection(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
-
-    /// "Disconnect" in the picker: drop the live session of the current file.
-    pub(crate) fn disconnect(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     // ---- connection ----
 
@@ -734,15 +741,22 @@ impl Siesta {
         let forced = d.file.connection.is_some();
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
         let prod = current.as_deref().is_some_and(|n| self.settings.settings.connections.is_prod(n));
+        let status = self.dot_of(&d.path, current.as_deref());
+        let (can_test, can_disconnect) = (current.is_some(), self.slots.keys().any(|(p, _)| *p == *d.path));
         let t = cx.theme();
         let (muted, fs) = (t.muted_foreground, t.font_size);
+        let status_color = match status {
+            runner::Dot::Grey => muted.opacity(0.6),
+            runner::Dot::Green => t.success,
+            runner::Dot::Red => t.danger,
+        };
         let dot = |color: Hsla| div().flex_none().size(fs * 0.55).rounded_full().bg(color);
         let label = current.clone().unwrap_or_else(|| "No connection".into());
         let view = cx.entity().downgrade();
         Some(
             Button::new("connection-picker")
                 .icon(IconName::Network)
-                .child(h_flex().gap_1p5().child(dot(muted.opacity(0.6))).child(label))
+                .child(h_flex().gap_1p5().child(dot(status_color)).child(label))
                 .dropdown_caret(true)
                 .small()
                 .when(prod, |b| b.danger())
@@ -790,14 +804,17 @@ impl Siesta {
                     if forced {
                         menu = menu.separator().label("Set by -- @connection in the file");
                     }
-                    // Both need a live session (DB layer).
-                    let hook = |label: &'static str, run: fn(&mut Siesta, &mut Window, &mut Context<Siesta>)| {
+                    // Test needs a connection, Disconnect a live session.
+                    let hook = |label: &'static str, enabled: bool, run: fn(&mut Siesta, &mut Window, &mut Context<Siesta>)| {
                         let view = view.clone();
-                        PopupMenuItem::new(label).disabled(true).on_click(move |_, window, cx| {
+                        PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, window, cx| {
                             view.update(cx, |this, cx| run(this, window, cx)).ok();
                         })
                     };
-                    menu = menu.separator().item(hook("Test connection", Siesta::test_connection)).item(hook("Disconnect", Siesta::disconnect));
+                    menu = menu
+                        .separator()
+                        .item(hook("Test connection", can_test, Siesta::test_connection))
+                        .item(hook("Disconnect", can_disconnect, Siesta::disconnect));
                     let chain = view.upgrade().and_then(|v| {
                         let this = v.read(cx);
                         this.doc().map(|d| (this.conn_candidates(&d.path), this.root.clone()))
@@ -898,37 +915,6 @@ impl Siesta {
         div().size_full().flex().flex_col().children(tabs).child(card).into_any_element()
     }
 
-    /// The right panel: header with "Run" and the statement it belongs to, then the result.
-    /// Until the DB layer exists the body is the empty-state hint; the result table, errors and
-    /// the running state replace it there, keyed by (file, statement).
-    fn result_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let title = self.doc().and_then(|d| d.active_statement().map(|s| s.label(&d.editor.read(cx).value()).to_string()));
-        let header = h_flex()
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .gap_3()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                Button::new("run")
-                    .icon(IconName::Play)
-                    .label("Run")
-                    .small()
-                    .disabled(true) // enabled by the DB layer
-                    .on_click(cx.listener(|this, _, window, cx| this.run_current(window, cx))),
-            )
-            .child(div().min_w_0().flex_1().truncate().text_sm().text_color(muted).children(title));
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(div().flex_1().flex().items_center().justify_center().text_color(muted).child(format!("{RUN_KEY} to run")))
-            .into_any_element()
-    }
 }
 
 /// A panel on the window background: rounded, hairline border, ring colour while it has focus.
@@ -976,7 +962,7 @@ fn center_line(editor: Entity<EditorState>, line: usize, retry: bool, window: &m
 impl Siesta {
     /// Editor and result panel side by side or stacked (`split`, Cmd+\), sized by `split_ratio`;
     /// dragging the divider saves the new ratio. Cmd+J hides the result panel.
-    fn editor_and_result(&self, center: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn editor_and_result(&mut self, center: AnyElement, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let s = &self.settings.settings;
         let vertical = s.split == siesta_settings::Split::Vertical;
         let ratio = s.split_ratio.clamp(0.2, 0.8);
@@ -987,7 +973,7 @@ impl Siesta {
         let group = invisible_dividers(if vertical { v_resizable("split-v") } else { h_resizable("split-h") });
         let (view, open) = (cx.entity().downgrade(), self.result_open);
         // Half the gap on each side of a divider; the outer edge gets the root's padding.
-        let result = div().size_full().p_1().child(card(false, cx).child(self.result_panel(cx)));
+        let result = div().size_full().p_1().child(card(false, cx).child(self.result_panel(window, cx)));
         group
             .on_resize(move |state, window, cx| {
                 let sizes = state.read(cx).sizes().clone();
@@ -1023,6 +1009,7 @@ impl Render for Siesta {
             .on_action(cx.listener(|this, _: &RunAll, window, cx| this.run_all(window, cx)))
             .on_action(cx.listener(|this, _: &RepeatLast, window, cx| this.repeat_last(window, cx)))
             .on_action(cx.listener(|this, _: &CancelRun, window, cx| this.cancel_run(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFilters, window, cx| this.toggle_filters(window, cx)))
             // Esc reaches here only when the editor had nothing of its own to close.
             // ponytail: Esc that closes the completion menu also gets here (the menu propagates it).
             .on_action(cx.listener(|this, _: &gpui_component::input::Escape, window, cx| this.cancel_run(window, cx)))
@@ -1108,6 +1095,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Run All in File", RunAll),
             MenuItem::action("Repeat Last", RepeatLast),
             MenuItem::action("Cancel Running", CancelRun),
+            MenuItem::action("Toggle Column Filters", ToggleFilters),
             MenuItem::separator(),
             MenuItem::action("Pick Connection…", PickConnection),
         ]),
@@ -1138,6 +1126,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Run All in File", Box::new(RunAll)),
         ("Repeat Last", Box::new(RepeatLast)),
         ("Cancel Running", Box::new(CancelRun)),
+        ("Toggle Column Filters", Box::new(ToggleFilters)),
         ("Pick Connection…", Box::new(PickConnection)),
         ("Go to File…", Box::new(GoToFile)),
         ("Go to Statement…", Box::new(GoToStatement)),
@@ -1160,9 +1149,12 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
 /// `siesta [path[:line]]`: a folder opens as the workspace, a file opens in its repo's workspace;
 /// no argument reopens the last workspace.
 fn main() -> std::process::ExitCode {
+    if let Some(code) = siesta_cli::main_if_cli() {
+        return code;
+    }
     // ponytail: hand-rolled GUI args; fold into clap when the GUI grows options.
     // `-psn_…` is a process serial number some macOS launches still pass to app bundles.
-    let target = std::env::args().skip(1).rfind(|a| !a.starts_with("-psn_"));
+    let target = std::env::args().skip(1).rfind(|a| a != "open" && !a.starts_with("-psn_"));
     let cwd = std::env::current_dir().expect("current dir");
     let base = siesta_workspace::base_dir();
     let (root, open) = match target.map(|t| parse_target(&t)).map(|(p, l)| (std::path::absolute(&p).unwrap_or_else(|_| cwd.join(&p)), l)) {
@@ -1286,6 +1278,149 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(active(&app, &mut cx), Some(1));
+    }
+
+    fn done(text: &str, cols: &[(&str, &str)], rows: Vec<Vec<db_exec::Value>>, has_more: bool) -> crate::results::Done {
+        crate::results::Done {
+            text: text.into(),
+            kind: sql_split::Kind::Query,
+            page: db_exec::Page::default(),
+            conn: "dev".into(),
+            color: None,
+            driver: db_conn::Driver::Postgres,
+            result: Ok(db_exec::Outcome {
+                columns: cols.iter().map(|(n, t)| db_exec::Column { name: n.to_string(), type_name: t.to_string() }).collect(),
+                rows,
+                has_more,
+                truncated: false,
+                rows_affected: None,
+                notices: vec![],
+                executed_sql: text.into(),
+                params: vec![],
+                in_transaction: false,
+                duration: std::time::Duration::from_millis(5),
+            }),
+        }
+    }
+
+    /// Cursor to (0-based) `line`, then let the panel load what it shows; the table's statement.
+    fn shown_at(app: &Entity<Siesta>, cx: &mut VisualTestContext, line: u32) -> Option<String> {
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.docs[this.current.unwrap()].editor.update(cx, |s, cx| s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx));
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.sync_results(window, cx);
+                this.ui.table.read(cx).delegate().done.as_ref().map(|d| d.text.clone())
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn result_follows_the_cursor(cx: &mut TestAppContext) {
+        use db_exec::Value::Int;
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                this.store.put((a.clone(), "SELECT 1".into()), done("SELECT 1", &[("a", "int4")], vec![vec![Int(1)]], false));
+                this.store.put((a.clone(), "SELECT 2".into()), done("SELECT 2", &[("b", "int4")], vec![vec![Int(2)], vec![Int(3)]], false));
+            })
+        });
+        assert_eq!(shown_at(&app, &mut cx, 0).as_deref(), Some("SELECT 1"));
+        assert_eq!(shown_at(&app, &mut cx, 2).as_deref(), Some("SELECT 2"));
+        let rows = cx.update(|_, cx| app.read(cx).ui.table.read(cx).delegate().order.len());
+        assert_eq!(rows, 2);
+        // `SELECT 3` was never run: nothing to show. Back on the first one, its result is back.
+        assert_eq!(shown_at(&app, &mut cx, 5), None);
+        assert_eq!(shown_at(&app, &mut cx, 0).as_deref(), Some("SELECT 1"));
+        // The sidebar counts rows per statement.
+        let status = |line: usize, cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).statement_status(&a, line, cx));
+        assert_eq!(status(3, &mut cx), Some(("2".to_string(), false)));
+        assert_eq!(status(6, &mut cx), None);
+        // Pin keeps the first result while the cursor moves.
+        cx.update(|_, cx| app.update(cx, |this, cx| this.ui.pinned = this.active_key(cx)));
+        assert_eq!(shown_at(&app, &mut cx, 2).as_deref(), Some("SELECT 1"));
+    }
+
+    #[gpui::test]
+    fn popup_shows_formatted_json_and_the_row_as_json(cx: &mut TestAppContext) {
+        use db_exec::Value::{Int, Json, Text};
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
+        let doc = serde_json::json!({"tags": ["x", "y"], "n": {"k": null}});
+        let rows = vec![vec![Int(1), Json(doc.clone()), Text("{\"t\":1}".into())], vec![Int(2), Json(serde_json::json!([1])), Text("plain".into())]];
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.put((a.clone(), "SELECT 1".into()), done("SELECT 1", &[("id", "int4"), ("doc", "jsonb"), ("note", "text")], rows, false))));
+        assert_eq!(shown_at(&app, &mut cx, 0).as_deref(), Some("SELECT 1"));
+        let popup = |cx: &mut VisualTestContext, row: usize, col: Option<usize>| {
+            cx.update(|window, cx| app.update(cx, |this, cx| this.open_popup(row, col, window, cx)));
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let p = app.read(cx).ui.popup.clone().unwrap();
+                let p = p.read(cx);
+                (p.title(), p.shown_text().to_string())
+            })
+        };
+        let (title, text) = popup(&mut cx, 0, Some(1));
+        assert_eq!(title, "doc · jsonb · row 1");
+        assert_eq!(text, serde_json::to_string_pretty(&doc).unwrap());
+        assert!(text.contains("\n  \"tags\": [\n    \"x\","));
+        // Text that parses as JSON is formatted too; plain text stays as it is.
+        assert_eq!(popup(&mut cx, 0, Some(2)).1, "{\n  \"t\": 1\n}");
+        assert_eq!(popup(&mut cx, 1, Some(2)).1, "plain");
+        // The whole row: a JSON object in column order.
+        let (title, text) = popup(&mut cx, 0, None);
+        assert_eq!(title, "Row 1");
+        assert!(text.starts_with("{\n  \"id\": 1,\n  \"doc\": {\n    \"tags\": ["), "{text}");
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok());
+    }
+
+    #[gpui::test]
+    fn sort_clicks_and_filters_become_the_page(cx: &mut TestAppContext) {
+        use db_exec::Value::Int;
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let key = (a.clone(), "SELECT 1".to_string());
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.put(key.clone(), done("SELECT 1", &[("a", "int4"), ("b", "int4")], vec![vec![Int(1), Int(2)]; 3], true))));
+        assert_eq!(shown_at(&app, &mut cx, 0).as_deref(), Some("SELECT 1"));
+        // No connection is picked, so nothing is sent; the page that would be asked for is what counts.
+        let page = |cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).store.entries[&key].page.clone());
+        let click = |col: &str, shift: bool, cx: &mut VisualTestContext| {
+            let col = col.to_string();
+            cx.update(|window, cx| app.update(cx, |this, cx| this.sort_by(col, shift, window, cx)))
+        };
+        click("a", false, &mut cx);
+        assert_eq!(page(&mut cx).sort, [("a".to_string(), false)]);
+        click("a", false, &mut cx);
+        assert_eq!(page(&mut cx).sort, [("a".to_string(), true)]);
+        click("b", true, &mut cx);
+        assert_eq!(page(&mut cx).sort, [("a".to_string(), true), ("b".to_string(), false)]);
+        click("a", false, &mut cx); // a plain click works on that column alone: desc → none
+        assert_eq!(page(&mut cx).sort, []);
+        // Next page: offset by one page size; the first page has no previous one.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.step_page(false, window, cx)));
+        assert_eq!(page(&mut cx).offset, 0);
+        cx.update(|window, cx| app.update(cx, |this, cx| this.step_page(true, window, cx)));
+        assert_eq!(page(&mut cx).offset, 100);
+        // Filter fields: Enter applies them as (column, text); a sort resets to the first page.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.toggle_filters(window, cx);
+                this.sync_results(window, cx);
+                let inputs = this.ui.table.read(cx).delegate().filters.clone();
+                assert_eq!(inputs.len(), 2);
+                inputs[1].update(cx, |s, cx| s.set_value(">10", window, cx));
+                this.apply_filters(window, cx);
+            })
+        });
+        let p = page(&mut cx);
+        assert_eq!((p.filters, p.offset), ([("b".to_string(), ">10".to_string())].to_vec(), 0));
     }
 
     #[gpui::test]

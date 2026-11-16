@@ -1,0 +1,826 @@
+//! The result panel: per-statement results (`Store`), the table (gpui-component `DataTable`),
+//! header, tabs (Result | Messages | Query), pagination, sorting and the filter row.
+//!
+//! The panel shows the result of the statement under the cursor (or the pinned one). Page, sort
+//! and filter changes run the statement again in the same session while the previous page stays
+//! on screen.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use db_conn::Driver;
+use db_exec::{DbError, Outcome, Page, Value};
+use gpui::{prelude::FluentBuilder as _, *};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{EditorState, Input, InputEvent, InputState, RopeExt as _},
+    menu::{DropdownMenu as _, PopupMenuItem},
+    tab::{Tab as TabItem, TabBar},
+    table::{Column, DataTable, TableDelegate, TableEvent, TableState},
+    v_flex,
+};
+use sql_split::{Dialect, Kind};
+
+use crate::{Siesta, RUN_KEY, doc::dialect_of, format::*, runner::Spec};
+
+/// A statement of a file: where its result lives. Edit the text and it is a new statement.
+pub type Key = (PathBuf, String);
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Tab {
+    #[default]
+    Result,
+    Messages,
+    Query,
+}
+
+/// A finished run of one statement.
+pub struct Done {
+    pub text: String,
+    pub kind: Kind,
+    /// The page that was asked for (offset, size, sort, filters).
+    pub page: Page,
+    pub conn: String,
+    pub color: Option<String>,
+    pub driver: Driver,
+    pub result: Result<Outcome, DbError>,
+}
+
+impl Done {
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.result.as_ref().ok()
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        dialect_of(self.driver)
+    }
+}
+
+#[derive(Default)]
+pub struct Entry {
+    /// Bumped by every new result or local re-sort: the table reloads when it changes.
+    pub id: u64,
+    pub running: Option<Instant>,
+    pub done: Option<Arc<Done>>,
+    /// The page the next run asks for; `done.page` is the one on screen.
+    pub page: Page,
+    /// "Count all": the filters it was counted with, and the count.
+    pub count: Option<(Vec<(String, String)>, u64)>,
+    pub tab: Tab,
+}
+
+#[derive(Default)]
+pub struct Store {
+    pub entries: HashMap<Key, Entry>,
+    /// The statements of the latest multi-statement run per file (empty: a single statement ran).
+    pub batches: HashMap<PathBuf, Vec<Key>>,
+    pub last: Option<(PathBuf, Vec<Spec>)>,
+}
+
+impl Store {
+    /// Put a finished result in place (used by the run pipeline, and by tests).
+    #[cfg(test)]
+    pub fn put(&mut self, key: Key, done: Done) {
+        let e = self.entries.entry(key).or_default();
+        e.id += 1;
+        e.page = done.page.clone();
+        e.done = Some(Arc::new(done));
+    }
+}
+
+/// The table's data and look.
+pub struct Grid {
+    view: WeakEntity<Siesta>,
+    pub done: Option<Arc<Done>>,
+    /// Display order of the rows (identity, or the local sort).
+    pub order: Vec<usize>,
+    numeric: Vec<bool>,
+    widths: Vec<Pixels>,
+    sort: Vec<(String, bool)>,
+    null_text: String,
+    preview_bytes: usize,
+    pub filters: Vec<Entity<InputState>>,
+    show_filters: bool,
+}
+
+impl Grid {
+    fn new(view: WeakEntity<Siesta>) -> Self {
+        Grid {
+            view,
+            done: None,
+            order: vec![],
+            numeric: vec![],
+            widths: vec![],
+            sort: vec![],
+            null_text: "NULL".into(),
+            preview_bytes: 8 * 1024,
+            filters: vec![],
+            show_filters: false,
+        }
+    }
+
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.done.as_ref().and_then(|d| d.outcome())
+    }
+
+    /// The value at display position (`row`, `col`).
+    pub fn value(&self, row: usize, col: usize) -> Option<&Value> {
+        self.outcome()?.rows.get(*self.order.get(row)?)?.get(col)
+    }
+
+    fn load(&mut self, done: Arc<Done>, sort: Vec<(String, bool)>, null_text: &str, preview_bytes: usize, fs: Pixels) {
+        let mut order = vec![];
+        let (mut numeric, mut widths) = (vec![], vec![]);
+        if let Some(o) = done.outcome() {
+            // The server sorted wrappable statements; the others are sorted here ("local").
+            order = if done.kind == Kind::Query { (0..o.rows.len()).collect() } else { sort_order(&o.rows, &o.columns, &sort) };
+            for (i, c) in o.columns.iter().enumerate() {
+                let sample = o.rows.iter().take(50).map(|r| cell_display(&r[i], null_text, 64).chars().count());
+                let chars = sample.chain([c.name.chars().count() + 3, c.type_name.chars().count()]).max().unwrap_or(4);
+                widths.push((fs * 0.62 * chars as f32 + px(28.)).clamp(px(64.), px(360.)));
+                numeric.push(is_numeric_column(&o.rows, i));
+            }
+        }
+        (self.done, self.order, self.numeric, self.widths, self.sort) = (Some(done), order, numeric, widths, sort);
+        (self.null_text, self.preview_bytes) = (null_text.to_string(), preview_bytes);
+    }
+}
+
+impl TableDelegate for Grid {
+    fn columns_count(&self, _: &App) -> usize {
+        self.outcome().map_or(0, |o| o.columns.len())
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.order.len()
+    }
+
+    fn column(&self, ix: usize, _: &App) -> Column {
+        let name = self.outcome().map_or_else(String::new, |o| o.columns[ix].name.clone());
+        let c = Column::new(name.clone(), name).width(self.widths.get(ix).copied().unwrap_or(px(120.))).resizable(true).movable(false).selectable(true);
+        if self.numeric.get(ix) == Some(&true) { c.text_right() } else { c }
+    }
+
+    /// Name and type, the sort mark, and (with Cmd+Alt+F) the filter field. A click sorts.
+    fn render_th(&mut self, ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let Some(col) = self.outcome().map(|o| o.columns[ix].clone()) else { return div().into_any_element() };
+        let t = cx.theme();
+        let (muted, fs) = (t.muted_foreground, t.font_size);
+        let mark = self.sort.iter().position(|(n, _)| *n == col.name).map(|i| {
+            let arrow = if self.sort[i].1 { "↓" } else { "↑" };
+            if self.sort.len() > 1 { format!("{arrow}{}", i + 1) } else { arrow.to_string() }
+        });
+        let view = self.view.clone();
+        let name = col.name.clone();
+        let local = self.done.as_ref().is_some_and(|d| d.kind != Kind::Query);
+        let head = div()
+            .id(("th", ix))
+            .w_full()
+            .cursor_pointer()
+            .on_click(move |ev: &ClickEvent, window, cx| {
+                let shift = ev.modifiers().shift;
+                view.update(cx, |this, cx| this.sort_by(name.clone(), shift, window, cx)).ok();
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_baseline()
+                    .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(col.name.clone()))
+                    .children(mark.map(|m| div().flex_none().text_color(t.primary).child(if local { format!("{m} local") } else { m }))),
+            )
+            .child(div().truncate().text_size(fs * 0.78).font_weight(FontWeight::NORMAL).text_color(muted).child(col.type_name.clone()));
+        let filter = self.show_filters.then(|| self.filters.get(ix).cloned()).flatten().map(|input| {
+            // A click in the field must not sort.
+            div().id(("th-filter", ix)).w_full().pt_1().on_click(|_, _, cx| cx.stop_propagation()).child(Input::new(&input).small().cleanable(true))
+        });
+        v_flex().w_full().child(head).children(filter).into_any_element()
+    }
+
+    fn render_td(&mut self, row: usize, col: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let Some(v) = self.value(row, col) else { return div().into_any_element() };
+        let text = cell_display(v, &self.null_text, self.preview_bytes);
+        let t = cx.theme();
+        div()
+            .w_full()
+            .truncate()
+            .when(matches!(v, Value::Null), |d| d.italic().text_color(t.muted_foreground))
+            .when(matches!(v, Value::Bytes(_)), |d| d.text_color(t.muted_foreground))
+            .when(self.numeric.get(col) == Some(&true), |d| d.text_right())
+            .child(text)
+            .into_any_element()
+    }
+
+    fn context_menu(&mut self, row: usize, menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> gpui_component::menu::PopupMenu {
+        let item = |label: &'static str, what: fn(&mut Siesta, usize, &mut Window, &mut Context<Siesta>)| {
+            let view = self.view.clone();
+            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                view.update(cx, |this, cx| what(this, row, window, cx)).ok();
+            })
+        };
+        menu.item(item("Copy row", Siesta::copy_row_tsv)).item(item("Copy as JSON", Siesta::copy_row_json)).item(item("Copy as INSERT", Siesta::copy_row_insert))
+    }
+
+    fn cell_text(&self, row: usize, col: usize, _: &App) -> String {
+        self.value(row, col).map(tsv_cell).unwrap_or_default()
+    }
+}
+
+/// Everything the panel keeps besides the results themselves.
+pub struct Ui {
+    pub table: Entity<TableState<Grid>>,
+    /// Messages and Query tabs: a read-only editor, loaded when what it shows changes.
+    meta: Entity<EditorState>,
+    meta_shown: Option<(Key, u64, Tab)>,
+    filter_cols: Vec<String>,
+    filter_subs: Vec<Subscription>,
+    pub filters_open: bool,
+    /// (statement, result id, filter row visible): what the table currently holds.
+    shown: Option<(Key, u64, bool)>,
+    pub pinned: Option<Key>,
+    pub popup: Option<Entity<crate::value_popup::Popup>>,
+    _subs: Vec<Subscription>,
+}
+
+impl Ui {
+    pub fn new(view: WeakEntity<Siesta>, window: &mut Window, cx: &mut Context<Siesta>) -> Self {
+        let table = cx.new(|cx| {
+            TableState::new(Grid::new(view), window, cx).cell_selectable(true).row_header(false).col_selectable(false).row_selectable(false).sortable(false).col_movable(false)
+        });
+        let meta = cx.new(|cx| {
+            let mut s = EditorState::new(window, cx).line_number(false).soft_wrap(true).folding(false).searchable(true).replaceable(false);
+            s.set_readonly(true, cx);
+            s
+        });
+        let subs = vec![cx.subscribe_in(&table, window, |this, _, ev: &TableEvent, window, cx| {
+            // A single click only selects (it must be possible to select and copy);
+            // a double click, Enter or Space opens the value.
+            if let TableEvent::DoubleClickedCell(r, c) = ev {
+                this.open_popup(*r, Some(*c), window, cx);
+            }
+        })];
+        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, pinned: None, popup: None, _subs: subs }
+    }
+}
+
+fn plain_error(e: &DbError) -> String {
+    let mut s = match &e.code {
+        Some(c) => format!("ERROR {c}: {}", e.message),
+        None => format!("ERROR: {}", e.message),
+    };
+    if let Some(d) = &e.detail {
+        s += &format!("\nDETAIL: {d}");
+    }
+    if let Some(h) = &e.hint {
+        s += &format!("\nHINT: {h}");
+    }
+    if let Some(p) = e.position {
+        s += &format!("\nPOSITION: {p}");
+    }
+    s
+}
+
+/// The Messages tab.
+pub fn messages_text(done: &Done) -> String {
+    let mut parts = vec![];
+    match &done.result {
+        Err(e) => parts.push(plain_error(e)),
+        Ok(o) => parts.extend(o.notices.iter().cloned()),
+    }
+    if parts.is_empty() { "No messages".into() } else { parts.join("\n\n") }
+}
+
+/// The Query tab: what was sent (with the page wrapper), and its parameters.
+pub fn query_text(done: &Done) -> String {
+    match &done.result {
+        Ok(o) => {
+            let params: String = o.params.iter().enumerate().map(|(i, p)| format!("\n-- ${} = {p}", i + 1)).collect();
+            format!("{}{params}", o.executed_sql)
+        }
+        Err(_) => done.text.clone(),
+    }
+}
+
+impl Siesta {
+    /// The statement whose result is shown: the pinned one, else the one under the cursor.
+    pub(crate) fn shown_key(&self, cx: &App) -> Option<Key> {
+        if let Some(k) = &self.ui.pinned {
+            return Some(k.clone());
+        }
+        self.active_key(cx)
+    }
+
+    /// The statement under the cursor of the current file.
+    pub(crate) fn active_key(&self, cx: &App) -> Option<Key> {
+        let d = self.doc().filter(|d| d.sql)?;
+        let st = d.active_statement()?;
+        let text = d.editor.read(cx).text().slice(st.range.clone()).to_string();
+        Some(((*d.path).clone(), text))
+    }
+
+    /// Row count or ✕ beside a statement of the tree.
+    pub(crate) fn statement_status(&self, path: &Path, line: usize, cx: &App) -> Option<(String, bool)> {
+        let d = self.docs.iter().find(|d| *d.path == path)?;
+        let st = d.file.statements.iter().find(|s| s.line == line)?;
+        let text = d.editor.read(cx).text().slice(st.range.clone()).to_string();
+        let e = self.store.entries.get(&(path.to_path_buf(), text))?;
+        if e.running.is_some() && e.done.is_none() {
+            return Some(("…".into(), false));
+        }
+        match &e.done.as_ref()?.result {
+            Ok(o) => Some((o.rows_affected.filter(|_| o.columns.is_empty()).map_or_else(|| o.rows.len().to_string(), |n| n.to_string()), false)),
+            Err(_) => Some(("✕".into(), true)),
+        }
+    }
+
+    fn entry(&self, key: &Key) -> Option<&Entry> {
+        self.store.entries.get(key)
+    }
+
+    fn done_of(&self, key: &Key) -> Option<Arc<Done>> {
+        self.entry(key)?.done.clone()
+    }
+
+    /// Load the table (and the filter fields, and the Messages / Query text) when what is shown changed.
+    pub(crate) fn sync_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.shown_key(cx);
+        let e = key.as_ref().and_then(|k| self.entry(k));
+        let sig = key.clone().zip(e).map(|(k, e)| (k, e.id, self.ui.filters_open));
+        let (done, page) = e.map(|e| (e.done.clone(), e.page.clone())).unwrap_or_default();
+        if sig != self.ui.shown {
+            self.ui.shown = sig;
+            let st = &self.settings.settings.results;
+            let (null_text, preview, fs) = (st.null_text.clone(), st.cell_preview_kb * 1024, cx.theme().font_size);
+            let cols: Vec<String> = done.as_ref().and_then(|d| d.outcome()).map(|o| o.columns.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
+            if cols != self.ui.filter_cols {
+                self.rebuild_filter_inputs(&cols, window, cx);
+            }
+            // The fields show this statement's filters (the page that was asked for).
+            for (name, input) in cols.iter().zip(&self.grid_filters(cx)) {
+                let text = page.filters.iter().find(|(c, _)| c == name).map(|(_, t)| t.clone()).unwrap_or_default();
+                input.update(cx, |s, cx| {
+                    if s.value() != text.as_str() {
+                        s.set_value(text, window, cx);
+                    }
+                });
+            }
+            let open = self.ui.filters_open;
+            let local_sort = page.sort.clone();
+            self.ui.table.update(cx, |t, cx| {
+                let g = t.delegate_mut();
+                g.show_filters = open;
+                match done {
+                    Some(d) => g.load(d, local_sort, &null_text, preview, fs),
+                    None => *g = Grid { filters: std::mem::take(&mut g.filters), ..Grid::new(g.view.clone()) },
+                }
+                t.clear_selection(cx);
+                t.refresh(cx);
+            });
+        }
+        self.sync_meta(key, window, cx);
+    }
+
+    fn grid_filters(&self, cx: &App) -> Vec<Entity<InputState>> {
+        self.ui.table.read(cx).delegate().filters.clone()
+    }
+
+    fn rebuild_filter_inputs(&mut self, cols: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        self.ui.filter_cols = cols.to_vec();
+        self.ui.filter_subs.clear();
+        let inputs: Vec<Entity<InputState>> = cols.iter().map(|c| cx.new(|cx| InputState::new(window, cx).placeholder(format!("filter {c}")))).collect();
+        for i in &inputs {
+            // Enter applies all the fields at once (a run per keystroke would be a request per letter).
+            let sub = cx.subscribe_in(i, window, |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.apply_filters(window, cx);
+                }
+            });
+            self.ui.filter_subs.push(sub);
+        }
+        self.ui.table.update(cx, |t, _| t.delegate_mut().filters = inputs);
+    }
+
+    fn sync_meta(&mut self, key: Option<Key>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(k) = key else { return };
+        let Some(e) = self.entry(&k) else { return };
+        let Some(done) = e.done.clone().filter(|_| e.tab != Tab::Result) else { return };
+        let sig = Some((k, e.id, e.tab));
+        if sig == self.ui.meta_shown {
+            return;
+        }
+        let (tab, text) = (e.tab, if e.tab == Tab::Messages { messages_text(&done) } else { query_text(&done) });
+        self.ui.meta_shown = sig;
+        self.ui.meta.update(cx, |s, cx| {
+            s.set_highlighter(SharedString::from(if tab == Tab::Query { "sql" } else { "text" }), cx);
+            s.set_value(text, window, cx);
+        });
+    }
+
+    // ---- page, sort, filter ----
+
+    fn edit_page(&mut self, window: &mut Window, cx: &mut Context<Self>, change: impl FnOnce(&mut Entry)) {
+        let Some(key) = self.shown_key(cx) else { return };
+        let Some(e) = self.store.entries.get_mut(&key) else { return };
+        if e.done.is_none() || e.running.is_some() {
+            return;
+        }
+        change(e);
+        let local = e.done.as_ref().is_some_and(|d| d.kind != Kind::Query);
+        if local {
+            // Not wrappable: the sort happens in memory.
+            e.id += 1;
+            cx.notify();
+        } else {
+            self.rerun(&key, window, cx);
+        }
+    }
+
+    /// Header click (Shift adds the column to the sort).
+    pub(crate) fn sort_by(&mut self, col: String, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_page(window, cx, |e| {
+            e.page.sort = next_sort(&e.page.sort, &col, shift);
+            e.page.offset = 0;
+        });
+    }
+
+    /// Cmd+] / Cmd+[
+    pub(crate) fn step_page(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.shown_key(cx) else { return };
+        let Some(e) = self.entry(&key) else { return };
+        let Some(done) = e.done.as_ref().filter(|d| d.kind == Kind::Query) else { return };
+        // The page on screen, not one that is still being fetched.
+        let (offset, size, more) = (done.page.offset, done.page.size, done.outcome().is_some_and(|o| o.has_more));
+        if (forward && !more) || (!forward && offset == 0) {
+            return;
+        }
+        self.edit_page(window, cx, |e| e.page.offset = if forward { offset + size } else { offset.saturating_sub(size) });
+    }
+
+    pub(crate) fn set_page_size(&mut self, size: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_page(window, cx, |e| {
+            e.page.size = size.max(1);
+            e.page.offset = 0;
+        });
+    }
+
+    /// Enter in a filter field: all the fields become the page's filters.
+    pub(crate) fn apply_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cols = self.ui.filter_cols.clone();
+        let texts: Vec<String> = self.grid_filters(cx).iter().map(|i| i.read(cx).value().trim().to_string()).collect();
+        let filters: Vec<(String, String)> = cols.into_iter().zip(texts).filter(|(_, t)| !t.is_empty()).collect();
+        self.edit_page(window, cx, |e| {
+            e.page.filters = filters;
+            e.page.offset = 0;
+        });
+    }
+
+    pub(crate) fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_page(window, cx, |e| {
+            e.page.filters.clear();
+            e.page.offset = 0;
+        });
+    }
+
+    pub(crate) fn toggle_filters(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.ui.filters_open = !self.ui.filters_open;
+        cx.notify();
+    }
+
+    fn pin(&mut self, cx: &mut Context<Self>) {
+        self.ui.pinned = match self.ui.pinned {
+            Some(_) => None,
+            None => self.active_key(cx),
+        };
+        cx.notify();
+    }
+
+    // ---- selection and copying ----
+
+    fn selected(&self, cx: &App) -> Option<(usize, usize)> {
+        self.ui.table.read(cx).selected_cell()
+    }
+
+    /// Cmd+C: the selected cell (or row) for pasting into a spreadsheet.
+    pub(crate) fn copy_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((r, c)) = self.selected(cx) else { return };
+        let text = self.ui.table.read(cx).delegate().value(r, c).map(tsv_cell);
+        if let Some(t) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
+            window.push_notification("Copied the cell", cx);
+        }
+    }
+
+    fn with_row<R>(&self, row: usize, cx: &App, f: impl FnOnce(&Done, &Outcome, &[Value]) -> R) -> Option<R> {
+        let g = self.ui.table.read(cx).delegate();
+        let (done, o) = (g.done.as_ref()?, g.outcome()?);
+        Some(f(done, o, o.rows.get(*g.order.get(row)?)?))
+    }
+
+    fn copy_text(&self, text: Option<String>, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
+            window.push_notification(format!("Copied {what}"), cx);
+        }
+    }
+
+    pub(crate) fn copy_row_tsv(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.with_row(row, cx, |_, _, r| tsv([r]));
+        self.copy_text(text, "the row", window, cx);
+    }
+
+    pub(crate) fn copy_row_json(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.with_row(row, cx, |_, o, r| row_json(&o.columns, r));
+        self.copy_text(text, "the row as JSON", window, cx);
+    }
+
+    pub(crate) fn copy_row_insert(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.with_row(row, cx, |d, o, r| insert_sql("table_name", &o.columns, [r], d.dialect()));
+        self.copy_text(text, "the row as INSERT", window, cx);
+    }
+
+    /// Copy the whole shown result (the page) as TSV with a header line.
+    fn copy_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let g = self.ui.table.read(cx).delegate();
+        let Some(o) = g.outcome() else { return };
+        let head = o.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t");
+        let text = format!("{head}\n{}", tsv(g.order.iter().map(|&i| o.rows[i].as_slice())));
+        let n = o.rows.len();
+        self.copy_text(Some(text), &format!("{n} rows"), window, cx);
+    }
+
+    /// Enter / Space: the selected cell in the popup.
+    pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((r, c)) = self.selected(cx) {
+            self.open_popup(r, Some(c), window, cx);
+        }
+    }
+
+    /// Cmd+Shift+Enter in the table: the whole row as a JSON object.
+    pub(crate) fn open_selected_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((r, _)) = self.selected(cx) {
+            self.open_popup(r, None, window, cx);
+        }
+    }
+
+    // ---- the panel ----
+
+    /// The right panel: header (Run / Stop, statement, Pin; status and actions), batch strip,
+    /// tabs, then the tab's content and the page footer.
+    pub(crate) fn result_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_results(window, cx);
+        let t = cx.theme();
+        let (muted, border, fs) = (t.muted_foreground, t.border, t.font_size);
+        let (danger, warning, primary, fg) = (t.danger, t.warning, t.primary, t.foreground);
+        let key = self.shown_key(cx);
+        let e = key.as_ref().and_then(|k| self.entry(k));
+        let done = e.and_then(|e| e.done.clone());
+        let running = e.and_then(|e| e.running);
+        let tab = e.map_or(Tab::Result, |e| e.tab);
+        let title = key.as_ref().map(|k| k.1.lines().next().unwrap_or("").trim().to_string());
+        let icon = |svg: &'static [u8]| Icon::default().data(svg);
+        let can_run = self.doc().is_some_and(|d| d.sql && d.active_statement().is_some());
+
+        let run = Button::new("run")
+            .label(if running.is_some() { "◼ Stop" } else { "▶ Run" })
+            .primary()
+            .small()
+            .disabled(running.is_none() && !can_run)
+            .tooltip(if running.is_some() { "Stop (Esc)" } else { "Run the statement (Cmd+Enter)" })
+            .on_click(cx.listener(move |this, _, window, cx| if running.is_some() { this.cancel_run(window, cx) } else { this.run_current(window, cx) }));
+        let pin = Button::new("pin")
+            .icon(icon(include_bytes!("../assets/pin.svg")))
+            .ghost()
+            .small()
+            .selected(self.ui.pinned.is_some())
+            .tooltip(if self.ui.pinned.is_some() { "Pinned: click to follow the cursor again" } else { "Pin: keep this result while the cursor moves" })
+            .on_click(cx.listener(|this, _, _, cx| this.pin(cx)));
+        let line1 = h_flex()
+            .gap_3()
+            .items_center()
+            .child(run)
+            .child(div().min_w_0().flex_1().truncate().text_sm().text_color(muted).children(title))
+            .child(pin);
+
+        // Status: what ran, how long, where.
+        let pill = |text: String, color: Hsla| div().flex_none().px_1p5().rounded_sm().bg(color.opacity(0.15)).text_color(color).text_xs().font_weight(FontWeight::BOLD).child(text);
+        let mut status = h_flex().min_w_0().gap_2().items_center().text_xs().text_color(muted);
+        if let Some(started) = running {
+            status = status.child(div().text_color(warning).child(format!("Running… {:.1} s", started.elapsed().as_secs_f32())));
+        }
+        if let Some(d) = &done {
+            status = match &d.result {
+                Ok(o) => status.child(div().text_color(fg).font_weight(FontWeight::SEMIBOLD).child(rows_label(o))).child(duration_label(o.duration)),
+                Err(_) => status.child(pill("Error".into(), danger)),
+            };
+            let strip = d.color.as_deref().and_then(parse_color).unwrap_or(muted.opacity(0.5));
+            status = status.child(h_flex().gap_1().items_center().child(div().w(px(3.)).h(fs).rounded_full().bg(strip)).child(d.conn.clone()));
+            if d.outcome().is_some_and(|o| o.in_transaction) || self.in_tx(&key.as_ref().expect("key").0) {
+                status = status.child(div().text_color(warning).font_weight(FontWeight::BOLD).child("TX ●"));
+            }
+            let filters = d.page.filters.len();
+            if filters > 0 {
+                status = status.child(
+                    Button::new("clear-filters")
+                        .label(format!("{filters} filter{} ✕", if filters == 1 { "" } else { "s" }))
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Clear the filters")
+                        .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx))),
+                );
+            }
+            if running.is_some() {
+                status = status.child("Loading…");
+            }
+        } else if running.is_none() {
+            status = status.child(if key.is_some() { format!("{RUN_KEY} to run") } else { "No statement under the cursor".to_string() });
+        }
+        let mut actions = h_flex().flex_none().gap_1();
+        if done.as_ref().is_some_and(|d| d.outcome().is_some_and(|o| !o.columns.is_empty())) {
+            actions = actions
+                .child(
+                    Button::new("filters")
+                        .icon(IconName::Search)
+                        .ghost()
+                        .xsmall()
+                        .selected(self.ui.filters_open)
+                        .tooltip("Column filters (Cmd+Alt+F)")
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_filters(window, cx))),
+                )
+                .child(Button::new("copy-result").icon(IconName::Copy).ghost().xsmall().tooltip("Copy the page as TSV").on_click(cx.listener(|this, _, window, cx| this.copy_result(window, cx))));
+        }
+        if done.is_some() {
+            actions = actions.child(Button::new("page-sql").label("Show page SQL").ghost().xsmall().on_click(cx.listener(|this, _, _, cx| {
+                if let Some(e) = this.shown_key(cx).and_then(|k| this.store.entries.get_mut(&k)) {
+                    e.tab = Tab::Query;
+                }
+                cx.notify();
+            })));
+        }
+        let line2 = h_flex().gap_2().items_center().justify_between().child(status).child(actions);
+        let batch = self.batch_strip(key.as_ref(), cx);
+        let header = v_flex().flex_none().gap_1().px_3().py_1p5().border_b_1().border_color(border).child(line1).child(line2).children(batch);
+
+        let tabs = done.as_ref().map(|d| {
+            let msgs = match &d.result {
+                Err(_) => Some(danger),
+                Ok(o) if !o.notices.is_empty() => Some(warning),
+                _ => None,
+            };
+            TabBar::new("result-tabs").pill().small().selected_index(tab as usize).on_click(cx.listener(|this, ix: &usize, _, cx| {
+                if let Some(e) = this.shown_key(cx).and_then(|k| this.store.entries.get_mut(&k)) {
+                    e.tab = [Tab::Result, Tab::Messages, Tab::Query][(*ix).min(2)];
+                }
+                cx.notify();
+            }))
+            .child(TabItem::new().label("Result"))
+            .child(match msgs {
+                Some(c) => TabItem::new().label("Messages").suffix(div().size(fs * 0.7).rounded_full().bg(c).mr(fs * 0.4)),
+                None => TabItem::new().label("Messages"),
+            })
+            .child(TabItem::new().label("Query"))
+        });
+
+        let body = match (&done, tab) {
+            (None, _) => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_color(muted)
+                .child(if running.is_some() { "Running…".to_string() } else { format!("{RUN_KEY} to run") })
+                .into_any_element(),
+            (Some(_), Tab::Messages | Tab::Query) => div().flex_1().min_h_0().child(gpui_component::input::Editor::new(&self.ui.meta).size_full().bordered(false)).into_any_element(),
+            (Some(d), Tab::Result) => match &d.result {
+                Err(err) => v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .gap_1()
+                    .text_sm()
+                    .child(div().text_color(danger).font_weight(FontWeight::SEMIBOLD).child(match &err.code {
+                        Some(c) => format!("{c}: {}", err.message),
+                        None => err.message.clone(),
+                    }))
+                    .children(err.detail.clone().map(|x| div().child(format!("DETAIL: {x}"))))
+                    .children(err.hint.clone().map(|x| div().text_color(muted).child(format!("HINT: {x}"))))
+                    .into_any_element(),
+                Ok(o) if o.columns.is_empty() => v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(div().text_color(fg).child(rows_label(o)))
+                    .children(o.notices.first().map(|n| div().text_xs().text_color(muted).child(n.clone())))
+                    .into_any_element(),
+                Ok(_) => self.table_view(running.is_some(), primary, window, cx),
+            },
+        };
+        let footer = (tab == Tab::Result).then(|| self.footer(key.as_ref(), cx)).flatten();
+        let panel = v_flex().size_full().child(header).children(tabs.map(|t| div().flex_none().px_2().py_1().child(t))).child(body).children(footer);
+        panel.into_any_element()
+    }
+
+    /// `Result 1 | Result 2 …` and `N statements · M rows affected` for a multi-statement run.
+    fn batch_strip(&self, key: Option<&Key>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = key?;
+        let keys = self.store.batches.get(&key.0).filter(|b| b.len() > 1 && b.contains(key))?;
+        let affected: u64 = keys.iter().filter_map(|k| self.done_of(k)).filter_map(|d| d.outcome().and_then(|o| o.rows_affected)).sum();
+        let ran = keys.iter().filter(|k| self.entry(k).is_some_and(|e| e.done.is_some())).count();
+        let mut row = h_flex().gap_1().items_center().flex_wrap();
+        for (i, k) in keys.iter().enumerate() {
+            let failed = self.done_of(k).is_some_and(|d| d.result.is_err());
+            let (path, text) = k.clone();
+            let b = Button::new(("batch", i))
+                .label(format!("Result {}{}", i + 1, if failed { " ✕" } else { "" }))
+                .ghost()
+                .xsmall()
+                .selected(k == key)
+                .on_click(cx.listener(move |this, _, window, cx| this.go_to_statement_text(&path, &text, window, cx)));
+            row = row.child(b);
+        }
+        let summary = format!("{} statements · {affected} rows affected{}", keys.len(), if ran < keys.len() { " (stopped)" } else { "" });
+        Some(row.child(div().ml_2().text_xs().text_color(cx.theme().muted_foreground).child(summary)).into_any_element())
+    }
+
+    /// A batch tab: move the cursor to that statement, which brings its result up.
+    fn go_to_statement_text(&mut self, path: &Path, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.docs.iter().find(|d| *d.path == path) else { return };
+        let editor = d.editor.clone();
+        editor.update(cx, |s, cx| {
+            if let Some(at) = s.value().find(text) {
+                let pos = s.text().offset_to_position(at);
+                s.set_cursor_position(pos, window, cx);
+            }
+        });
+    }
+
+    fn table_view(&self, loading: bool, _primary: Hsla, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme();
+        let open = self.ui.filters_open;
+        // Two lines (name, type) and, with the filter row, a field under them.
+        let head = t.font_size * if open { 4.6 } else { 2.9 };
+        div()
+            .id("result-table")
+            .key_context("ResultTable")
+            .flex_1()
+            .min_h_0()
+            .when(loading, |d| d.opacity(0.55))
+            .on_action(cx.listener(|this, _: &crate::CopyCells, window, cx| this.copy_selection(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::OpenCell, window, cx| this.open_selected(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::OpenRow, window, cx| this.open_selected_row(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::NextPage, window, cx| this.step_page(true, window, cx)))
+            .on_action(cx.listener(|this, _: &crate::PrevPage, window, cx| this.step_page(false, window, cx)))
+            .child(DataTable::new(&self.ui.table).small().bordered(false).stripe(true).header_row_height(head))
+            .into_any_element()
+    }
+
+    /// `‹ 1 / ? ›`, the page size, "Count all"; Query results only.
+    fn footer(&self, key: Option<&Key>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let e = self.entry(key?)?;
+        let done = e.done.as_ref()?;
+        let o = done.outcome().filter(|o| !o.columns.is_empty())?;
+        let t = cx.theme();
+        let muted = t.muted_foreground;
+        let mut row = h_flex().flex_none().gap_2().items_center().px_3().py_1().border_t_1().border_color(t.border).text_xs().text_color(muted);
+        if done.kind != Kind::Query {
+            let sorted = !e.page.sort.is_empty();
+            row = row.child(format!("{}{}", rows_label(o), if sorted { " · sorted locally" } else { "" }));
+            if o.truncated {
+                row = row.child(div().text_color(t.warning).child("The result is cut at results.max_rows"));
+            }
+            return Some(row.into_any_element());
+        }
+        let (offset, size) = (done.page.offset, done.page.size);
+        let total = e.count.as_ref().filter(|(f, _)| *f == done.page.filters).map(|(_, n)| *n);
+        let sizes = [25u64, 50, 100, 200, 500, 1000];
+        let view = cx.entity().downgrade();
+        row = row
+            .child(Button::new("page-prev").icon(IconName::ChevronLeft).ghost().xsmall().disabled(offset == 0).tooltip("Previous page (Cmd+[)").on_click(cx.listener(|this, _, window, cx| this.step_page(false, window, cx))))
+            .child(page_label(offset, size, total))
+            .child(Button::new("page-next").icon(IconName::ChevronRight).ghost().xsmall().disabled(!o.has_more).tooltip("Next page (Cmd+])").on_click(cx.listener(|this, _, window, cx| this.step_page(true, window, cx))))
+            .child(
+                Button::new("page-size")
+                    .label(format!("{size} / page"))
+                    .ghost()
+                    .xsmall()
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |menu, _, _| {
+                        sizes.iter().fold(menu, |menu, &n| {
+                            let view = view.clone();
+                            menu.item(PopupMenuItem::new(format!("{n} rows")).checked(n == size).on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| this.set_page_size(n, window, cx)).ok();
+                            }))
+                        })
+                    }),
+            );
+        row = match total {
+            Some(n) => row.child(format!("{n} rows in total")),
+            None => row.child(Button::new("count-all").label("Count all").ghost().xsmall().on_click(cx.listener(|this, _, window, cx| this.count_all(window, cx)))),
+        };
+        Some(row.into_any_element())
+    }
+}
