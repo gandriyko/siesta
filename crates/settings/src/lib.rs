@@ -1,1 +1,354 @@
-//! Global (`~/.config/siesta/settings.json`) and workspace (`.siesta/settings.json`) settings.
+//! Settings: `~/.config/siesta/settings.json` (global) overlaid by
+//! `<workspace>/.siesta/settings.json` (per project, can be committed).
+//!
+//! JSON with `//` and `/* */` comments, nested by group (`results.page_size` is
+//! `{"results": {"page_size": …}}`). Missing keys take defaults, unknown keys are ignored.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Which variant of the theme is shown; `System` follows the OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Extra shortcuts on top of Siesta's own; `keymap.json` next to the settings file wins over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Keymap {
+    #[default]
+    Default,
+    Vscode,
+    Jetbrains,
+}
+
+/// Editor and result panel side by side (`horizontal`) or stacked (`vertical`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+/// When a destructive statement (`DROP`, `TRUNCATE`, `DELETE`/`UPDATE` without `WHERE`) asks for confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmDestructive {
+    /// Only on connections matching `connections.prod_pattern`.
+    #[default]
+    Prod,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub appearance: Appearance,
+    pub keymap: Keymap,
+    /// Cmd+\ toggles it.
+    pub split: Split,
+    /// The editor's share of the editor + result area, 0.2–0.8.
+    pub split_ratio: f32,
+    /// Theme family (`"Gruvbox"`, `"Catppuccin"`, …); `"Default"` = built-in.
+    pub theme: String,
+    /// UI text size, px.
+    pub ui_font_size: f32,
+    /// Editor and result font; empty = the theme's monospace font.
+    pub font_family: String,
+    /// Editor and result font size, px.
+    pub font_size: f32,
+    pub editor: Editor,
+    pub results: Results,
+    pub run: Run,
+    pub connections: Connections,
+    pub history: History,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Editor {
+    pub line_numbers: bool,
+    pub soft_wrap: bool,
+    /// Background on the line under the cursor.
+    pub highlight_current_line: bool,
+}
+
+/// The result table (`"results": {…}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Results {
+    /// Rows per page, fetched from the server.
+    pub page_size: usize,
+    /// Hard cap on rows a single statement returns (CLI / export).
+    pub max_rows: usize,
+    /// Cell values longer than this are cut in the grid; the full value opens in a popup.
+    pub cell_preview_kb: usize,
+    /// How SQL NULL is shown.
+    pub null_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Run {
+    /// A failed statement stops the rest of a multi-statement run.
+    pub stop_on_error: bool,
+    pub confirm_destructive: ConfirmDestructive,
+    /// Server-side timeout per statement; `null` = no limit.
+    pub statement_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Connections {
+    /// Extra connection files above the chain; `~/` is the home directory, relative = workspace root.
+    pub files: Vec<String>,
+    /// Connections shown with a red warning; `*` matches any suffix, case-insensitive.
+    pub prod_pattern: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct History {
+    pub total: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            appearance: Appearance::System,
+            keymap: Keymap::Default,
+            split: Split::Horizontal,
+            split_ratio: 0.55,
+            theme: "Default".into(),
+            ui_font_size: 14.,
+            font_family: String::new(),
+            font_size: 14.,
+            editor: Editor::default(),
+            results: Results::default(),
+            run: Run::default(),
+            connections: Connections::default(),
+            history: History::default(),
+        }
+    }
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false }
+    }
+}
+
+impl Default for Results {
+    fn default() -> Self {
+        Self { page_size: 100, max_rows: 10_000, cell_preview_kb: 8, null_text: "NULL".into() }
+    }
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self { stop_on_error: true, confirm_destructive: ConfirmDestructive::Prod, statement_timeout_ms: None }
+    }
+}
+
+impl Default for Connections {
+    fn default() -> Self {
+        Self { files: vec![], prod_pattern: "prod*".into() }
+    }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self { total: 500 }
+    }
+}
+
+impl Connections {
+    pub fn is_prod(&self, name: &str) -> bool {
+        let (p, n) = (self.prod_pattern.to_lowercase(), name.to_lowercase());
+        match p.strip_suffix('*') {
+            Some(prefix) => n.starts_with(prefix),
+            None => !p.is_empty() && n == p,
+        }
+    }
+}
+
+impl Settings {
+    /// `connections.files` as paths (`~/` → home, relative → `root`).
+    pub fn connection_files(&self, root: &Path) -> Vec<PathBuf> {
+        let home = std::env::home_dir().unwrap_or_default();
+        self.connections.files.iter().map(|p| p.strip_prefix("~/").map_or_else(|| root.join(p), |rest| home.join(rest))).collect()
+    }
+}
+
+/// Both layers as written, plus the merged result.
+#[derive(Clone)]
+pub struct Loaded {
+    pub global_path: Option<PathBuf>,
+    pub workspace_path: Option<PathBuf>,
+    global: Value,
+    workspace: Value,
+    pub settings: Settings,
+    /// Unreadable / invalid files (their layer is skipped).
+    pub errors: Vec<String>,
+}
+
+/// `~/.config/siesta/settings.json`
+pub fn global_path() -> Option<PathBuf> {
+    Some(std::env::home_dir()?.join(".config/siesta/settings.json"))
+}
+
+impl Loaded {
+    pub fn load(root: Option<&Path>) -> Self {
+        Self::load_from(global_path(), root.map(|r| r.join(".siesta/settings.json")))
+    }
+
+    pub fn load_from(global_path: Option<PathBuf>, workspace_path: Option<PathBuf>) -> Self {
+        let mut errors = vec![];
+        let mut read = |p: &Option<PathBuf>| match p.as_deref().map(read_jsonc) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                errors.push(format!("{}: {e}", p.as_ref().unwrap().display()));
+                Value::Object(Map::new())
+            }
+            None => Value::Object(Map::new()),
+        };
+        let (global, workspace) = (read(&global_path), read(&workspace_path));
+        let mut loaded = Self { global_path, workspace_path, global, workspace, settings: Settings::default(), errors };
+        loaded.merge();
+        loaded
+    }
+
+    fn merge(&mut self) {
+        let mut v = serde_json::to_value(Settings::default()).expect("defaults serialize");
+        deep_merge(&mut v, &self.global);
+        deep_merge(&mut v, &self.workspace);
+        match serde_json::from_value(v) {
+            Ok(s) => self.settings = s,
+            Err(e) => self.errors.push(format!("settings: {e}")),
+        }
+    }
+
+    /// Set a dotted key (`"results.page_size"`) in the global file and re-merge.
+    /// Comments in the global file are not preserved once the UI writes it.
+    pub fn set(&mut self, key: &str, value: Value) -> io::Result<()> {
+        let path = self.global_path.clone().ok_or_else(|| io::Error::other("no home directory"))?;
+        let mut node = &mut self.global;
+        for part in key.split('.') {
+            if !node.is_object() {
+                *node = Value::Object(Map::new());
+            }
+            node = node.as_object_mut().unwrap().entry(part).or_insert(Value::Null);
+        }
+        *node = value;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&self.global)? + "\n")?;
+        self.merge();
+        Ok(())
+    }
+
+    /// The workspace file overrides `key`, so editing the global value has no effect.
+    pub fn overridden(&self, key: &str) -> bool {
+        key.split('.').try_fold(&self.workspace, |v, k| v.get(k)).is_some()
+    }
+}
+
+fn read_jsonc(path: &Path) -> Result<Value, String> {
+    match std::fs::File::open(path) {
+        Ok(f) => serde_json::from_reader(json_comments::StripComments::new(f)).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Objects merge key by key; anything else (arrays included) replaces.
+fn deep_merge(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                deep_merge(b.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults() {
+        let s = Settings::default();
+        assert_eq!((s.results.page_size, s.results.max_rows, s.results.cell_preview_kb), (100, 10_000, 8));
+        assert_eq!(s.results.null_text, "NULL");
+        assert!(s.run.stop_on_error);
+        assert_eq!((s.run.confirm_destructive, s.run.statement_timeout_ms), (ConfirmDestructive::Prod, None));
+        assert_eq!((s.connections.prod_pattern.as_str(), s.history.total), ("prod*", 500));
+        // an empty layer set yields exactly the defaults
+        assert_eq!(Loaded::load_from(None, None).settings, s);
+    }
+
+    #[test]
+    fn layers_comments_and_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (g, w) = (dir.path().join("cfg/settings.json"), dir.path().join("ws.json"));
+        std::fs::write(
+            &w,
+            "{\n // project wants small pages\n \"results\": {\"page_size\": 50}, \"appearance\": \"light\", /* why not */\n \"run\": {\"confirm_destructive\": \"always\", \"statement_timeout_ms\": 5000}\n}",
+        )
+        .unwrap();
+
+        let mut l = Loaded::load_from(Some(g.clone()), Some(w));
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!((l.settings.appearance, l.settings.results.page_size), (Appearance::Light, 50));
+        assert_eq!((l.settings.run.confirm_destructive, l.settings.run.statement_timeout_ms), (ConfirmDestructive::Always, Some(5000)));
+        assert_eq!(l.settings.results.max_rows, 10_000); // default kept beside the override
+        assert!(l.overridden("results.page_size") && !l.overridden("font_size"));
+
+        l.set("font_size", 16.into()).unwrap();
+        l.set("results.page_size", 200.into()).unwrap();
+        assert_eq!((l.settings.font_size, l.settings.results.page_size), (16., 50)); // workspace still wins
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&g).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({"font_size": 16, "results": {"page_size": 200}}));
+
+        std::fs::write(&g, "{ broken").unwrap();
+        let l = Loaded::load_from(Some(g), None);
+        assert_eq!((l.errors.len(), l.settings.font_size), (1, 14.));
+    }
+
+    #[test]
+    fn invalid_value_keeps_defaults_and_unknown_keys_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path().join("s.json");
+        std::fs::write(&w, r#"{"mystery": 1, "run": {"confirm_destructive": "sometimes"}}"#).unwrap();
+        let l = Loaded::load_from(None, Some(w));
+        assert_eq!(l.errors.len(), 1);
+        assert_eq!(l.settings, Settings::default());
+    }
+
+    #[test]
+    fn prod_pattern_and_connection_files() {
+        let c = Connections::default();
+        assert!(c.is_prod("prod") && c.is_prod("Production") && !c.is_prod("dev"));
+        let exact = Connections { prod_pattern: "live".into(), ..Default::default() };
+        assert!(exact.is_prod("LIVE") && !exact.is_prod("live2"));
+
+        let mut s = Settings::default();
+        s.connections.files = vec!["~/x/siesta.json".into(), "db/siesta.json".into()];
+        let files = s.connection_files(Path::new("/ws"));
+        assert_eq!(files[1], Path::new("/ws/db/siesta.json"));
+        assert!(files[0].ends_with("x/siesta.json") && files[0].is_absolute());
+    }
+}

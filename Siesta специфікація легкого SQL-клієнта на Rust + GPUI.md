@@ -378,11 +378,13 @@ Cargo workspace з ядром без залежності від GUI.
 
 Глобальні `~/.config/siesta/settings.json` і робочої теки `.siesta/settings.json`, snake_case:
 
-- `theme`, `font_family`, `font_size`, `split`, `split_ratio`.
-- `results.page_size` (100), `results.max_rows` (10 000), `results.cell_preview_kb`, `results.null_text`.
-- `run.stop_on_error`, `run.confirm_destructive` (`prod` | `always` | `never`), `run.statement_timeout_ms`.
-- `connections.files`, `connections.prod_pattern` (`prod*`).
-- `history.total`.
+Робоча тека перекриває глобальні значення по ключах (вкладені групи зливаються, масиви замінюються); коментарі `//` і `/* */` дозволені; невідомі ключі ігноруються; помилковий файл пропускається з повідомленням.
+
+- UI, як у Respite: `appearance` (`system` | `light` | `dark`), `keymap` (`default` | `vscode` | `jetbrains`), `theme` (`Default`), `ui_font_size` (14), `font_family`, `font_size` (14), `split` (`horizontal` | `vertical`), `split_ratio` (0.55), `editor.line_numbers`, `editor.soft_wrap`, `editor.highlight_current_line`.
+- `results.page_size` (100), `results.max_rows` (10 000), `results.cell_preview_kb` (8), `results.null_text` (`NULL`).
+- `run.stop_on_error` (true), `run.confirm_destructive` (`prod` | `always` | `never`, типово `prod`), `run.statement_timeout_ms` (немає).
+- `connections.files` (шляхи; `~/` — домашня тека, відносні — від кореня робочої теки), `connections.prod_pattern` (`prod*`, `*` — будь-який суфікс, без урахування регістру).
+- `history.total` (500).
 
 ### Дорожня карта
 
