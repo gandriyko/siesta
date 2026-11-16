@@ -22,6 +22,14 @@ pub enum Kind {
     Other,
 }
 
+impl Kind {
+    /// Whether a statement of this kind asks for confirmation on a `prod` connection: everything
+    /// that is not a plain read (`Other`: DML, DDL, `SELECT … INTO`, `FOR UPDATE`, SET, BEGIN, CALL…).
+    pub fn needs_prod_confirm(self) -> bool {
+        self == Kind::Other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     /// Text sent to the server: first token up to the delimiter, without leading or trailing
@@ -697,6 +705,12 @@ mod tests {
         for (src, want) in cases {
             assert_eq!(split(src, PG).statements[0].kind, *want, "{src}");
         }
+    }
+
+    #[test]
+    fn prod_confirm_only_for_non_reads() {
+        assert!(!Kind::Query.needs_prod_confirm() && !Kind::Read.needs_prod_confirm());
+        assert!(Kind::Other.needs_prod_confirm());
     }
 
     #[test]

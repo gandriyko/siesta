@@ -51,7 +51,7 @@ for `siesta.json` from the current directory up to the project root (the nearest
   no connection at all is an error (exit `3`). `exec` and `schema` need `-c`.
 - `--max-rows N` — rows per statement (default 100, `0` = the `results.max_rows` setting, which is also the upper limit).
 - `--read-only` — force the connection read-only.
-- `--yes` — skip the confirmations (every statement on a `prod` connection, `-- @confirm`; see Safety).
+- `--yes` — skip the confirmations (non-read statements on a `prod` connection, `-- @confirm`; see Safety).
 
 `schema` options:
 
@@ -147,7 +147,7 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
 
 - Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database` /
   `user` / `password`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
-  statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
+  non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
 - `${env:NAME}` reads the environment, `${dotenv:NAME}` the `.env` next to the file.
 - Files are found in every folder from the project root down to the `.sql` file; deeper folders and
   the private file win. The user's global connections (`~/.config/siesta/connections.json` and
@@ -157,7 +157,7 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
 
 ## Safety
 
-- On a connection with `"prod": true` EVERY statement needs confirmation, even a `SELECT`. Elsewhere a
+- On a connection with `"prod": true` every statement that is not a plain read (DML, DDL, `SELECT … INTO`, `FOR UPDATE`, `SET`, `BEGIN`, `CALL`, …) needs confirmation; `SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN` run without it. Elsewhere a
   statement needs it when it has `-- @confirm`, or, with the setting `run.confirm_destructive` = `always`,
   when it is `UPDATE` / `DELETE` without `WHERE`, `DROP`, `TRUNCATE` or `ALTER`.
 - Without a terminal the CLI never asks: it exits `4` (error code `confirmation_required`) before running

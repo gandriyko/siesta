@@ -206,9 +206,9 @@ fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes:
     let policy = env.settings.run.confirm_destructive;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     for j in jobs {
-        // `prod` connections confirm every statement; the policy only matters elsewhere
+        // `prod` connections confirm every non-read statement; the policy only matters elsewhere
         // (`prod` in the policy means that same flag, so it adds nothing for the others).
-        let reason = if conn.prod {
+        let reason = if conn.prod && j.kind.needs_prod_confirm() {
             Some("production connection")
         } else if j.confirm {
             Some("marked -- @confirm")
@@ -431,10 +431,12 @@ mod tests {
         let prod = conn("prod-db", false, true);
         let dev = conn("dev-db", false, false);
         let ro = conn("dev-ro", true, false);
-        // A prod connection confirms every statement, even a plain SELECT.
+        // A prod connection confirms every non-read statement; reads (Query / Read) run freely.
         assert!(prod.prod && !dev.prod);
-        assert_eq!(refused(&e, &prod, job_of("SELECT 1", false), false), Some(4));
-        assert_eq!(refused(&e, &prod, job_of("SELECT 1", false), true), None);
+        let read = |sql: &str, kind| Job { kind, ..job_of(sql, false) };
+        assert_eq!(refused(&e, &prod, read("SELECT 1", Kind::Query), false), None);
+        assert_eq!(refused(&e, &prod, read("SHOW x", Kind::Read), false), None);
+        assert_eq!(refused(&e, &prod, job_of("SELECT 1", true), false), Some(4)); // `-- @confirm` still asks
         assert_eq!(refused(&e, &prod, job_of("DELETE FROM t WHERE id = 1", false), false), Some(4));
         assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), true), None);
         // Neither a read-only nor a plain connection does, by default.

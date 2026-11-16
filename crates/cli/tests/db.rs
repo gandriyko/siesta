@@ -102,11 +102,14 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     assert_eq!(v["error"]["sqlstate"], sql_error_state, "{v}");
     assert!(!v.is_array(), "the second statement must not run: {v}");
 
-    // Refusal: every statement on a prod connection (even a SELECT), 4 and nothing runs; --yes runs.
+    // Refusal: every non-read statement on a prod connection, 4 and nothing runs; --yes runs.
     let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "DELETE FROM siesta_cli_t"]));
     assert_eq!((code, v["error"]["code"].as_str()), (4, Some("confirmation_required")));
-    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "SELECT 1"]));
+    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "UPDATE siesta_cli_t SET name = 'y'"]));
     assert_eq!((code, v["error"]["code"].as_str()), (4, Some("confirmation_required")));
+    // Reads on prod run without --yes.
+    let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "SELECT 1"]));
+    assert_eq!(code, 0, "{v}");
     let (_, v) = f.json(&with(&["exec", "-c", "c", "SELECT count(*) AS n FROM siesta_cli_t"]));
     assert_eq!(v["rows"][0][0], 5);
     let (code, v) = f.json(&with(&["exec", "-c", "prod-c", "--yes", "DELETE FROM siesta_cli_t WHERE id = 5"]));

@@ -1698,8 +1698,17 @@ mod tests {
         assert!(!cx.has_pending_prompt() && ran(&mut cx));
         cx.update(|_, cx| app.update(cx, |this, _| this.store.last = None));
 
-        // A prod one asks for every run, even a SELECT; Cancel runs nothing.
+        // A prod one runs a SELECT without asking, but asks for an UPDATE; Cancel runs nothing.
         cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("live".into()), window, cx)));
+        run(&mut cx);
+        assert!(!cx.has_pending_prompt() && ran(&mut cx));
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.last = None));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("UPDATE t SET a = 1", window, cx));
+                this.docs[0].reparse(cx);
+            })
+        });
         run(&mut cx);
         assert!(cx.has_pending_prompt());
         assert!(cx.pending_prompt().unwrap().0.contains("PRODUCTION live"));

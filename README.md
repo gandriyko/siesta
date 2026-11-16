@@ -17,7 +17,7 @@ Connections are plain JSON: `siesta.json` (committed, no secrets) and `siesta.pr
 
 A `.sql` file picks its connection with `-- @connection dev-pg` on the first line. Values like `${env:SHOP_DB_PASSWORD}` are read from the environment.
 
-Your own connections can live outside any repo: `~/.config/siesta/connections.json` plus `connections.private.json` for passwords (the desktop app's "New connection" form writes both). A project's `siesta.json` overrides a global connection of the same name. `"prod": true` marks production: a red banner, and every run asks for confirmation (the CLI needs `--yes` for every statement).
+Your own connections can live outside any repo: `~/.config/siesta/connections.json` plus `connections.private.json` for passwords (the desktop app's "New connection" form writes both). A project's `siesta.json` overrides a global connection of the same name. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
 
 ## CLI
 
@@ -37,7 +37,7 @@ Statements are addressed by `-- @name`, `:LINE` or `#N`. Some useful flags:
 siesta run reports.sql users_by_day --output json     # machine-readable output (default when piped)
 siesta exec -c dev-pg 'SELECT count(*) FROM users'    # no file needed
 siesta exec -c prod-mysql --read-only 'SELECT 1'      # writes are refused client-side (exit 4) and by the server session (a safety default, not a security boundary)
-siesta run cleanup.sql --yes                          # every statement on a prod connection needs --yes
+siesta run cleanup.sql --yes                          # non-read statements on a prod connection need --yes
 siesta schema -c dev-pg users                         # columns before writing a query
 ```
 
