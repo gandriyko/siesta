@@ -35,6 +35,18 @@ impl DbRow {
     }
 }
 
+/// Header of the DB tab: `connection · database`, with `· loading…` while it is read.
+pub(crate) fn db_title(conn: &str, database: Option<&str>, loading: bool) -> String {
+    let mut t = conn.to_string();
+    if let Some(db) = database {
+        t += &format!(" · {db}");
+    }
+    if loading {
+        t += " · loading…";
+    }
+    t
+}
+
 /// Toggle keys: a schema is open unless its key is in `toggled`, a table is closed unless it is.
 pub(crate) fn schema_key(schema: &str) -> String {
     format!("s:{schema}")
@@ -276,6 +288,7 @@ impl Siesta {
             return div().flex_1().flex().flex_col().gap_2().child(note("No connection: pick one in the top-right corner".into())).child(div().px_3().flex().gap_2().child(new).child(manage_button(cx))).into_any_element();
         };
         let key = d.schema_key().unwrap_or_default();
+        let shown_db = d.shown_database();
         let (schema, loading, error) = {
             let c = self.schemas.borrow();
             (c.schemas.get(&key).cloned(), c.loading.contains(&key), c.errors.get(&key).cloned())
@@ -307,7 +320,7 @@ impl Siesta {
             range.map(|ix| this.render_db_row(ix, cx)).collect::<Vec<_>>()
         }));
         let conn_name = conn.clone();
-        let title = if loading { format!("{conn} · loading…") } else { conn };
+        let title = db_title(&conn, shown_db.as_deref(), loading);
         let refresh = Button::new("refresh-schema")
             .icon(IconName::RefreshCw)
             .ghost()
@@ -347,9 +360,16 @@ impl Siesta {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{DbRow, rows, schema_key, table_key};
+    use super::{DbRow, db_title, rows, schema_key, table_key};
     use db_exec::{ColumnInfo, Index, Schema, SchemaNode, Table, TableKind};
     use std::collections::HashSet;
+
+    #[test]
+    fn header_names_connection_and_database() {
+        assert_eq!(db_title("dev", Some("app"), false), "dev · app");
+        assert_eq!(db_title("dev", None, true), "dev · loading…");
+        assert_eq!(db_title("dev", Some("app"), true), "dev · app · loading…");
+    }
 
     fn schema() -> Schema {
         let col = |n: &str, pk: bool| ColumnInfo { name: n.into(), data_type: "integer".into(), nullable: !pk, primary_key: pk, ordinal: 1 };

@@ -97,7 +97,24 @@ fn lit(d: Dialect, s: &str) -> String {
     format!("'{}'", if d == Dialect::MySql { s.replace('\\', "\\\\") } else { s })
 }
 
+/// Whether a MySQL / MariaDB database is a server-internal one (listed last, shown muted).
+pub fn is_system_database(name: &str) -> bool {
+    ["information_schema", "mysql", "performance_schema", "sys"].contains(&name)
+}
+
 impl Session {
+    /// Databases the credentials can connect to. Postgres: not templates, `allowconn`, `CONNECT`
+    /// privilege; MySQL / MariaDB: `SHOW DATABASES` with the system ones last.
+    pub async fn databases(&mut self) -> Result<Vec<String>, DbError> {
+        if self.dialect() == Dialect::Postgres {
+            let q = "SELECT datname::text FROM pg_database WHERE NOT datistemplate AND datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY 1";
+            return Ok(self.catalog(q).await?.iter().map(|r| text(&r[0])).collect());
+        }
+        let mut names: Vec<String> = self.catalog("SHOW DATABASES").await?.iter().map(|r| text(&r[0])).collect();
+        names.sort_by_key(|n| (is_system_database(n), n.clone()));
+        Ok(names)
+    }
+
     /// Reads the whole structure with four catalog queries.
     pub async fn schema(&mut self) -> Result<Schema, DbError> {
         let pg = self.dialect() == Dialect::Postgres;

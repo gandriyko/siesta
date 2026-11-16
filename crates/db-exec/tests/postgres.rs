@@ -21,6 +21,12 @@ fn other(ty: &str, text: &str) -> Value {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn databases_list_and_override_pg() {
+    databases_and_override(PG).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn rejected_login_names_the_fix_pg() {
     rejected_login_names_the_fix(PG).await;
 }

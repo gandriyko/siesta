@@ -49,12 +49,22 @@ pub struct Done {
     /// Where the statement was in the editor when it ran.
     pub range: Option<std::ops::Range<usize>>,
     pub conn: String,
+    /// The database it ran on (`None` = the server's default).
+    pub database: Option<String>,
     pub color: Option<String>,
     pub driver: Driver,
     pub result: Result<Outcome, DbError>,
 }
 
 impl Done {
+    /// `connection · database` (just the connection when no database is known).
+    pub fn label(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{} · {db}", self.conn),
+            None => self.conn.clone(),
+        }
+    }
+
     pub fn outcome(&self) -> Option<&Outcome> {
         self.result.as_ref().ok()
     }
@@ -695,7 +705,7 @@ impl Siesta {
                 Err(_) => status.child(pill("Error".into(), danger)),
             };
             let strip = d.color.as_deref().and_then(parse_color).unwrap_or(muted.opacity(0.5));
-            status = status.child(h_flex().gap_1().items_center().child(div().w(px(3.)).h(fs).rounded_full().bg(strip)).child(d.conn.clone()));
+            status = status.child(h_flex().gap_1().items_center().child(div().w(px(3.)).h(fs).rounded_full().bg(strip)).child(d.label()));
             if d.outcome().is_some_and(|o| o.in_transaction) || self.in_tx(&key.as_ref().expect("key").0) {
                 status = status.child(div().text_color(warning).font_weight(FontWeight::BOLD).child("TX ●"));
             }

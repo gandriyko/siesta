@@ -57,6 +57,11 @@ enum ConnCmd {
         /// Connection name
         name: String,
     },
+    /// Databases on the server of a connection that its credentials can access
+    Databases {
+        /// Connection name
+        name: String,
+    },
     /// Store a connection's password in the system keychain (prompt without echo, or stdin when piped)
     SetPassword {
         /// Connection name
@@ -133,6 +138,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
         Cmd::Exec(a) => run::exec(a, out),
         Cmd::Connections { cmd: None | Some(ConnCmd::List), .. } => connections(format, out),
         Cmd::Connections { cmd: Some(ConnCmd::Test { name }), .. } => test_connection(&name, format, out),
+        Cmd::Connections { cmd: Some(ConnCmd::Databases { name }), .. } => databases(&name, format, out),
         Cmd::Connections { cmd: Some(ConnCmd::SetPassword { name }), .. } => {
             let stdin = std::io::stdin();
             let tty = stdin.is_terminal();
@@ -235,8 +241,8 @@ fn cwd_probe() -> PathBuf {
     std::env::current_dir().unwrap_or_default().join("_.sql")
 }
 
-fn open_session(env: &Env, name: &str) -> Result<(tokio::runtime::Runtime, Session, db_conn::Connection), CliError> {
-    let conn = env.pick(name)?;
+fn open_session(env: &Env, name: &str, database: Option<&str>) -> Result<(tokio::runtime::Runtime, Session, db_conn::Connection), CliError> {
+    let conn = env.pick(name)?.with_database(database);
     let rt = runtime();
     let s = rt.block_on(Session::open_with(&conn, std::time::Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{name}': {e}"), 2))?;
     Ok((rt, s, conn))
@@ -296,7 +302,7 @@ fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
 fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
     let env = Env::load(&cwd_probe());
     let started = std::time::Instant::now();
-    let (rt, mut s, _) = open_session(&env, name)?;
+    let (rt, mut s, _) = open_session(&env, name, None)?;
     let version = rt.block_on(s.run("SELECT version()", Kind::Query, &Page::default())).map_err(|e| db_error(&e))?;
     let version = version.rows.first().and_then(|r| r.first()).map(|v| v.display()).unwrap_or_default();
     let ms = started.elapsed().as_millis() as u64;
@@ -306,6 +312,16 @@ fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8
     } else {
         put(out, json!({ "connection": name, "ok": true, "server": version, "duration_ms": ms }).to_string());
     }
+    Ok(0)
+}
+
+fn databases(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let env = Env::load(&cwd_probe());
+    let (rt, mut s, _) = open_session(&env, name, None)?;
+    let names = rt.block_on(s.databases()).map_err(|e| db_error(&e));
+    rt.block_on(s.close());
+    let rows: Vec<Value> = names?.into_iter().map(|n| json!({ "name": n })).collect();
+    emit_objects(out, format, &["name"], &rows);
     Ok(0)
 }
 
@@ -321,7 +337,7 @@ fn schema(a: SchemaArgs, format: Format, out: &mut dyn Write) -> Result<u8, CliE
     }
     let env = Env::load(&cwd_probe());
     let name = env.resolve(a.conn.connection.as_deref(), None)?.name;
-    let (rt, mut s, _) = open_session(&env, &name)?;
+    let (rt, mut s, _) = open_session(&env, &name, a.conn.database.as_deref())?;
     let schema = rt.block_on(s.schema()).map_err(|e| db_error(&e))?;
     let Some(want) = &a.table else {
         rt.block_on(s.close());

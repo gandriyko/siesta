@@ -50,6 +50,9 @@ pub struct WorkspaceState {
     pub current: Option<PathBuf>,
     /// Connection picked per file; `null` = "No connection" chosen explicitly.
     pub connections: BTreeMap<PathBuf, Option<String>>,
+    /// Database picked per file (absent = the connection's default). Dropped when the file's
+    /// connection changes.
+    pub databases: BTreeMap<PathBuf, String>,
 }
 
 fn read(base: &Path) -> serde_json::Value {
@@ -114,6 +117,7 @@ mod tests {
             open: vec![OpenFile { path: root.path().join("a.sql"), line: 3, column: 1 }],
             current: Some(root.path().join("a.sql")),
             connections: BTreeMap::from([(root.path().join("a.sql"), Some("dev".into())), (root.path().join("b.sql"), None)]),
+            databases: BTreeMap::from([(root.path().join("a.sql"), "app".to_string())]),
         };
         save_state(base.path(), root.path(), &st);
         assert_eq!(load_state(base.path(), root.path()), st);

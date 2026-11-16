@@ -36,6 +36,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 | `siesta connections` | Connections of `~/.config/siesta/connections/`, secrets masked, with `password: set` / `none` |
 | `siesta connections list` | The same as `siesta connections` |
 | `siesta connections test NAME` | Open a connection and report the server version |
+| `siesta connections databases NAME` | Databases on the server of a connection that its credentials can access (`name`); with `-d` / `-- @database` you can run in any of them |
 | `siesta connections set-password NAME` | Store the password of a connection in the system keychain (hidden prompt, or one line from stdin); the user does this, not you |
 | `siesta schema [TABLE]` | Every table and view, or one table (`table` or `schema.table`) with columns and indexes |
 
@@ -46,6 +47,9 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 
 - `-c`, `--connection NAME` — the connection. Without it `run` uses the file's `-- @connection`;
   no connection at all is an error (exit `3`). `exec` and `schema` need `-c`.
+- `-d`, `--database NAME` — the database on that server. Precedence: the flag, then the file's
+  `-- @database` (`run` only), then the connection's `database` (the default; none = the server's default).
+  Run `siesta connections databases NAME` to see what is available.
 - `--max-rows N` — rows per statement (default 100, `0` = the `results.max_rows` setting, which is also the upper limit).
 - `--read-only` — force the connection read-only.
 - `--yes` — skip the confirmations (non-read statements on a `prod` connection, `-- @confirm`; see Safety).
@@ -53,6 +57,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 `schema` options:
 
 - `-c`, `--connection NAME` — required.
+- `-d`, `--database NAME` — read the structure of that database instead of the connection's default.
 - `--ddl` — print the `CREATE TABLE` / `CREATE VIEW` text of the table (MySQL: `SHOW CREATE TABLE`;
   Postgres: assembled from the catalog, without storage options and ownership).
 
@@ -81,6 +86,7 @@ failure's code.
   "file": "reports.sql",
   "statement": { "name": "users_by_day", "line": 12 },
   "connection": "dev-pg",
+  "database": "app",
   "columns": [ { "name": "id", "type": "int8" }, { "name": "payload", "type": "jsonb" } ],
   "rows": [ [1, { "ip": "10.0.0.1" }] ],
   "rows_truncated": false,
@@ -92,6 +98,8 @@ failure's code.
 
 - `rows` is an array of arrays in column order. `NULL` is `null`; JSON / JSONB are nested values,
   not strings; numeric and date/time values are strings (exact); bytes are a hex string.
+- `database` is the effective database (flag, directive or the connection's `database`); `null` when none of
+  them is set, i.e. the server's default.
 - `rows_truncated` is true when `--max-rows` cut the result.
 - `rows_affected` is a number for INSERT / UPDATE / DELETE / DDL, `null` for queries.
 - `file` is `null` for `exec`; `line` counts from the start of the SQL given.
@@ -129,6 +137,7 @@ DELETE FROM sessions WHERE expires_at < now();
 | Directive | Effect |
 |---|---|
 | `-- @connection NAME` | Default connection of the file, at the top before the first statement; `-c` overrides it |
+| `-- @database NAME` | Database for the file, at the top before the first statement; overrides the connection's `database`, `-d` overrides it |
 | `-- @name ID` | Name the statement for addressing: `siesta run FILE ID` |
 | `-- @page-size N` | Page size in the GUI; the CLI uses `--max-rows` instead |
 | `-- @confirm` | Always ask before running; the CLI refuses with exit `4` unless `--yes` |
@@ -146,8 +155,8 @@ project-level connection files.
 { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
 ```
 
-- Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database` /
-  `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
+- Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database`
+  (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
   There is no `password` key.
 - `${env:NAME}` reads the environment.

@@ -22,6 +22,8 @@ pub struct Doc {
     pub conns: Arc<Connections>,
     /// The picker's choice for this file; `-- @connection` in the text wins over it.
     pub picked: Option<String>,
+    /// The database picked for this file; `-- @database` in the text wins over it.
+    pub picked_db: Option<String>,
     /// Index into `file.statements` of the statement under the cursor.
     pub active: Option<usize>,
     /// Byte range currently decorated as the active statement.
@@ -55,11 +57,13 @@ pub fn default_schema(c: &db_conn::Connection) -> Option<String> {
 }
 
 impl Doc {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: PathBuf,
         editor: Entity<EditorState>,
         conns: Arc<Connections>,
         picked: Option<String>,
+        picked_db: Option<String>,
         cache: crate::schema_cache::Shared,
         subs: Vec<Subscription>,
         cx: &mut App,
@@ -79,6 +83,7 @@ impl Doc {
             dialect: Dialect::default(),
             conns,
             picked,
+            picked_db,
             active: None,
             applied: None,
             stmt_lines: None,
@@ -107,9 +112,30 @@ impl Doc {
         self.file.connection.as_deref()
     }
 
-    /// Schema cache key of the file's connection (`None`: no connection, or an unusable one).
+    /// The database a `-- @database` directive fixes; while it is there the picker rewrites it.
+    pub fn locked_db(&self) -> Option<&str> {
+        self.file.database.as_deref()
+    }
+
+    /// The database chosen for this file: `-- @database`, else the picker; `None` = the connection's default.
+    pub fn database(&self) -> Option<&str> {
+        self.file.database.as_deref().or(self.picked_db.as_deref())
+    }
+
+    /// The database shown for the file: its choice, else the connection's own, else `None`
+    /// (the server's default).
+    pub fn shown_database(&self) -> Option<String> {
+        self.effective_connection().and_then(|c| c.database)
+    }
+
+    /// The file's connection pointed at its database (flag-less CLI rules: directive, pick, default).
+    pub fn effective_connection(&self) -> Option<db_conn::Connection> {
+        self.conns.connections.get(self.connection()?).map(|c| c.with_database(self.database()))
+    }
+
+    /// Schema cache key of the file's connection and database (`None`: no connection, or an unusable one).
     pub fn schema_key(&self) -> Option<String> {
-        self.conns.connections.get(self.connection()?).map(crate::schema_cache::key)
+        self.effective_connection().as_ref().map(crate::schema_cache::key)
     }
 
     /// Dialect of a named connection; Postgres without one (or when it is unknown).
@@ -132,8 +158,7 @@ impl Doc {
             file = sql_split::split(&text, wanted);
         }
         self.file = Arc::new(file);
-        let connection = self.connection().map(str::to_string);
-        let default_schema = connection.as_deref().and_then(|c| self.conns.connections.get(c)).and_then(default_schema);
+        let default_schema = self.effective_connection().as_ref().and_then(default_schema);
         let mut lang = self.lang.borrow_mut();
         (lang.dialect, lang.connection, lang.default_schema) = (self.dialect, self.schema_key(), default_schema);
         drop(lang);

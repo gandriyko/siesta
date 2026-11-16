@@ -20,6 +20,8 @@ Connections live in your config dir, one JSON file per connection: `~/.config/si
 
 A `.sql` file picks its connection with `-- @connection dev-pg` on the first line. Values like `${env:SHOP_DB_HOST}` are read from the environment (handy in CI).
 
+`database` is only the connection's default and is optional. A file can use any database the credentials can access: pick it in the second dropdown at the top right (the choice is remembered per file), or write `-- @database app` under `-- @connection` (the CLI takes `-d app`; the flag wins over the directive). `siesta connections databases NAME` lists them.
+
 There is no password in the file. The password lives only in the system keychain (macOS Keychain, Linux Secret Service, service `siesta`, account = connection name): type it in the connection form, or run `siesta connections set-password NAME`. It is read only when a connection opens; without an entry Siesta connects without a password. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
 
 An old `~/.config/siesta/connections.json` (with `connections.private.json`) is split into per-connection files on first start and renamed to `*.migrated`; its passwords move into the keychain.
@@ -33,6 +35,7 @@ siesta list          Statements of a file or directory: file, line, name, first 
 siesta run           Run statements of a file (all of them in file order when none are named)
 siesta exec          Run SQL from an argument or stdin
 siesta connections   Connections, secrets masked; `test NAME` opens one, `set-password NAME` stores its password
+siesta connections databases NAME   Databases the credentials can access (use with -d / -- @database)
 siesta schema        Tables, columns and indexes of a connection; --ddl prints CREATE TABLE
 ```
 
@@ -43,6 +46,7 @@ siesta run reports.sql users_by_day --output json     # machine-readable output 
 siesta exec -c dev-pg 'SELECT count(*) FROM users'    # no file needed
 siesta exec -c prod-mysql --read-only 'SELECT 1'      # writes are refused client-side (exit 4) and by the server session (a safety default, not a security boundary)
 siesta run cleanup.sql --yes                          # non-read statements on a prod connection need --yes
+siesta exec -c dev-pg -d app_test 'SELECT current_database()'   # another database on the same server
 siesta schema -c dev-pg users                         # columns before writing a query
 ```
 
@@ -66,6 +70,11 @@ crates/
   settings/   settings.json
   workspace/  project folder, file index, UI state
 ```
+
+Keychain: an unsigned debug binary changes identity on every rebuild, so macOS asks for keychain access
+again each time. Create a self-signed code-signing certificate named "Siesta Dev" once (Keychain Access,
+Certificate Assistant, Create a Certificate, type Code Signing). `cargo run` / `cargo test` then sign the
+binary through `scripts/sign-dev.sh` and "Always Allow" sticks. Without the certificate nothing is signed.
 
 Integration tests need Docker (Postgres and MariaDB): `scripts/test-db.sh`; `--down` stops the containers.
 

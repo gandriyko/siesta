@@ -385,6 +385,7 @@ fn directives(comment: &str, at: usize) -> Completion {
     let Some(word) = rest.strip_prefix('@').filter(|w| w.chars().all(|c| c.is_ascii_alphabetic() || c == '-')) else { return Completion::default() };
     let info = |n: &str| match n {
         "connection" => "default connection of the file (at its start)",
+        "database" => "database of the file on the connection's server (at its start)",
         "name" => "name of the statement in the tree, search and CLI",
         "page-size" => "result page size of the statement",
         "confirm" => "always ask before running",
@@ -799,7 +800,7 @@ mod tests {
     #[test]
     fn directives_work_without_a_connection() {
         let c = at("-- @|", PG, None);
-        assert_eq!(labels(&c), ["confirm", "connection", "name", "page-size"]);
+        assert_eq!(labels(&c), ["confirm", "connection", "database", "name", "page-size"]);
         assert!(c.items.iter().all(|i| i.kind == Kind::Directive && !i.detail.is_empty()));
         assert_eq!(c.start, 4);
         let c = at("-- @pa|", PG, None);

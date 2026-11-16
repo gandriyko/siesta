@@ -9,6 +9,10 @@ if [[ "${1:-}" == "--down" ]]; then
 fi
 
 docker compose up -d --wait
+# A second database per server for the per-file database tests (idempotent: containers outlive runs).
+docker compose exec -T postgres psql -U siesta -d siesta -tAc "SELECT 1 FROM pg_database WHERE datname = 'siesta_b'" | grep -q 1 \
+    || docker compose exec -T postgres psql -U siesta -d siesta -c "CREATE DATABASE siesta_b"
+docker compose exec -T mariadb mariadb -uroot -psiesta -e "CREATE DATABASE IF NOT EXISTS siesta_b; GRANT ALL ON siesta_b.* TO 'siesta'@'%'"
 export SIESTA_TEST_PG_URL="postgres://siesta:siesta@127.0.0.1:25432/siesta"
 export SIESTA_TEST_MYSQL_URL="mysql://siesta:siesta@127.0.0.1:23306/siesta"
 cargo test -p db-exec -p siesta-cli -- --include-ignored "$@"

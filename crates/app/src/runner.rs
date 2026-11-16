@@ -39,7 +39,18 @@ pub enum Dot {
     Red,
 }
 
-/// The session of one (file, connection): opened lazily by the first run, closed with the file.
+/// The databases a connection's server offers, as the database picker shows them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbList {
+    Loading,
+    Ready(Vec<String>),
+    Failed(String),
+}
+
+/// (file, connection, database): the database is the effective one (`None` = the server's default).
+pub type SlotKey = (PathBuf, String, Option<String>);
+
+/// The session of one (file, connection, database): opened lazily by the first run, closed with the file.
 pub struct Slot {
     handles: Handles,
     pub dot: Dot,
@@ -81,7 +92,7 @@ impl Handles {
 }
 
 impl Slot {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Slot { handles: Handles::new(), dot: Dot::Grey, in_tx: false }
     }
 }
@@ -254,11 +265,11 @@ impl Siesta {
     }
 
     /// The connection of `path` by name: spec, or why it is unusable.
-    fn connection_of(&self, path: &Path) -> Result<(String, Connection), String> {
+    pub(crate) fn connection_of(&self, path: &Path) -> Result<(String, Connection), String> {
         let d = self.docs.iter().find(|d| *d.path == path).ok_or("The file is not open")?;
         let name = d.connection().ok_or("No connection: pick one in the top-right corner")?;
-        match d.conns.connections.get(name) {
-            Some(c) => Ok((name.to_string(), c.clone())),
+        match d.effective_connection() {
+            Some(c) => Ok((name.to_string(), c)),
             None => Err(match d.conns.errors.get(name) {
                 Some(e) => format!("Connection '{name}' is unusable: {e}"),
                 None => format!("Unknown connection '{name}'"),
@@ -266,13 +277,27 @@ impl Siesta {
         }
     }
 
-    pub(crate) fn dot_of(&self, path: &Path, conn: Option<&str>) -> Dot {
-        conn.and_then(|c| self.slots.get(&(path.to_path_buf(), c.to_string()))).map_or(Dot::Grey, |s| s.dot)
+    pub(crate) fn dot_of(&self, path: &Path, conn: Option<&str>, database: Option<String>) -> Dot {
+        conn.and_then(|c| self.slots.get(&(path.to_path_buf(), c.to_string(), database))).map_or(Dot::Grey, |s| s.dot)
     }
 
     /// The open transaction of any session of `path`.
     pub(crate) fn in_tx(&self, path: &Path) -> bool {
-        self.slots.iter().any(|((p, _), s)| p == path && s.in_tx)
+        self.slots.iter().any(|((p, ..), s)| p == path && s.in_tx)
+    }
+
+    /// Closes the sessions of `path` on `conn` that point at another database than `keep`: the file
+    /// moved to a different database. Call after the transaction question was answered.
+    pub(crate) fn close_other_database_sessions(&mut self, path: &Path, conn: &str, keep: &Option<String>) {
+        let keys: Vec<_> = self.slots.keys().filter(|(p, c, db)| p == path && c == conn && db != keep).cloned().collect();
+        for slot in keys.into_iter().filter_map(|k| self.slots.remove(&k)) {
+            close_slot(slot, None);
+        }
+    }
+
+    /// An open transaction in a session of `path` on `conn` that is not on database `keep`.
+    pub(crate) fn in_tx_elsewhere(&self, path: &Path, conn: &str, keep: &Option<String>) -> bool {
+        self.slots.iter().any(|((p, c, db), s)| p == path && c == conn && db != keep && s.in_tx)
     }
 
     /// Cmd+Enter, double click on a statement, the result panel's "Run": the selection, or the
@@ -307,7 +332,7 @@ impl Siesta {
         if !self.store.entries.iter().any(|(k, e)| k.0 == path && e.running.is_some()) {
             return;
         }
-        for ((p, _), slot) in &self.slots {
+        for ((p, ..), slot) in &self.slots {
             if *p != path {
                 continue;
             }
@@ -364,20 +389,20 @@ impl Siesta {
 
     /// Close every session of `path` (`finish` runs first); the handles complete when they are closed.
     pub(crate) fn close_sessions(&mut self, path: &Path, finish: Option<&'static str>) -> Vec<tokio::task::JoinHandle<()>> {
-        let keys: Vec<_> = self.slots.keys().filter(|(p, _)| p == path).cloned().collect();
+        let keys: Vec<_> = self.slots.keys().filter(|(p, ..)| p == path).cloned().collect();
         keys.into_iter().filter_map(|k| self.slots.remove(&k)).map(|slot| close_slot(slot, finish)).collect()
     }
 
     /// Close the sessions of connection `name` in every file (its credentials changed); an open
     /// transaction goes with the session.
     pub(crate) fn close_connection_sessions(&mut self, name: &str) -> Vec<tokio::task::JoinHandle<()>> {
-        let keys: Vec<_> = self.slots.keys().filter(|(_, n)| n == name).cloned().collect();
+        let keys: Vec<_> = self.slots.keys().filter(|(_, n, _)| n == name).cloned().collect();
         keys.into_iter().filter_map(|k| self.slots.remove(&k)).map(|slot| close_slot(slot, None)).collect()
     }
 
     /// Paths with an open transaction in any session.
     pub(crate) fn paths_in_tx(&self) -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = self.slots.iter().filter(|(_, s)| s.in_tx).map(|((p, _), _)| p.clone()).collect();
+        let mut v: Vec<PathBuf> = self.slots.iter().filter(|(_, s)| s.in_tx).map(|((p, ..), _)| p.clone()).collect();
         v.sort();
         v.dedup();
         v
@@ -439,7 +464,7 @@ impl Siesta {
         let Some(done) = e.done.clone() else { return };
         let Ok((_, conn)) = self.connection_of(&key.0) else { return };
         // The connection of that result, not necessarily the picked one now.
-        let conn = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).cloned()).unwrap_or(conn);
+        let conn = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).map(|c| c.with_database(done.database.as_deref()))).unwrap_or(conn);
         let e = self.store.entries.get_mut(key).expect("entry");
         e.running = Some(Instant::now());
         let stmt = Stmt { text: done.text.clone(), kind: done.kind, page: e.page.clone(), range: done.range.clone() };
@@ -448,7 +473,7 @@ impl Siesta {
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_job(&mut self, path: PathBuf, name: String, conn: Connection, stmts: Vec<Stmt>, keys: Vec<Key>, window: &mut Window, cx: &mut Context<Self>) {
-        let slot = self.slots.entry((path.clone(), name.clone())).or_insert_with(Slot::new);
+        let slot = self.slots.entry((path.clone(), name.clone(), conn.database.clone())).or_insert_with(Slot::new);
         let handles = slot.handles.clone();
         let opts = self.opts();
         let token = handles.token(); // taken here, not on the runtime: a Cancel right after this must reach the job
@@ -467,7 +492,7 @@ impl Siesta {
 
     #[allow(clippy::too_many_arguments)]
     fn finish(&mut self, path: PathBuf, name: String, conn: Connection, stmts: Vec<Stmt>, keys: Vec<Key>, report: Report, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(slot) = self.slots.get_mut(&(path.clone(), name.clone()))
+        if let Some(slot) = self.slots.get_mut(&(path.clone(), name.clone(), conn.database.clone()))
             && !report.skipped
         {
             slot.in_tx = report.in_tx;
@@ -488,7 +513,7 @@ impl Siesta {
                 position = Some((stmt.text.clone(), stmt.range.clone(), p, err.message.clone()));
             }
             e.id += 1;
-            e.done = Some(Arc::new(Done { text: stmt.text, kind: stmt.kind, page: stmt.page, range: stmt.range, conn: name.clone(), color: color.clone(), driver: conn.driver, result }));
+            e.done = Some(Arc::new(Done { text: stmt.text, kind: stmt.kind, page: stmt.page, range: stmt.range, conn: name.clone(), database: conn.database.clone(), color: color.clone(), driver: conn.driver, result }));
         }
         if let Some((text, range, p, msg)) = position {
             self.underline_error(&path, &text, range, p, &msg, cx);
@@ -567,8 +592,8 @@ impl Siesta {
         let Some(e) = self.store.entries.get(&key) else { return };
         let Some(done) = e.done.clone() else { return };
         let filters = e.page.filters.clone();
-        let Some(conn) = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).cloned()) else { return };
-        let slot = self.slots.entry((key.0.clone(), done.conn.clone())).or_insert_with(Slot::new);
+        let Some(conn) = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).map(|c| c.with_database(done.database.as_deref()))) else { return };
+        let slot = self.slots.entry((key.0.clone(), done.conn.clone(), conn.database.clone())).or_insert_with(Slot::new);
         let token = slot.handles.token();
         let handle = RT.spawn(count_job(slot.handles.clone(), conn, done.text.clone(), filters.clone(), self.opts(), token));
         cx.spawn_in(window, async move |this, cx| {
@@ -603,7 +628,8 @@ impl Siesta {
     }
 
     /// A connection was just picked (or restored) for `path`: read its schema in the background,
-    /// unless this run of the app already has it. Opens the file's session for that.
+    /// unless this run of the app already has it. Opens the file's session for that. The server's
+    /// database list is read too (once per connection), so the database picker has it when opened.
     pub(crate) fn autoload_schema(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if !self.docs.iter().any(|d| *d.path == path && d.sql) {
             return;
@@ -612,6 +638,48 @@ impl Siesta {
         if !self.schemas.borrow().fresh.contains(&crate::schema_cache::key(&conn)) {
             self.load_schema(path.to_path_buf(), name, conn, window, cx);
         }
+        self.fetch_databases_of(path, false, window, cx);
+    }
+
+    /// The database picker was opened: read the current file's server list unless it is known.
+    pub(crate) fn fetch_databases(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.doc().map(|d| (*d.path).clone()) {
+            self.fetch_databases_of(&path, force, window, cx);
+        }
+    }
+
+    pub(crate) fn refresh_databases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fetch_databases(true, window, cx);
+    }
+
+    /// Reads the databases of `path`'s connection on a throwaway session (the file's own sessions
+    /// are per database). Cached per connection for the life of the app; `force` reads again.
+    fn fetch_databases_of(&mut self, path: &Path, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(base) = self.docs.iter().find(|d| *d.path == path && d.sql).and_then(|d| d.connection().and_then(|n| d.conns.connections.get(n)).cloned()) else { return };
+        let key = crate::schema_cache::key(&base);
+        match self.db_lists.get(&key) {
+            Some(DbList::Loading) => return,
+            Some(DbList::Ready(_)) if !force => return,
+            _ => {}
+        }
+        self.db_lists.insert(key.clone(), DbList::Loading);
+        let timeout = Duration::from_millis(self.settings.settings.run.connect_timeout_ms);
+        let handle = RT.spawn(async move {
+            let mut s = Session::open_with(&base, timeout).await?;
+            let r = s.databases().await;
+            s.close().await;
+            r
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));
+            this.update(cx, |this, cx| {
+                this.db_lists.insert(key, r.map_or_else(|e| DbList::Failed(e.to_string()), DbList::Ready));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// "Refresh schema": read the current file's connection again (opens its session if needed).
@@ -634,7 +702,7 @@ impl Siesta {
             }
             c.errors.remove(&key);
         }
-        let handles = self.slots.entry((path, name)).or_insert_with(Slot::new).handles.clone();
+        let handles = self.slots.entry((path, name, conn.database.clone())).or_insert_with(Slot::new).handles.clone();
         let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &self.root, &key));
         let token = handles.token();
         let handle = RT.spawn(schema_job(handles, conn, self.opts(), file, token));
@@ -668,7 +736,7 @@ impl Siesta {
             Ok(c) => c,
             Err(e) => return window.push_notification(e, cx),
         };
-        let handles = self.slots.entry((path, name)).or_insert_with(Slot::new).handles.clone();
+        let handles = self.slots.entry((path, name, conn.database.clone())).or_insert_with(Slot::new).handles.clone();
         let token = handles.token();
         let handle = RT.spawn(ddl_job(handles, conn, self.opts(), schema.to_string(), table.to_string(), token));
         let table = table.to_string();

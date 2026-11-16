@@ -112,6 +112,11 @@ pub(crate) struct Siesta {
     result_open: bool,
     /// The connection picked per file (`None` = "No connection" chosen); persisted.
     picks: BTreeMap<PathBuf, Option<String>>,
+    /// The database picked per file (absent = the connection's default); persisted.
+    db_picks: BTreeMap<PathBuf, String>,
+    /// The databases each connection's server offers (`schema_cache::key` of the connection as
+    /// saved), read in the background when a picker opens; kept until "Refresh".
+    db_lists: HashMap<String, runner::DbList>,
     /// The connection files at the last check; a change reloads connections.
     conns_seen: Option<Stamp>,
     /// A dirty tab whose close was requested once; the next close discards it.
@@ -122,8 +127,8 @@ pub(crate) struct Siesta {
     mru: Vec<PathBuf>,
     /// Ctrl+Tab held down: the MRU order when it started and how far it has gone.
     tab_cycle: Option<(Vec<PathBuf>, usize)>,
-    /// Sessions per (file, connection), opened by the first run and closed with the file.
-    slots: HashMap<(PathBuf, String), runner::Slot>,
+    /// Sessions per (file, connection, database), opened by the first run and closed with the file.
+    slots: HashMap<runner::SlotKey, runner::Slot>,
     /// Results per (file, statement text).
     store: results::Store,
     /// The result panel's table, filter fields and pin.
@@ -230,6 +235,8 @@ impl Siesta {
             sidebar: true,
             result_open: true,
             picks: BTreeMap::new(),
+            db_picks: BTreeMap::new(),
+            db_lists: HashMap::new(),
             conns_seen: None,
             close_armed: None,
             picker_sub: None,
@@ -261,6 +268,7 @@ impl Siesta {
         self.rescan();
         let state = self.base.as_deref().map(|b| siesta_workspace::load_state(b, &self.root)).unwrap_or_default();
         self.picks = state.connections;
+        self.db_picks = state.databases;
         for f in state.open.iter().filter(|f| f.path.is_file()) {
             if let Some(ix) = self.open(f.path.clone(), None, window, cx) {
                 self.docs[ix].editor.update(cx, |s, cx| s.set_cursor_position(Position::new(f.line, f.column), window, cx));
@@ -514,7 +522,8 @@ impl Siesta {
                     }),
                 ];
                 let picked = self.picks.get(&path).cloned().flatten();
-                self.docs.push(Doc::new(path.clone(), editor, self.conns.clone(), picked, self.schemas.clone(), subs, cx));
+                let picked_db = self.db_picks.get(&path).cloned();
+                self.docs.push(Doc::new(path.clone(), editor, self.conns.clone(), picked, picked_db, self.schemas.clone(), subs, cx));
                 let ix = self.docs.len() - 1;
                 if let Some(key) = self.docs[ix].schema_key() {
                     self.load_cached_schema(&key);
@@ -646,7 +655,7 @@ impl Siesta {
                 OpenFile { path: (*d.path).clone(), line: pos.line, column: pos.character }
             })
             .collect();
-        let state = WorkspaceState { open, current: self.doc().map(|d| (*d.path).clone()), connections: self.picks.clone() };
+        let state = WorkspaceState { open, current: self.doc().map(|d| (*d.path).clone()), connections: self.picks.clone(), databases: self.db_picks.clone() };
         siesta_workspace::save_state(base, &self.root, &state);
     }
 
@@ -747,18 +756,23 @@ impl Siesta {
             if answer.await != Ok(0) {
                 return;
             }
-            this.update_in(cx, |this, window, cx| this.rewrite_directive(&path, name.as_deref(), window, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.rewrite_directive(&path, "connection", name.as_deref(), window, cx)).ok();
         })
         .detach();
     }
 
-    /// Replaces (or removes) the `-- @connection` line as an ordinary undoable edit; the editor's
-    /// change handling then re-splits the text and the connection follows.
-    fn rewrite_directive(&mut self, path: &Path, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Replaces (or removes) the `-- @connection` / `-- @database` line (`word`) as an ordinary
+    /// undoable edit; the editor's change handling then re-splits the text and the choice follows.
+    fn rewrite_directive(&mut self, path: &Path, word: &str, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
         let d = &self.docs[ix];
+        let before = d.connection().map(str::to_string);
         let old = d.editor.read(cx).value().to_string();
-        let Some(new) = sql_split::rewrite_connection(&old, d.dialect, name) else { return };
+        let rewritten = match word {
+            "database" => sql_split::rewrite_database(&old, d.dialect, name),
+            _ => sql_split::rewrite_connection(&old, d.dialect, name),
+        };
+        let Some(new) = rewritten else { return };
         let (range, text) = doc::changed(&old, &new);
         d.editor.update(cx, |s, cx| {
             let rope = s.text().clone();
@@ -766,12 +780,146 @@ impl Siesta {
             s.apply_lsp_edits(&vec![edit], window, cx);
         });
         self.docs[ix].reparse(cx);
+        // Another connection starts from its default database.
+        if self.docs[ix].connection().map(str::to_string) != before {
+            self.db_picks.remove(path);
+            self.docs[ix].picked_db = None;
+            self.docs[ix].reparse(cx);
+            self.remember(cx);
+        }
         cx.notify();
+    }
+
+    /// The database picker's choice for the current file (`None` = the connection's default).
+    /// With `-- @database` in the text the choice rewrites the directive instead, after a
+    /// confirmation; otherwise it is remembered per file. Either way the file moves to a new
+    /// session (an open transaction in the old one is asked about first).
+    pub(crate) fn select_database(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.doc().filter(|d| d.sql && d.connection().is_some()) else { return };
+        let path = (*d.path).clone();
+        let Some(old) = d.locked_db().map(str::to_string) else {
+            return self.change_database(path, name, false, window, cx);
+        };
+        if name.as_deref() == Some(old.as_str()) {
+            return;
+        }
+        let action = match &name {
+            Some(n) => format!("Switch to `{n}` and rewrite that line in the file?"),
+            None => "Remove that line from the file?".to_string(),
+        };
+        let detail = format!("This file sets its database with `-- @database {old}`. {action}");
+        let answer = window.prompt(PromptLevel::Warning, "Change database in file?", Some(&detail), &["Rewrite", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update_in(cx, |this, window, cx| this.change_database(path, name, true, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Moves `path` to database `name` (`rewrite`: through its `-- @database` line, else as a pick).
+    /// A transaction open in a session that this leaves behind is asked about first.
+    fn change_database(&mut self, path: PathBuf, name: Option<String>, rewrite: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.docs.iter().find(|d| *d.path == path) else { return };
+        let Some(base) = d.connection().and_then(|n| d.conns.connections.get(n)) else { return };
+        let target = if rewrite { name.clone().or(d.picked_db.clone()) } else { name.clone() }.or(base.database.clone());
+        if self.in_tx_elsewhere(&path, &base.name, &target) {
+            return self.ask_transaction(path.clone(), move |this, window, cx| this.apply_database(path, name, rewrite, window, cx), window, cx);
+        }
+        self.apply_database(path, name, rewrite, window, cx);
+    }
+
+    fn apply_database(&mut self, path: PathBuf, name: Option<String>, rewrite: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
+        if rewrite {
+            self.rewrite_directive(&path, "database", name.as_deref(), window, cx);
+        } else {
+            match &name {
+                Some(n) => self.db_picks.insert(path.clone(), n.clone()),
+                None => self.db_picks.remove(&path),
+            };
+            self.docs[ix].picked_db = name;
+            self.docs[ix].reparse(cx);
+        }
+        let d = &self.docs[ix];
+        let (conn, keep, key) = (d.connection().map(str::to_string), d.shown_database(), d.schema_key());
+        if let Some(c) = conn {
+            self.close_other_database_sessions(&path, &c, &keep);
+        }
+        if let Some(key) = key {
+            self.load_cached_schema(&key);
+        }
+        self.autoload_schema(&path, window, cx);
+        self.remember(cx);
+        cx.notify();
+    }
+
+    /// Top-right database picker, next to the connection picker: the databases the credentials can
+    /// access, read from the server in the background when the picker opens (and kept until Refresh).
+    fn database_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let d = self.doc().filter(|d| d.sql)?;
+        let conn = d.conns.connections.get(d.connection()?)?;
+        let shown = d.shown_database();
+        let explicit = d.database().map(str::to_string);
+        let forced = d.locked_db().is_some();
+        let list = self.db_lists.get(&schema_cache::key(conn)).cloned();
+        let default_label = format!("Default ({})", conn.database.as_deref().unwrap_or("server default"));
+        let mysql = conn.driver == db_conn::Driver::MySql;
+        let label = shown.unwrap_or_else(|| "(default)".into());
+        let view = cx.entity().downgrade();
+        let opened = view.clone();
+        Some(
+            Button::new("database-picker")
+                .label(label)
+                .dropdown_caret(true)
+                .small()
+                .ghost()
+                .when(forced, |b| b.tooltip("Set by `-- @database` in this file"))
+                .dropdown_menu(move |menu, _, _| {
+                    let pick = |name: Option<String>| {
+                        let view = view.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            view.update(cx, |this, cx| this.select_database(name.clone(), window, cx)).ok();
+                        }
+                    };
+                    let mut menu = menu.item(PopupMenuItem::new(default_label.clone()).checked(explicit.is_none()).on_click(pick(None))).separator();
+                    match &list {
+                        None | Some(runner::DbList::Loading) => menu = menu.item(PopupMenuItem::new("Loading…").disabled(true)),
+                        Some(runner::DbList::Failed(e)) => menu = menu.item(PopupMenuItem::new(format!("Could not list databases: {e}")).disabled(true)),
+                        Some(runner::DbList::Ready(names)) => {
+                            for n in names {
+                                let muted = mysql && db_exec::is_system_database(n);
+                                let text = n.clone();
+                                let item = PopupMenuItem::element(move |_, cx| {
+                                    let c = if muted { cx.theme().muted_foreground } else { cx.theme().foreground };
+                                    div().text_color(c).child(text.clone())
+                                });
+                                menu = menu.item(item.checked(explicit.as_deref() == Some(n.as_str())).on_click(pick(Some(n.clone()))));
+                            }
+                        }
+                    }
+                    menu.separator().item(PopupMenuItem::new("Refresh").on_click({
+                        let view = view.clone();
+                        move |_, window, cx| _ = view.update(cx, |this, cx| this.refresh_databases(window, cx))
+                    }))
+                })
+                .on_open_change(move |open, window, cx| {
+                    if *open {
+                        opened.update(cx, |this, cx| this.fetch_databases(false, window, cx)).ok();
+                    }
+                })
+                .into_any_element(),
+        )
     }
 
     /// Remembers `name` as the pick of `path` (only that file) and loads its schema in the background.
     pub(crate) fn pick_for(&mut self, path: &Path, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
+        // The database belongs to a connection: another connection starts from its default.
+        if self.docs[ix].picked != name {
+            self.db_picks.remove(path);
+            self.docs[ix].picked_db = None;
+        }
         self.picks.insert(path.to_path_buf(), name.clone());
         self.docs[ix].picked = name.clone();
         self.docs[ix].reparse(cx);
@@ -813,8 +961,8 @@ impl Siesta {
         // Each connection's colour (its own, or red for prod) marks it in the picker.
         let colors: std::collections::HashMap<String, Hsla> = names.iter().filter_map(|n| Some((n.clone(), format::parse_color(conn_of(n)?.display_color()?)?))).collect();
         let strip = current.as_ref().and_then(|n| colors.get(n).copied());
-        let status = self.dot_of(&d.path, current.as_deref());
-        let (can_test, can_disconnect) = (current.is_some(), self.slots.keys().any(|(p, _)| *p == *d.path));
+        let status = self.dot_of(&d.path, current.as_deref(), d.shown_database());
+        let (can_test, can_disconnect) = (current.is_some(), self.slots.keys().any(|(p, ..)| *p == *d.path));
         let t = cx.theme();
         let (muted, fs) = (t.muted_foreground, t.font_size);
         let status_color = match status {
@@ -959,6 +1107,7 @@ impl Siesta {
             .pb_1()
             .child(div().id("docs").flex_1().min_w_0().flex().gap_1().overflow_x_scroll().children(tabs))
             .children(self.connection_picker(cx))
+            .children(self.database_picker(cx))
             .into_any_element()
     }
 
@@ -1370,6 +1519,7 @@ mod tests {
             page: db_exec::Page::default(),
             range: None,
             conn: "dev".into(),
+            database: None,
             color: None,
             driver: db_conn::Driver::Postgres,
             result: Ok(db_exec::Outcome {
@@ -1593,6 +1743,97 @@ mod tests {
             this.schemas.borrow().loading.contains(&key)
         });
         assert!(loading);
+    }
+
+    #[gpui::test]
+    fn database_precedence_session_key_schema_key_and_directive_rewrite(tcx: &mut TestAppContext) {
+        use crate::runner::Slot;
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        // (database(), shown database, session key's database, schema key)
+        let st = |app: &Entity<Siesta>, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let this = app.read(cx);
+                let d = this.doc().unwrap();
+                (d.database().map(str::to_string), d.shown_database(), this.connection_of(&a).unwrap().1.database, d.schema_key().unwrap())
+            })
+        };
+        let select = |cx: &mut VisualTestContext, db: Option<&str>| cx.update(|window, cx| app.update(cx, |this, cx| this.select_database(db.map(Into::into), window, cx)));
+        let connect = |cx: &mut VisualTestContext, n: &str| cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some(n.into()), window, cx)));
+        connect(&mut cx, "dev");
+        let (_, default_db, _, default_key) = st(&app, &mut cx);
+        // No choice: the connection's default.
+        assert_eq!(st(&app, &mut cx).0, None);
+
+        // A pick (no directive in the text): remembered, and it changes the session key and the schema cache key.
+        select(&mut cx, Some("app"));
+        let (pick, shown, session_db, key_app) = st(&app, &mut cx);
+        assert_eq!((pick.as_deref(), shown.as_deref(), session_db.as_deref()), (Some("app"), Some("app"), Some("app")));
+        assert_ne!(key_app, default_key);
+        assert_eq!(siesta_workspace::load_state(base.path(), ws.path()).databases[&a], "app");
+        // Switching closes the session of the old database (nothing in a transaction: no question).
+        cx.update(|_, cx| app.update(cx, |this, _| _ = this.slots.insert((a.clone(), "dev".into(), Some("app".into())), Slot::new())));
+        select(&mut cx, Some("other"));
+        let (_, _, session_db, key_other) = st(&app, &mut cx);
+        assert_eq!(session_db.as_deref(), Some("other"));
+        assert!(key_other != key_app && key_other != default_key);
+        assert!(cx.update(|_, cx| app.read(cx).slots.keys().all(|(_, _, db)| db.as_deref() != Some("app"))));
+        // A transaction in the old session is asked about first.
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                let mut slot = Slot::new();
+                slot.in_tx = true;
+                this.slots.insert((a.clone(), "dev".into(), Some("other".into())), slot);
+            })
+        });
+        select(&mut cx, Some("app"));
+        assert!(cx.pending_prompt().unwrap().0.contains("open transaction"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(st(&app, &mut cx).0.as_deref(), Some("other"));
+        // "Default" forgets the pick.
+        cx.update(|_, cx| app.update(cx, |this, _| _ = this.slots.remove(&(a.clone(), "dev".into(), Some("other".into())))));
+        select(&mut cx, None);
+        let (pick, shown, _, key) = st(&app, &mut cx);
+        assert_eq!((pick, shown, key), (None, default_db, default_key));
+        assert!(siesta_workspace::load_state(base.path(), ws.path()).databases.is_empty());
+
+        // `-- @database` wins over the pick.
+        select(&mut cx, Some("app"));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("-- @database fromfile\nSELECT 1;\n", window, cx));
+                this.docs[0].reparse(cx);
+            })
+        });
+        assert_eq!(st(&app, &mut cx).2.as_deref(), Some("fromfile"));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().locked_db().map(str::to_string)).as_deref(), Some("fromfile"));
+        // Choosing another one asks, and rewrites the line (the pick stays); Cancel changes nothing.
+        let text = |cx: &mut VisualTestContext| text_of(&app, cx);
+        select(&mut cx, Some("x"));
+        assert!(cx.pending_prompt().unwrap().1.contains("-- @database fromfile"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(text(&mut cx), "-- @database fromfile\nSELECT 1;\n");
+        select(&mut cx, Some("x"));
+        cx.simulate_prompt_answer("Rewrite");
+        cx.run_until_parked();
+        assert_eq!(text(&mut cx), "-- @database x\nSELECT 1;\n");
+        assert_eq!(st(&app, &mut cx).2.as_deref(), Some("x"));
+        assert_eq!(siesta_workspace::load_state(base.path(), ws.path()).databases[&a], "app");
+        // "Default" removes the line; the pick applies again.
+        select(&mut cx, None);
+        cx.simulate_prompt_answer("Rewrite");
+        cx.run_until_parked();
+        assert_eq!(text(&mut cx), "SELECT 1;\n");
+        assert_eq!(st(&app, &mut cx).2.as_deref(), Some("app"));
+
+        // Another connection starts from its own default again.
+        connect(&mut cx, "my");
+        let (pick, ..) = st(&app, &mut cx);
+        assert_eq!(pick, None);
+        assert!(siesta_workspace::load_state(base.path(), ws.path()).databases.is_empty());
     }
 
     #[gpui::test]

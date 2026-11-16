@@ -192,11 +192,35 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     let _ = f.driver;
 }
 
+/// `connections databases`, `-d`, and `-- @database` (flag wins over the directive).
+fn databases_scenario(f: &Fixture, current: &str) {
+    let (code, v) = f.json(&["connections", "databases", "c", "--output", "json"]);
+    assert_eq!(code, 0, "{v}");
+    let names: Vec<&str> = v.as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"siesta") && names.contains(&"siesta_b"), "{names:?}");
+    let (code, v) = f.json(&["connections", "databases", "nope", "--output", "json"]);
+    assert_eq!((code, v["error"]["code"].as_str()), (3, Some("unknown_connection")));
+
+    let db_of = |args: &[&str]| {
+        let (code, v) = f.json(&[args, &["--output", "json"]].concat());
+        assert_eq!(code, 0, "{v}");
+        (v["rows"][0][0].as_str().unwrap().to_string(), v["database"].as_str().map(String::from))
+    };
+    assert_eq!(db_of(&["exec", "-c", "c", current]), ("siesta".into(), None));
+    assert_eq!(db_of(&["exec", "-c", "c", "-d", "siesta_b", current]), ("siesta_b".into(), Some("siesta_b".into())));
+    let file = f.file("d.sql", &format!("-- @connection c\n-- @database siesta_b\n{current};\n"));
+    assert_eq!(db_of(&["run", &file]), ("siesta_b".into(), Some("siesta_b".into())));
+    assert_eq!(db_of(&["run", &file, "-d", "siesta"]), ("siesta".into(), Some("siesta".into())));
+    let (code, v) = f.json(&["schema", "-c", "c", "-d", "siesta_b", "--output", "json"]);
+    assert_eq!(code, 0, "{v}");
+}
+
 #[test]
 #[ignore = "needs docker: scripts/test-db.sh"]
 fn postgres() {
     let f = Fixture::new("postgres", "SIESTA_TEST_PG_URL");
     scenario(&f, "42P01");
+    databases_scenario(&f, "SELECT current_database()");
     // JSON / JSONB are nested values, not strings.
     let (code, v) = f.json(&["exec", "-c", "c", "SELECT '{\"a\": [1, {\"b\": null}]}'::jsonb AS j, 1.50::numeric AS n", "--output", "json"]);
     assert_eq!(code, 0);
@@ -222,6 +246,7 @@ fn wrong_driver_fails_fast_with_exit_2() {
 fn mysql() {
     let f = Fixture::new("mysql", "SIESTA_TEST_MYSQL_URL");
     scenario(&f, "42S02");
+    databases_scenario(&f, "SELECT DATABASE()");
 }
 
 #[test]

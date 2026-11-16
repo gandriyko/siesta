@@ -23,6 +23,9 @@ pub struct ConnArgs {
     /// Connection name (overrides `-- @connection`)
     #[arg(short = 'c', long)]
     pub connection: Option<String>,
+    /// Database on that server (overrides `-- @database` and the connection's default)
+    #[arg(short = 'd', long)]
+    pub database: Option<String>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -279,7 +282,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     let (mut exit, mut items) = (0, Vec::new());
     for (n, j) in jobs.iter().enumerate() {
         let result = rt.block_on(session.run(&j.text, j.kind, &page));
-        let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, result: &result, max_rows: cap };
+        let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, database: conn.database.as_deref(), result: &result, max_rows: cap };
         if let Err(e) = &result {
             exit = first_exit(exit, e);
         }
@@ -319,8 +322,10 @@ pub(crate) fn run(a: RunArgs, out: &mut dyn Write) -> Result<u8, CliError> {
     let path = std::path::absolute(&a.file).unwrap_or_else(|_| a.file.clone());
     let env = Env::load(&path);
     // The directive is the same in both dialects; the real dialect needs the connection.
-    let directive = sql_split::split(&src, Dialect::Postgres).connection;
-    let conn = env.resolve(a.opts.conn.connection.as_deref(), directive.as_deref()).map_err(|e| e.at(&a.file, None))?;
+    let top = sql_split::split(&src, Dialect::Postgres);
+    let conn = env.resolve(a.opts.conn.connection.as_deref(), top.connection.as_deref()).map_err(|e| e.at(&a.file, None))?;
+    // Flag, else `-- @database`, else the connection's own default.
+    let conn = conn.with_database(a.opts.conn.database.as_deref().or(top.database.as_deref()));
     let file = sql_split::split(&src, dialect_of(conn.driver));
     check_parse(&src, &file, Some(&a.file))?;
     let picked: Vec<usize> = if a.statements.is_empty() {
@@ -354,7 +359,7 @@ pub(crate) fn exec(a: ExecArgs, out: &mut dyn Write) -> Result<u8, CliError> {
     };
     let probe = std::env::current_dir().unwrap_or_default().join("_.sql");
     let env = Env::load(&probe);
-    let conn = env.resolve(a.opts.conn.connection.as_deref(), None)?;
+    let conn = env.resolve(a.opts.conn.connection.as_deref(), None)?.with_database(a.opts.conn.database.as_deref());
     let file = sql_split::split(&sql, dialect_of(conn.driver));
     check_parse(&sql, &file, None)?;
     let jobs = (0..file.statements.len()).map(|i| job(&sql, &file, i)).collect();

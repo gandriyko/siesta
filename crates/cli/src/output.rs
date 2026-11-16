@@ -105,6 +105,8 @@ pub(crate) struct Item<'a> {
     pub name: Option<&'a str>,
     pub line: usize,
     pub connection: &'a str,
+    /// The effective database; `None` when it is the server's default, which is not known here.
+    pub database: Option<&'a str>,
     pub result: &'a Result<Outcome, DbError>,
     /// The row limit that was applied.
     pub max_rows: usize,
@@ -124,6 +126,7 @@ pub(crate) fn item_json(i: &Item) -> Value {
         "file": i.file,
         "statement": { "name": i.name, "line": i.line },
         "connection": i.connection,
+        "database": i.database,
     });
     match i.result {
         Err(e) => v["error"] = error_json(e),
@@ -231,8 +234,9 @@ mod tests {
     #[test]
     fn json_item_nests_json_values() {
         let r = Ok(outcome());
-        let v = item_json(&Item { file: Some("a.sql"), name: Some("q"), line: 3, connection: "dev", result: &r, max_rows: 2 });
+        let v = item_json(&Item { file: Some("a.sql"), name: Some("q"), line: 3, connection: "dev", database: Some("app"), result: &r, max_rows: 2 });
         assert_eq!(v["schema"], "siesta.run/v1");
+        assert_eq!(v["database"], "app");
         assert_eq!(v["statement"], json!({"name": "q", "line": 3}));
         assert_eq!(v["columns"][1], json!({"name": "payload", "type": "jsonb"}));
         assert_eq!(v["rows"], json!([[1, {"ip": "10.0.0.1", "tags": [1, 2]}], [2, null]]));
@@ -242,19 +246,19 @@ mod tests {
     #[test]
     fn json_item_error() {
         let r = Err(DbError { code: Some("42P01".into()), message: "no table".into(), ..Default::default() });
-        let v = item_json(&Item { file: None, name: None, line: 1, connection: "dev", result: &r, max_rows: 1 });
+        let v = item_json(&Item { file: None, name: None, line: 1, connection: "dev", database: None, result: &r, max_rows: 1 });
         assert_eq!(v["error"]["sqlstate"], "42P01");
         assert_eq!(v["error"]["code"], "sql_error");
         assert!(v.get("rows").is_none());
         let r = Err(DbError { message: "no".into(), refused: true, ..Default::default() });
-        let v = item_json(&Item { file: None, name: None, line: 1, connection: "dev", result: &r, max_rows: 1 });
+        let v = item_json(&Item { file: None, name: None, line: 1, connection: "dev", database: None, result: &r, max_rows: 1 });
         assert_eq!(v["error"]["code"], "read_only_refused");
     }
 
     #[test]
     fn text_item_shows_null_and_truncation() {
         let r = Ok(outcome());
-        let item = Item { file: None, name: None, line: 1, connection: "dev", result: &r, max_rows: 2 };
+        let item = Item { file: None, name: None, line: 1, connection: "dev", database: None, result: &r, max_rows: 2 };
         let mut buf = vec![];
         item_text(&item, Format::Table, None, &mut buf);
         let text = String::from_utf8(buf).unwrap();

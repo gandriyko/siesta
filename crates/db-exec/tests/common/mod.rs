@@ -37,6 +37,29 @@ pub async fn rejected_login_names_the_fix(driver: Driver) {
     assert!(e.message.contains("No password is stored for `test-no-password`") && e.message.contains("set-password"), "{e}");
 }
 
+/// The server lists the accessible databases, and a session opened with another `database` runs in it.
+pub async fn databases_and_override(driver: Driver) {
+    let mut s = open(driver).await;
+    let dbs = s.databases().await.expect("databases");
+    for want in ["siesta", "siesta_b"] {
+        assert!(dbs.iter().any(|d| d == want), "{want} missing in {dbs:?}");
+    }
+    assert!(!dbs.iter().any(|d| d == "template0" || d == "template1"), "{dbs:?}");
+    if driver == Driver::MySql {
+        // System databases come last.
+        let first_system = dbs.iter().position(|d| db_exec::is_system_database(d)).expect("system databases are listed");
+        assert!(dbs[first_system..].iter().all(|d| db_exec::is_system_database(d)), "{dbs:?}");
+    }
+    s.close().await;
+    let current = if driver == Driver::Postgres { "SELECT current_database()" } else { "SELECT DATABASE()" };
+    let mut s = Session::open(&connection(driver).with_database(Some("siesta_b"))).await.expect("open siesta_b");
+    assert_eq!(texts(&run(&mut s, current).await), ["siesta_b"]);
+    s.close().await;
+    // No override: the connection's own database.
+    let mut s = open(driver).await;
+    assert_eq!(texts(&run(&mut s, current).await), ["siesta"]);
+}
+
 /// `driver` pointed at the port of the other database. It must fail within the connect timeout.
 /// `hangs`: the client waits for a server greeting that never comes (MySQL on Postgres), so the
 /// timeout itself ends it with the "No response" message; the Postgres client instead rejects

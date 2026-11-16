@@ -121,6 +121,16 @@ impl Connection {
         self.color.as_deref().or(self.prod.then_some("red"))
     }
 
+    /// This connection pointed at `database` (`None`: keep its own default). The fingerprint of
+    /// the copy differs per database, so schema caches stay apart.
+    pub fn with_database(&self, database: Option<&str>) -> Connection {
+        let mut c = self.clone();
+        if let Some(d) = database {
+            c.database = Some(d.to_string());
+        }
+        c
+    }
+
     /// A stable id of the server this connection points at (driver, url without its password,
     /// host, port, database, user), for caches that must not mix a connection with another one
     /// that was later saved under the same name. FNV-1a: stable across Rust versions.

@@ -75,6 +75,9 @@ pub struct SqlFile {
     pub connection: Option<String>,
     /// Where that directive's comment sits in the source.
     pub connection_at: Option<Range<usize>>,
+    /// `-- @database` before the first statement, and where it sits.
+    pub database: Option<String>,
+    pub database_at: Option<Range<usize>>,
     pub statements: Vec<Statement>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -88,16 +91,26 @@ impl SqlFile {
     }
 }
 
-pub const DIRECTIVES: &[&str] = &["connection", "name", "page-size", "confirm"];
+pub const DIRECTIVES: &[&str] = &["connection", "database", "name", "page-size", "confirm"];
 
 /// `src` with the value of its `-- @connection` directive replaced by `name`, or the whole
 /// directive line removed for `None`. `None` back when the file has no directive.
 pub fn rewrite_connection(src: &str, dialect: Dialect, name: Option<&str>) -> Option<String> {
     let at = split(src, dialect).connection_at?;
+    rewrite_directive_at(src, at, "connection", name)
+}
+
+/// Same as [`rewrite_connection`] for the `-- @database` directive.
+pub fn rewrite_database(src: &str, dialect: Dialect, name: Option<&str>) -> Option<String> {
+    let at = split(src, dialect).database_at?;
+    rewrite_directive_at(src, at, "database", name)
+}
+
+fn rewrite_directive_at(src: &str, at: Range<usize>, word: &str, name: Option<&str>) -> Option<String> {
     let text = &src[at.clone()];
     let end = at.start + text.trim_end().len();
     if let Some(n) = name {
-        let w = text.find("@connection")? + "@connection".len();
+        let w = text.find(&format!("@{word}"))? + word.len() + 1;
         let from = at.start + w + (text[w..].len() - text[w..].trim_start().len());
         return Some(format!("{}{n}{}", &src[..from], &src[end..]));
     }
@@ -359,7 +372,12 @@ impl<'a> Splitter<'a> {
         let (word, value) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(w, v)| (w, v.trim()));
         let warn = |s: &mut Self, msg: String| s.diag(comment.clone(), Severity::Warning, msg);
         match (word, value) {
-            ("connection" | "name", "") => warn(self, format!("`@{word}` needs a value")),
+            ("connection" | "database" | "name", "") => warn(self, format!("`@{word}` needs a value")),
+            ("database", _) if self.out.statements.is_empty() => {
+                self.out.database = Some(value.into());
+                self.out.database_at = Some(comment);
+            }
+            ("database", _) => warn(self, "`@database` applies only at the top of the file".into()),
             ("connection", _) if self.out.statements.is_empty() => {
                 self.out.connection = Some(value.into());
                 self.out.connection_at = Some(comment);
@@ -726,6 +744,21 @@ mod tests {
         assert_eq!(at("SELECT 3"), "SELECT 3");
         assert_eq!(f.statement_at(src.len()).unwrap().text(src), "SELECT 3");
         assert_eq!(split("", PG).statement_at(0), None);
+    }
+
+    #[test]
+    fn database_directive_parses_and_rewrites() {
+        let f = split("-- @connection c\n-- @database app\nSELECT 1;\n-- @database late\nSELECT 2;", PG);
+        assert_eq!(f.database.as_deref(), Some("app"));
+        assert_eq!(f.connection.as_deref(), Some("c"));
+        assert!(f.diagnostics.iter().any(|d| d.message.contains("`@database` applies only at the top")));
+        let r = |src: &str, n| rewrite_database(src, PG, n);
+        assert_eq!(r("-- @database a\nSELECT 1;", Some("b")).unwrap(), "-- @database b\nSELECT 1;");
+        assert_eq!(r("--  @database  a \r\nSELECT 1;\r\n", Some("b")).unwrap(), "--  @database  b \r\nSELECT 1;\r\n");
+        assert_eq!(r("-- @connection c\r\n-- @database a\r\nSELECT 1;", None).unwrap(), "-- @connection c\r\nSELECT 1;");
+        assert_eq!(r("SELECT 1;\n-- @database a\nSELECT 2;", Some("b")), None);
+        assert_eq!(r("-- @connection c\nSELECT 1;", Some("b")), None);
+        assert_eq!(split("-- @database\nSELECT 1;", PG).database, None);
     }
 
     #[test]
