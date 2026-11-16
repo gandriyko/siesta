@@ -16,6 +16,8 @@ mod legacy;
 pub mod secrets;
 pub use global::{ConnectionForm, delete, names, read_form, save};
 pub use legacy::migrate;
+mod urlparse;
+pub use urlparse::{ParsedUrl, parse_url};
 
 const KEYS: [&str; 12] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];

@@ -1745,6 +1745,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn typing_a_url_fills_the_fields_and_saving_writes_no_url(tcx: &mut TestAppContext) {
+        db_conn::secrets::use_memory_store();
+        let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let dir = cfg.path().join("siesta");
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.config_dir = Some(dir.clone());
+                this.open_conn_form(None, window, cx);
+            })
+        });
+        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        cx.update(|window, cx| {
+            form.update(cx, |f, cx| {
+                f.name.update(cx, |s, cx| s.set_value("viaurl", window, cx));
+                // `set_value` emits no Change event (typing does), so apply what the subscription would.
+                f.apply_url("mysql://me:p%40ss@db.local:3307/shop?ssl-mode=REQUIRED", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let f = cx.update(|_, cx| form.read(cx).collect(cx));
+        assert_eq!((f.driver, f.user.as_str(), f.password.as_str(), f.host.as_str(), f.port.as_str(), f.database.as_str(), f.ssl_mode), (Some(db_conn::Driver::MySql), "me", "p@ss", "db.local", "3307", "shop", Some(db_conn::SslMode::Require)));
+        // An incomplete URL leaves the fields as they are.
+        cx.update(|window, cx| form.update(cx, |f, cx| f.apply_url("postgres://", window, cx)));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "db.local");
+        cx.update(|window, cx| form.update(cx, |f, cx| f.save(window, cx)));
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("connections/viaurl.json")).unwrap()).unwrap();
+        assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "db.local", "port": 3307, "database": "shop", "user": "me", "ssl": {"mode": "require"}}));
+        assert_eq!(db_conn::secrets::get("viaurl").as_deref(), Ok("p@ss"));
+    }
+
+    #[gpui::test]
     fn connections_page_lists_edits_and_deletes_without_touching_picks(tcx: &mut TestAppContext) {
         use crate::connections_page::{ConnectionsPage, build_rows};
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

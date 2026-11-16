@@ -12,7 +12,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
     v_flex,
@@ -51,7 +51,10 @@ pub(crate) struct ConnForm {
     /// The keychain holds a password (an empty password field keeps it).
     has_password: bool,
     pub name: Entity<InputState>,
-    url: Entity<InputState>,
+    pub url: Entity<InputState>,
+    /// Why the URL was not (fully) applied, or what it ignored; shown muted under the field.
+    url_note: Option<String>,
+    _sub: Subscription,
     pub host: Entity<InputState>,
     pub port: Entity<InputState>,
     database: Entity<InputState>,
@@ -78,14 +81,23 @@ impl ConnForm {
             let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored in the system keychain" };
             cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true))
         };
+        let url = input("postgres://user:password@host:5432/db (fills the fields below)", "", window, cx);
+        let _sub = cx.subscribe_in(&url, window, |this, url, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                let text = url.read(cx).value().to_string();
+                this.apply_url(&text, window, cx);
+            }
+        });
         Self {
+            _sub,
+            url_note: None,
             has_password: f.has_password,
             app,
             dir,
             target,
             original,
             name: input("local", &f.name, window, cx),
-            url: input("postgres://user@host:5432/db (or fill the fields below)", &f.url, window, cx),
+            url,
             host: input("localhost", &f.host, window, cx),
             port: input("5432", &f.port, window, cx),
             database: input("", &f.database, window, cx),
@@ -102,6 +114,32 @@ impl ConnForm {
             error: None,
             test: Test::Idle,
         }
+    }
+
+    /// A typed / pasted URL fills the other fields when it parses completely; otherwise they stay untouched.
+    pub(crate) fn apply_url(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.url_note = None;
+        if !text.trim().is_empty() {
+            match db_conn::parse_url(text) {
+                Err(e) => self.url_note = Some(e),
+                Ok(p) => {
+                    let set = |i: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| i.update(cx, |s, cx| s.set_value(v, window, cx));
+                    set(&self.host, p.host, window, cx);
+                    set(&self.port, p.port.map(|p| p.to_string()).unwrap_or_default(), window, cx);
+                    set(&self.database, p.database, window, cx);
+                    set(&self.user, p.user, window, cx);
+                    if !p.password.is_empty() {
+                        set(&self.password, p.password, window, cx);
+                    }
+                    self.driver = p.driver;
+                    self.ssl = p.ssl_mode;
+                    if !p.ignored.is_empty() {
+                        self.url_note = Some(format!("Ignored: {}", p.ignored.join(", ")));
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// What the fields hold now.
@@ -268,6 +306,7 @@ impl Render for ConnForm {
             .child(field("Name", &self.name))
             .child(Self::field("Driver", muted, driver))
             .child(field("URL", &self.url))
+            .children(self.url_note.clone().map(|n| div().text_xs().text_color(muted).child(n)))
             .child(h_flex().gap_2().child(div().flex_1().child(field("Host", &self.host))).child(div().w(px(100.)).child(field("Port", &self.port))))
             .child(h_flex().gap_2().child(div().flex_1().child(field("Database", &self.database))).child(div().flex_1().child(field("User", &self.user))))
             .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))

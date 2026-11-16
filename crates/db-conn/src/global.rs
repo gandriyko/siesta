@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::secrets::{self, SecretError};
-use crate::{Connection, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, valid_name};
+use crate::{Connection, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, parse_url, valid_name};
 
 /// What the form edits. Strings are trimmed on save; an empty one removes the key.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -46,7 +46,8 @@ impl ConnectionForm {
                 v => m.insert(k.into(), v.into()),
             };
         };
-        for (k, v) in [("url", &self.url), ("host", &self.host), ("database", &self.database), ("user", &self.user), ("schema", &self.schema), ("init_sql", &self.init_sql), ("color", &self.color)] {
+        // The `url` field only fills the other fields in the form; it is never written (no password in JSON).
+        for (k, v) in [("host", &self.host), ("database", &self.database), ("user", &self.user), ("schema", &self.schema), ("init_sql", &self.init_sql), ("color", &self.color)] {
             set(k, v);
         }
         match self.port.trim() {
@@ -115,7 +116,7 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
     };
     let b = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
     let mut base = e.clone();
-    for k in ["url", "host", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password"] {
+    for k in ["host", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password"] {
         base.remove(k);
     }
     if let Some(Value::Object(o)) = base.get_mut("ssl") {
@@ -127,16 +128,24 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
     let ssl_mode = e.get("ssl").and_then(|o| o.get("mode")).and_then(Value::as_str).and_then(|m| {
         [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull].into_iter().find(|x| mode_name(*x) == m)
     });
+    // A hand-written `url` is split into the fields (explicit keys win); saving rewrites the file without it.
+    // One that does not parse stays in `base`, so saving does not lose it.
+    let p = parse_url(&s("url")).ok();
+    if p.is_some() {
+        base.remove("url");
+    }
+    let p = p.unwrap_or_default();
+    let or = |k: &str, v: String| Some(s(k)).filter(|x| !x.is_empty()).unwrap_or(v);
     Some(ConnectionForm {
         name: name.into(),
         driver: parse_driver(e.get("driver").and_then(Value::as_str), e.get("url").and_then(Value::as_str)).ok(),
-        url: s("url"),
-        host: s("host"),
-        port: s("port"),
-        database: s("database"),
-        user: s("user"),
-        password: String::new(),
-        ssl_mode,
+        url: String::new(),
+        host: or("host", p.host),
+        port: or("port", p.port.map(|p| p.to_string()).unwrap_or_default()),
+        database: or("database", p.database),
+        user: or("user", p.user),
+        password: p.password,
+        ssl_mode: ssl_mode.or(p.ssl_mode),
         schema: s("schema"),
         init_sql: s("init_sql"),
         color: s("color"),
