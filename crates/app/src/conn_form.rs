@@ -1,6 +1,6 @@
 //! New / Edit connection form (a dialog): reached from the connection picker, the DB tab and the
 //! Connections page. One form for every connection; it writes `<config dir>/connections/<name>.json`
-//! and keeps the password only in the system keychain (reading and writing is `db_conn::global`).
+//! and keeps the password only encrypted there as `password_enc` (reading and writing is `db_conn::global`).
 
 use std::{
     path::PathBuf,
@@ -65,7 +65,7 @@ pub(crate) struct ConnForm {
     original: Option<String>,
     /// Keys of the file the form does not show (kept on save).
     base: serde_json::Map<String, serde_json::Value>,
-    /// The keychain holds a password (an empty password field keeps it).
+    /// The file holds an encrypted password (an empty password field keeps it).
     has_password: bool,
     pub name: Entity<InputState>,
     pub url: Entity<InputState>,
@@ -96,7 +96,7 @@ impl ConnForm {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
         };
         let password = {
-            let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored in the system keychain" };
+            let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored encrypted in the connection file" };
             cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true))
         };
         let url = input("postgres://user:password@host:5432/db (fills the fields below)", "", window, cx);
@@ -184,7 +184,7 @@ impl ConnForm {
         }
     }
 
-    /// Writes the file and the keychain entry; on success the dialog closes and the file it was
+    /// Writes the file with the encrypted password; on success the dialog closes and the file it was
     /// opened for picks the connection. If only the password could not be stored, the connection
     /// is saved, every file sees it, and the form stays open with the error.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -258,7 +258,7 @@ impl ConnForm {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete connection '{name}'?"),
-            Some("The connection file is removed and its password is deleted from the system keychain."),
+            Some("The connection file is removed, together with its encrypted password."),
             &["Delete", "Cancel"],
             cx,
         );
@@ -334,7 +334,7 @@ impl Render for ConnForm {
         let testing = matches!(self.test, Test::Running);
         let status = self.status(cx);
         let editing = self.original.is_some();
-        let location = format!("Saved to {}; the password is kept only in the system keychain.", db_conn::connections_dir(&self.dir).display());
+        let location = format!("Saved to {}; the password is kept only encrypted (key: {}).",db_conn::connections_dir(&self.dir).display(), db_conn::crypto::key_path(&self.dir).display());
         v_flex()
             .gap_2()
             .child(field("Name", &self.name))
@@ -430,7 +430,7 @@ impl Siesta {
         self.conn_form = None;
     }
 
-    /// Deletes a connection (file and keychain entry) from the Connections page.
+    /// Deletes a connection (its file, with the password) from the Connections page.
     pub(crate) fn delete_connection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = self.config_dir.clone() else { return };
         match db_conn::delete(&dir, name) {

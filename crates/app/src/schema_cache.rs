@@ -73,6 +73,7 @@ mod tests {
             database: Some("app".into()),
             user: None,
             password: None,
+            password_enc: None,
             ssl: Default::default(),
             read_only: false,
             prod: false,

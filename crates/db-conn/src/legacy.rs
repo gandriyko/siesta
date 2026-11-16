@@ -1,13 +1,14 @@
 //! One-time migration of the old `connections.json` / `connections.private.json` (one JSON map of
 //! all connections, passwords in the private file or behind `${keychain}` markers) into
-//! per-connection files and keychain entries. The old files are renamed to `*.migrated`.
+//! per-connection files; literal passwords become `password_enc`, keychain markers are dropped with
+//! a warning. The old files are renamed to `*.migrated`.
 
 use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use crate::global::write_atomic;
-use crate::{connections_dir, secrets, subst, valid_name};
+use crate::{connections_dir, crypto, subst, valid_name};
 
 const PUBLIC: &str = "connections.json";
 const PRIVATE: &str = "connections.private.json";
@@ -21,18 +22,13 @@ fn read(path: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// `${keychain}` → the connection's own account, `${keychain:ACCOUNT}` → that account.
-fn keychain_account<'a>(s: &'a str, name: &'a str) -> Option<&'a str> {
-    let inner = s.trim().strip_prefix("${")?.strip_suffix('}')?.trim();
-    match inner.split_once(':') {
-        None if inner == "keychain" => Some(name),
-        Some(("keychain", a)) if !a.trim().is_empty() => Some(a.trim()),
-        _ => None,
-    }
+/// `${keychain}` or `${keychain:ACCOUNT}`.
+fn keychain_marker(s: &str) -> bool {
+    s.trim().strip_prefix("${").and_then(|s| s.strip_suffix('}')).is_some_and(|i| i.trim() == "keychain" || i.trim().starts_with("keychain:"))
 }
 
 /// Splits the old files in `config` into `connections/<name>.json` (an existing file is kept),
-/// moves passwords into the keychain and renames the old files to `*.migrated`. Does nothing when
+/// encrypts passwords into `password_enc` and renames the old files to `*.migrated`. Does nothing when
 /// there is no `connections.json`. Returns what went wrong, for the warnings.
 pub fn migrate(config: &Path) -> Vec<String> {
     if !config.join(PUBLIC).is_file() {
@@ -78,14 +74,17 @@ pub fn migrate(config: &Path) -> Vec<String> {
             warnings.push(format!("{}: already exists, '{name}' from {PUBLIC} not migrated", path.display()));
             continue;
         }
+        if let Some(Value::String(p)) = password {
+            match encrypt_password(config, &name, &p) {
+                Ok(Some(enc)) => {
+                    e.insert("password_enc".into(), enc.into());
+                }
+                Ok(None) => {}
+                Err(msg) => warnings.push(format!("password of '{name}' not migrated ({msg}); set it with `siesta connections set-password {name}`")),
+            }
+        }
         if let Err(msg) = write_atomic(&path, &e) {
             warnings.push(msg);
-            continue;
-        }
-        if let Some(Value::String(p)) = password
-            && let Err(msg) = move_password(&name, &p)
-        {
-            warnings.push(format!("password of '{name}' not migrated ({msg}); set it with `siesta connections set-password {name}`"));
         }
     }
     for f in [PUBLIC, PRIVATE] {
@@ -99,19 +98,16 @@ pub fn migrate(config: &Path) -> Vec<String> {
     warnings
 }
 
-fn move_password(name: &str, old: &str) -> Result<(), String> {
-    let password = match keychain_account(old, name) {
-        // The password is already in the keychain: only an explicit other account has to be copied.
-        Some(a) if a == name => return Ok(()),
-        Some(a) => match secrets::get(a) {
-            Ok(p) => p,
-            Err(secrets::SecretError::Missing) => return Ok(()),
-            Err(e) => return Err(e.to_string()),
-        },
-        None if old.is_empty() => return Ok(()),
-        None => subst(old)?,
-    };
-    secrets::set(name, &password).map_err(|e| e.to_string())
+/// The old password as `password_enc`; `Ok(None)` for an empty one. `${keychain…}` markers are
+/// dropped (the keychain is not used any more).
+fn encrypt_password(config: &Path, name: &str, old: &str) -> Result<Option<String>, String> {
+    if keychain_marker(old) {
+        return Err("it was in the system keychain, which Siesta no longer reads; re-enter the password".into());
+    }
+    if old.is_empty() {
+        return Ok(None);
+    }
+    crypto::encrypt(config, name, &subst(old)?).map(Some)
 }
 
 #[cfg(test)]
@@ -120,10 +116,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn splits_into_files_and_moves_passwords_to_the_keychain() {
-        secrets::use_memory_store();
-        secrets::set("kc-mig-shared", "from-team-account").unwrap();
-        secrets::set("kc-mig-own", "already").unwrap();
+    fn splits_into_files_and_encrypts_passwords() {
         let tmp = tempfile::tempdir().unwrap();
         let c = tmp.path();
         fs::write(
@@ -145,20 +138,21 @@ mod tests {
 
         let w = migrate(c);
         let w = w.join("\n");
-        assert!(w.contains("bad/name") && w.contains("kc-mig-exists") && w.contains("kc-mig-unset"), "{w}");
+        assert!(w.contains("bad/name") && w.contains("kc-mig-exists") && w.contains("kc-mig-unset") && w.contains("password of 'kc-mig-own'") && w.contains("re-enter"), "{w}");
         assert!(!w.contains("hunter2"), "{w}");
 
         let file = |n: &str| -> Value { serde_json::from_str(&fs::read_to_string(connections_dir(c).join(format!("{n}.json"))).unwrap()).unwrap() };
-        assert_eq!(file("kc-mig-lit"), serde_json::json!({"driver": "postgres", "host": "private-host", "ssl": {"mode": "verify-full", "ca": c.join("certs/ca.pem").to_str().unwrap()}}));
+        let mut lit = file("kc-mig-lit");
+        assert!(lit.as_object_mut().unwrap().remove("password_enc").is_some());
+        assert_eq!(lit, serde_json::json!({"driver": "postgres", "host": "private-host", "ssl": {"mode": "verify-full", "ca": c.join("certs/ca.pem").to_str().unwrap()}}));
         assert_eq!(file("kc-mig-team"), serde_json::json!({"driver": "mysql"}));
         assert_eq!(file("kc-mig-exists")["host"], "new");
         assert_eq!(crate::names(c), ["kc-mig-env", "kc-mig-exists", "kc-mig-lit", "kc-mig-own", "kc-mig-team", "kc-mig-unset"]);
-        // Passwords are in the keychain, none in a file.
-        assert_eq!(secrets::get("kc-mig-lit").as_deref(), Ok("hunter2"));
-        assert_eq!(secrets::get("kc-mig-own").as_deref(), Ok("already"));
-        assert_eq!(secrets::get("kc-mig-team").as_deref(), Ok("from-team-account"));
-        assert_eq!(secrets::get("kc-mig-env").ok(), std::env::var("PATH").ok());
-        assert_eq!(secrets::get("kc-mig-unset"), Err(secrets::SecretError::Missing));
+        // Literal and `${env:}` passwords are encrypted; keychain markers and unresolved ones are dropped.
+        let pw = |n: &str| crate::Connections::load(c).connections[n].resolve_password_in(c).unwrap().password;
+        assert_eq!(pw("kc-mig-lit").as_deref(), Some("hunter2"));
+        assert_eq!(pw("kc-mig-env"), std::env::var("PATH").ok());
+        assert_eq!((pw("kc-mig-own"), pw("kc-mig-team"), pw("kc-mig-unset")), (None, None, None));
         assert!(!fs::read_to_string(connections_dir(c).join("kc-mig-lit.json")).unwrap().contains("hunter2"));
         // The old files are renamed, so a second run does nothing.
         assert!(!c.join(PUBLIC).exists() && !c.join(PRIVATE).exists());

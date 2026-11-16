@@ -30,7 +30,7 @@ pub(crate) struct ConnRow {
     pub color: Option<String>,
     pub prod: bool,
     pub read_only: bool,
-    /// A password is in the keychain (or in the URL).
+    /// The file holds an encrypted password (or the URL has one).
     pub password: bool,
     /// The current file's connection.
     pub used: bool,
@@ -55,9 +55,8 @@ fn target_of(c: &Connection) -> String {
     }
 }
 
-/// The page's rows, sorted by name. `filter` is matched against name, driver and target;
-/// `has_password` says whether the keychain holds a password for a name.
-pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str, has_password: &dyn Fn(&str) -> bool) -> Vec<ConnRow> {
+/// The page's rows, sorted by name. `filter` is matched against name, driver and target.
+pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str) -> Vec<ConnRow> {
     let filter = filter.trim().to_lowercase();
     let names: std::collections::BTreeSet<&String> = c.connections.keys().chain(c.errors.keys()).collect();
     names
@@ -71,7 +70,7 @@ pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str, h
                 color: conn.and_then(|c| c.display_color().map(str::to_string)),
                 prod: conn.is_some_and(|c| c.prod),
                 read_only: conn.is_some_and(|c| c.read_only),
-                password: conn.is_some_and(|c| c.has_password()) || has_password(name),
+                password: conn.is_some_and(|c| c.has_password()),
                 used: current == Some(name.as_str()),
                 error: c.errors.get(name).cloned(),
             }
@@ -135,8 +134,6 @@ pub(crate) struct ConnectionsPage {
     focus: FocusHandle,
     filter: Entity<InputState>,
     tests: HashMap<String, Test>,
-    /// Which names have a keychain password, read once per loaded `Connections` (a read can be slow).
-    passwords: (usize, HashMap<String, bool>),
     _subs: Vec<Subscription>,
 }
 
@@ -154,7 +151,7 @@ impl ConnectionsPage {
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Self { app, main, focus, filter, tests: HashMap::new(), passwords: (0, HashMap::new()), _subs }
+        Self { app, main, focus, filter, tests: HashMap::new(), _subs }
     }
 
     /// Runs `f` on `Siesta` in the main window, which comes forward (the form is a dialog there).
@@ -200,7 +197,7 @@ impl ConnectionsPage {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete connection '{name}'?"),
-            Some("The connection file is removed and its password is deleted from the system keychain."),
+            Some("The connection file is removed, together with its encrypted password."),
             &["Delete", "Cancel"],
             cx,
         );
@@ -282,12 +279,7 @@ impl Render for ConnectionsPage {
         let Some(app) = self.app.upgrade() else { return div().into_any_element() };
         let (conns, current) = app.read(cx).conns_for_page();
         let query = self.filter.read(cx).value().to_string();
-        let id = Arc::as_ptr(&conns) as usize;
-        if self.passwords.0 != id {
-            self.passwords = (id, conns.connections.keys().map(|n| (n.clone(), db_conn::secrets::get(n).is_ok())).collect());
-        }
-        let stored = &self.passwords.1;
-        let rows = build_rows(&conns, current.as_deref(), &query, &|n| stored.get(n).copied().unwrap_or(false));
+        let rows = build_rows(&conns, current.as_deref(), &query);
         let (muted, warning) = (cx.theme().muted_foreground, cx.theme().warning);
 
         let notes = conns.warnings.iter().map(|w| div().text_xs().text_color(warning).child(w.clone()));
@@ -338,6 +330,7 @@ mod tests {
             database: Some("d".into()),
             user: None,
             password: None,
+            password_enc: None,
             ssl: Default::default(),
             read_only: ro,
             prod,
@@ -355,13 +348,13 @@ mod tests {
         }
         c.connections.get_mut("a").unwrap().url = Some("postgres://u:secret@h/d".into());
         c.errors.insert("broken".into(), "no driver".into());
-        let stored = |n: &str| n == "b";
-        let rows = build_rows(&c, Some("b"), "", &stored);
+        c.connections.get_mut("b").unwrap().password_enc = Some("v1:x".into());
+        let rows = build_rows(&c, Some("b"), "");
         let seen: Vec<_> = rows.iter().map(|r| (r.name.as_str(), r.prod, r.read_only, r.used, r.error.is_some(), r.password)).collect();
         assert_eq!(seen, [("a", false, false, false, false, true), ("b", true, true, true, false, true), ("broken", false, false, false, true, false)]);
         assert_eq!((rows[0].target.as_str(), rows[1].target.as_str()), ("postgres://u:***@h/d", "h:5432/d"));
         // The filter matches names, drivers and targets.
-        assert_eq!(build_rows(&c, None, "BRO", &stored).iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["broken"]);
-        assert_eq!(build_rows(&c, None, "postgres", &stored).len(), 2);
+        assert_eq!(build_rows(&c, None, "BRO").iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["broken"]);
+        assert_eq!(build_rows(&c, None, "postgres").len(), 2);
     }
 }

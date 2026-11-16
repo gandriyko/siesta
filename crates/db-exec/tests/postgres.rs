@@ -27,6 +27,12 @@ async fn databases_list_and_override_pg() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn encrypted_password_connects_pg() {
+    encrypted_password_connects(PG).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn rejected_login_names_the_fix_pg() {
     rejected_login_names_the_fix(PG).await;
 }

@@ -62,7 +62,7 @@ enum ConnCmd {
         /// Connection name
         name: String,
     },
-    /// Store a connection's password in the system keychain (prompt without echo, or stdin when piped)
+    /// Store a connection's password, encrypted with the local key, in its file (prompt without echo, or stdin when piped)
     SetPassword {
         /// Connection name
         name: String,
@@ -149,7 +149,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
 }
 
 /// `connections set-password`: the password is read from a prompt without echo (`tty`) or from `input`
-/// (one line), and stored in the keychain under the connection's name.
+/// (one line), and stored encrypted (`password_enc`) in the connection's file.
 fn set_password(name: &str, config: Option<&Path>, tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
     Env::load_in(&cwd_probe(), config).pick(name)?;
     let password = if tty {
@@ -162,11 +162,12 @@ fn set_password(name: &str, config: Option<&Path>, tty: bool, input: &mut dyn Bu
     if password.is_empty() {
         return Err(CliError::new("no_password", "empty password", 3));
     }
-    db_conn::secrets::set(name, &password).map_err(|e| CliError::new("keychain_error", e.to_string(), 2))?;
+    let dir = config.ok_or_else(|| CliError::new("io_error", "no home directory", 3))?;
+    db_conn::set_password(dir, name, &password).map_err(|e| CliError::new("encryption_error", e, 2))?;
     if format.human() {
-        put(out, format!("Stored the password of '{name}' in the system keychain (service `{}`, account `{name}`)", db_conn::secrets::SERVICE));
+        put(out, format!("Stored the encrypted password of '{name}' in {}", db_conn::connections_dir(dir).join(format!("{name}.json")).display()));
     } else {
-        put(out, json!({ "connection": name, "ok": true, "service": db_conn::secrets::SERVICE, "account": name }).to_string());
+        put(out, json!({ "connection": name, "ok": true }).to_string());
     }
     Ok(0)
 }
@@ -289,7 +290,7 @@ fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
         .values()
         .map(|c| {
             let mut v = db_conn::masked(c);
-            v["password"] = json!(if c.has_password() || db_conn::secrets::get(&c.name).is_ok() { "set" } else { "none" });
+            v["password"] = json!(if c.has_password() { "set" } else { "none" });
             v
         })
         .collect();
@@ -446,16 +447,17 @@ mod tests {
     // Tests that load connections (they read `SIESTA_CONFIG_DIR`) live in tests/config.rs.
 
     #[test]
-    fn set_password_from_stdin_stores_by_connection_name() {
-        db_conn::secrets::use_memory_store();
+    fn set_password_from_stdin_encrypts_into_the_connection_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("connections")).unwrap();
         std::fs::write(dir.path().join("connections/kc-cli-a.json"), r#"{"driver": "postgres", "host": "h"}"#).unwrap();
         let set = |name: &str, input: &str| set_password(name, Some(dir.path()), false, &mut input.as_bytes(), Format::Json, &mut vec![]);
         assert_eq!(set("kc-cli-a", "hunter2\r\nignored\n").unwrap(), 0);
-        assert_eq!(db_conn::secrets::get("kc-cli-a").as_deref(), Ok("hunter2"));
+        let resolved = || db_conn::Connections::load(dir.path()).connections["kc-cli-a"].resolve_password_in(dir.path()).unwrap().password;
+        assert_eq!(resolved().as_deref(), Some("hunter2"));
+        assert!(!std::fs::read_to_string(dir.path().join("connections/kc-cli-a.json")).unwrap().contains("hunter2"));
         assert_eq!(set("nope", "x\n").unwrap_err().code, "unknown_connection");
         assert_eq!(set("kc-cli-a", "\n").unwrap_err().code, "no_password");
-        assert_eq!(db_conn::secrets::get("kc-cli-a").as_deref(), Ok("hunter2"));
+        assert_eq!(resolved().as_deref(), Some("hunter2"));
     }
 }

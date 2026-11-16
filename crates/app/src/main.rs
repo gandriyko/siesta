@@ -1472,8 +1472,6 @@ mod tests {
         if !cx.update(|cx| cx.has_global::<gpui_component::Theme>()) {
             cx.update(gpui_component::init);
         }
-        // Opening a session reads the keychain: never the real one.
-        db_conn::secrets::use_memory_store();
         let mut view = None;
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
@@ -1936,7 +1934,6 @@ mod tests {
     #[gpui::test]
     fn form_saves_into_the_config_dir_and_picks_for_its_own_file_only(tcx: &mut TestAppContext) {
         use db_conn::Driver;
-        db_conn::secrets::use_memory_store();
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (a, b) = (ws.path().join("a.sql"), ws.path().join("b.sql"));
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
@@ -1961,8 +1958,11 @@ mod tests {
             })
         });
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("connections/fresh.json")).unwrap()).unwrap();
+        let mut file = file;
+        assert!(file.as_object_mut().unwrap().remove("password_enc").is_some());
         assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1}));
-        assert_eq!(db_conn::secrets::get("fresh").as_deref(), Ok("pw"));
+        let stored = |d: &Path, n: &str| db_conn::Connections::load(d).connections[n].resolve_password_in(d).unwrap().password;
+        assert_eq!(stored(&dir, "fresh").as_deref(), Some("pw"));
         // Every open file sees the connection; only `a.sql` (the file the form was opened for) picked it.
         let (pa, pb, known) = cx.update(|_, cx| {
             let this = app.read(cx);
@@ -1987,7 +1987,6 @@ mod tests {
 
     #[gpui::test]
     fn typing_a_url_fills_the_fields_and_saving_writes_no_url(tcx: &mut TestAppContext) {
-        db_conn::secrets::use_memory_store();
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
         let dir = cfg.path().join("siesta");
@@ -2014,8 +2013,10 @@ mod tests {
         assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "db.local");
         cx.update(|window, cx| form.update(cx, |f, cx| f.save(window, cx)));
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("connections/viaurl.json")).unwrap()).unwrap();
+        let mut file = file;
+        assert!(file.as_object_mut().unwrap().remove("password_enc").is_some());
         assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "db.local", "port": 3307, "database": "shop", "user": "me", "ssl": {"mode": "require"}}));
-        assert_eq!(db_conn::secrets::get("viaurl").as_deref(), Ok("p@ss"));
+        assert_eq!(db_conn::Connections::load(&dir).connections["viaurl"].resolve_password_in(&dir).unwrap().password.as_deref(), Some("p@ss"));
     }
 
     #[gpui::test]
@@ -2027,7 +2028,7 @@ mod tests {
         std::fs::write(dir.join("connections/gl.json"), r#"{"driver": "postgres", "host": "h", "port": 5, "database": "d"}"#).unwrap();
         std::fs::write(dir.join("connections/other.json"), r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1}"#).unwrap();
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
-        db_conn::secrets::set("gl", "pw").unwrap();
+        db_conn::set_password(&dir, "gl", "pw").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.config_dir = Some(dir.clone());
@@ -2035,10 +2036,10 @@ mod tests {
                 this.pick_for(&a, Some("other".into()), window, cx);
             })
         });
-        // The page is one flat list with a "password set" mark.
+        // The page is one flat list with a "password set" mark (`password_enc` present).
         let rows = cx.update(|_, cx| {
             let (conns, current) = app.read(cx).conns_for_page();
-            build_rows(&conns, current.as_deref(), "", &|n| db_conn::secrets::get(n).is_ok())
+            build_rows(&conns, current.as_deref(), "")
         });
         assert_eq!(rows.iter().map(|r| (r.name.as_str(), r.password, r.used, r.target.as_str())).collect::<Vec<_>>(), [("gl", true, false, "h:5/d"), ("other", false, true, "127.0.0.1:1")]);
         // The page itself renders.
@@ -2063,11 +2064,10 @@ mod tests {
         });
         assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
         assert_eq!(db_conn::read_form(&dir, "gl").unwrap().host, "edited");
-        assert_eq!(db_conn::secrets::get("gl").as_deref(), Ok("pw")); // the empty password field kept it
-        // Delete removes the connection and its keychain entry, and leaves the pick.
+        assert_eq!(db_conn::Connections::load(&dir).connections["gl"].resolve_password_in(&dir).unwrap().password.as_deref(), Some("pw")); // the empty password field kept it
+        // Delete removes the connection with its password, and leaves the pick.
         cx.update(|window, cx| app.update(cx, |this, cx| this.delete_connection("gl", window, cx)));
-        assert!(db_conn::read_form(&dir, "gl").is_none());
-        assert!(db_conn::secrets::get("gl").is_err());
+        assert!(db_conn::read_form(&dir, "gl").is_none() && !db_conn::has_password(&dir, "gl"));
         assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
     }
 

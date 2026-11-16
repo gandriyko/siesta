@@ -18,6 +18,7 @@ pub fn connection(driver: Driver) -> Connection {
         database: None,
         user: None,
         password: None,
+        password_enc: None,
         ssl: Ssl::default(),
         read_only: false,
         prod: false,
@@ -27,14 +28,28 @@ pub fn connection(driver: Driver) -> Connection {
     }
 }
 
-/// A rejected login without any password says where to set one (the keychain is the in-memory mock).
+/// A rejected login without any password says where to set one (no `password_enc`, so no key is needed).
 pub async fn rejected_login_names_the_fix(driver: Driver) {
-    db_conn::secrets::use_memory_store();
     let mut c = connection(driver);
     c.name = "test-no-password".into();
     c.url = c.url.map(|u| u.replacen(":siesta@", "@", 1));
     let e = Session::open(&c).await.err().expect("login without a password is rejected");
     assert!(e.message.contains("No password is stored for `test-no-password`") && e.message.contains("set-password"), "{e}");
+}
+
+/// A password stored as `password_enc` (key in a temp config dir) is decrypted when the session opens.
+pub async fn encrypted_password_connects(driver: Driver) {
+    let dir = std::env::temp_dir().join(format!("siesta-enc-test-{}-{}", std::process::id(), driver == Driver::Postgres));
+    let enc = db_conn::crypto::encrypt(&dir, "test-enc", "siesta").unwrap();
+    // The test config dir is process-wide, but only connections with `password_enc` ever read it.
+    unsafe { std::env::set_var("SIESTA_CONFIG_DIR", &dir) };
+    let mut c = connection(driver);
+    c.name = "test-enc".into();
+    c.url = c.url.map(|u| u.replacen(":siesta@", "@", 1));
+    c.password_enc = Some(enc);
+    let result = Session::open(&c).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result.expect("login with the decrypted password").close().await;
 }
 
 /// The server lists the accessible databases, and a session opened with another `database` runs in it.

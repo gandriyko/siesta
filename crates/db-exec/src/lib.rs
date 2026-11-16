@@ -325,7 +325,7 @@ impl Session {
     /// [`open`](Self::open) with a connect timeout over the whole attempt (TLS, handshake, setup
     /// statements); also used by cancel and reconnect of this session.
     pub async fn open_with(c: &Connection, connect_timeout: Duration) -> Result<Session, DbError> {
-        // The one place the keychain password is read (also on reconnect: `spec` keeps the resolved copy).
+        // The one place the password is decrypted (also on reconnect: `spec` keeps the resolved copy).
         let resolved = c.resolve_password().map_err(DbError::msg)?;
         let c = &resolved;
         let e = |e| {

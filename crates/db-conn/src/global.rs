@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::secrets::{self, SecretError};
-use crate::{Connection, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, parse_url, valid_name};
+use crate::{Connection, crypto, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, parse_url, valid_name};
 
 /// What the form edits. Strings are trimmed on save; an empty one removes the key.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -22,7 +21,7 @@ pub struct ConnectionForm {
     pub port: String,
     pub database: String,
     pub user: String,
-    /// A new password to store; empty keeps the keychain entry.
+    /// A new password to store (encrypted); empty keeps the stored one.
     pub password: String,
     pub ssl_mode: Option<SslMode>,
     pub schema: String,
@@ -30,7 +29,7 @@ pub struct ConnectionForm {
     pub color: String,
     pub read_only: bool,
     pub prod: bool,
-    /// The keychain holds a password for the connection (set by `read_form`; the form shows a placeholder).
+    /// The file holds a `password_enc` (set by `read_form`; the form shows a placeholder).
     pub has_password: bool,
     /// The keys the form does not own (`ssl.ca`, unknown ones), carried so Test sees them too.
     pub base: Map<String, Value>,
@@ -81,7 +80,7 @@ impl ConnectionForm {
         let mut c = parse(name, &self.entry()?, &connections_dir(config), &mut vec![])?;
         c.password = match (self.password.is_empty(), original) {
             (false, _) => Some(self.password.clone()),
-            (true, Some(o)) => secrets::get(o).ok(),
+            (true, Some(o)) => stored_enc(config, o).and_then(|e| crypto::decrypt(config, o, &e).ok()),
             (true, None) => None,
         };
         Ok(c)
@@ -90,6 +89,27 @@ impl ConnectionForm {
 
 fn path_of(config: &Path, name: &str) -> PathBuf {
     connections_dir(config).join(format!("{name}.json"))
+}
+
+/// The `password_enc` of a connection file, if any.
+fn stored_enc(config: &Path, name: &str) -> Option<String> {
+    let Value::Object(e) = serde_json::from_str(&std::fs::read_to_string(path_of(config, name)).ok()?).ok()? else { return None };
+    e.get("password_enc")?.as_str().map(String::from)
+}
+
+/// Whether the connection file holds a password (no decryption, no key needed).
+pub fn has_password(config: &Path, name: &str) -> bool {
+    stored_enc(config, name).is_some()
+}
+
+/// Encrypts `password` into the existing connection file `name` (the rest of the file stays).
+pub fn set_password(config: &Path, name: &str, password: &str) -> Result<(), String> {
+    valid_name(name)?;
+    let path = path_of(config, name);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let Ok(Value::Object(mut e)) = serde_json::from_str(&text) else { return Err(format!("{}: not a JSON object", path.display())) };
+    e.insert("password_enc".into(), crypto::encrypt(config, name, password)?.into());
+    write_atomic(&path, &e)
 }
 
 /// Names of the connection files, sorted.
@@ -116,7 +136,7 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
     };
     let b = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
     let mut base = e.clone();
-    for k in ["host", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password"] {
+    for k in ["host", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password", "password_enc"] {
         base.remove(k);
     }
     if let Some(Value::Object(o)) = base.get_mut("ssl") {
@@ -151,20 +171,34 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
         color: s("color"),
         read_only: b("read_only"),
         prod: b("prod"),
-        has_password: secrets::get(name).is_ok(),
+        has_password: e.get("password_enc").is_some_and(Value::is_string),
         base,
     })
 }
 
 /// Saves the form as `<name>.json`. `original` is the name being edited (a rename moves the file
-/// and the keychain entry); `None` for a new connection. `Err` means nothing was saved. `Ok(Some(e))`
-/// means the file is saved but the password could not be (keychain unavailable, denied): the form
-/// shows `e` and stays open.
+/// and re-encrypts the password for the new name); `None` for a new connection. `Err` means nothing
+/// was saved. `Ok(Some(e))` means the file is saved but the password could not be (key unreadable,
+/// old password undecryptable): the form shows `e` and stays open.
 pub fn save(config: &Path, form: &ConnectionForm, original: Option<&str>) -> Result<Option<String>, String> {
     let name = form.name.trim();
     valid_name(name)?;
-    let entry = form.entry()?;
+    let mut entry = form.entry()?;
     let renamed = original.filter(|o| *o != name);
+    let old_enc = original.and_then(|o| stored_enc(config, o));
+    let enc = match (form.password.as_str(), old_enc) {
+        ("", None) => Ok(None),
+        ("", Some(e)) if renamed.is_none() => Ok(Some(e)),
+        ("", Some(e)) => crypto::decrypt(config, renamed.unwrap_or_default(), &e).and_then(|p| crypto::encrypt(config, name, &p)).map(Some),
+        (pw, _) => crypto::encrypt(config, name, pw).map(Some),
+    };
+    let (enc, warn) = match enc {
+        Ok(e) => (e, None),
+        Err(e) => (None, Some(e)),
+    };
+    if let Some(e) = enc {
+        entry.insert("password_enc".into(), e.into());
+    }
     let (path, old) = (path_of(config, name), renamed.map(|o| path_of(config, o)));
     // The same file under a differently-cased name (case-insensitive file systems) is a rename, not a clash.
     if path.exists() && !renamed.is_some_and(|o| o.eq_ignore_ascii_case(name)) && Some(name) != original {
@@ -175,42 +209,18 @@ pub fn save(config: &Path, form: &ConnectionForm, original: Option<&str>) -> Res
         std::fs::rename(&old, &path).map_err(|e| format!("{}: {e}", old.display()))?;
     }
     write_atomic(&path, &entry)?;
-    Ok(match (form.password.as_str(), renamed) {
-        ("", Some(o)) => move_secret(o, name).err(),
-        ("", None) => None,
-        (pw, renamed) => secrets::set(name, pw).err().map(|e| e.to_string()).or_else(|| {
-            // A new password under a new name: the old entry is stale.
-            renamed.and_then(|o| secrets::delete(o).err()).map(|e| e.to_string())
-        }),
-    })
+    Ok(warn)
 }
 
-/// Moves the keychain entry of `from` to `to`; a missing one is fine.
-fn move_secret(from: &str, to: &str) -> Result<(), String> {
-    match secrets::get(from) {
-        Ok(p) => {
-            secrets::set(to, &p).map_err(|e| e.to_string())?;
-            secrets::delete(from).map_err(|e| e.to_string())
-        }
-        Err(SecretError::Missing) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Removes the connection's file and its keychain entry (best effort: a missing entry or an
-/// unavailable keychain does not fail the delete); whether the file was there.
+/// Removes the connection's file (the password goes with it); whether the file was there.
 pub fn delete(config: &Path, name: &str) -> Result<bool, String> {
     valid_name(name)?;
     let path = path_of(config, name);
-    let found = match std::fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    if found {
-        let _ = secrets::delete(name);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
-    Ok(found)
 }
 
 pub(crate) fn write_atomic(path: &Path, map: &Map<String, Value>) -> Result<(), String> {
@@ -232,7 +242,6 @@ mod tests {
     use std::fs;
 
     fn form(name: &str) -> ConnectionForm {
-        secrets::use_memory_store();
         ConnectionForm { name: name.into(), driver: Some(Driver::Postgres), host: "h".into(), port: "5432".into(), password: "secret".into(), ..Default::default() }
     }
 
@@ -241,66 +250,75 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_the_file_without_a_password_and_roundtrips() {
+    fn save_writes_the_file_with_an_encrypted_password_and_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         let mut f = form("kc-save");
         (f.prod, f.read_only, f.ssl_mode, f.schema) = (true, true, Some(SslMode::Require), "app".into());
         assert_eq!(save(d, &f, None).unwrap(), None);
-        assert_eq!(json(d, "kc-save"), serde_json::json!({"driver": "postgres", "host": "h", "port": 5432, "prod": true, "read_only": true, "schema": "app", "ssl": {"mode": "require"}}));
-        assert_eq!(secrets::get("kc-save").as_deref(), Ok("secret"));
+        let mut j = json(d, "kc-save");
+        let enc = j.as_object_mut().unwrap().remove("password_enc").unwrap();
+        assert_eq!(j, serde_json::json!({"driver": "postgres", "host": "h", "port": 5432, "prod": true, "read_only": true, "schema": "app", "ssl": {"mode": "require"}}));
+        assert!(enc.as_str().unwrap().starts_with("v1:") && !fs::read_to_string(path_of(d, "kc-save")).unwrap().contains("secret"));
+        assert!(has_password(d, "kc-save") && !has_password(d, "nope"));
         // The form comes back with an empty password field and the "stored" flag.
         assert_eq!(read_form(d, "kc-save").unwrap(), ConnectionForm { password: String::new(), has_password: true, ..f.clone() });
         let c = crate::Connections::load(d);
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         let c = &c.connections["kc-save"];
         assert_eq!((c.password.as_deref(), c.prod, c.ssl.mode), (None, true, Some(SslMode::Require)));
-        assert_eq!(c.resolve_password().unwrap().password.as_deref(), Some("secret"));
+        assert_eq!(c.resolve_password_in(d).unwrap().password.as_deref(), Some("secret"));
         assert!(fs::read_dir(connections_dir(d)).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
     }
 
     #[test]
-    fn edit_keeps_renames_and_deletes_the_keychain_entry() {
+    fn edit_keeps_reencrypts_on_rename_and_delete_removes_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
+        let pw = |c: &Path, n: &str| crate::Connections::load(c).connections[n].resolve_password_in(c).map(|c| c.password);
         save(d, &form("kc-old"), None).unwrap();
         // Edit with an empty password field: the stored one stays.
         let mut f = read_form(d, "kc-old").unwrap();
         f.host = "other".into();
+        let before = json(d, "kc-old")["password_enc"].clone();
         save(d, &f, Some("kc-old")).unwrap();
-        assert_eq!(secrets::get("kc-old").as_deref(), Ok("secret"));
-        // Rename moves the file and the entry.
+        assert_eq!(json(d, "kc-old")["password_enc"], before);
+        assert_eq!(pw(d, "kc-old"), Ok(Some("secret".into())));
+        // Rename moves the file and re-encrypts for the new name (the AAD).
         f.name = "kc-new".into();
         assert_eq!(save(d, &f, Some("kc-old")).unwrap(), None);
-        assert_eq!((secrets::get("kc-old"), secrets::get("kc-new").as_deref()), (Err(SecretError::Missing), Ok("secret")));
         assert_eq!(names(d), ["kc-new"]);
+        assert_ne!(json(d, "kc-new")["password_enc"], before);
+        assert_eq!(pw(d, "kc-new"), Ok(Some("secret".into())));
         assert_eq!(json(d, "kc-new")["host"], "other");
         // A new password replaces it, also together with a rename.
         f.password = "fresh".into();
         save(d, &f, Some("kc-new")).unwrap();
-        assert_eq!(secrets::get("kc-new").as_deref(), Ok("fresh"));
+        assert_eq!(pw(d, "kc-new"), Ok(Some("fresh".into())));
         f.name = "kc-newer".into();
         save(d, &f, Some("kc-new")).unwrap();
-        assert_eq!((secrets::get("kc-new"), secrets::get("kc-newer").as_deref()), (Err(SecretError::Missing), Ok("fresh")));
-        // Delete removes both (a second delete of the missing file is fine).
+        assert_eq!(pw(d, "kc-newer"), Ok(Some("fresh".into())));
+        // A copied file under another name does not decrypt.
+        fs::copy(path_of(d, "kc-newer"), path_of(d, "copy")).unwrap();
+        assert!(pw(d, "copy").unwrap_err().contains("Can't decrypt"));
+        // set_password encrypts into an existing file only.
+        set_password(d, "copy", "again").unwrap();
+        assert_eq!(pw(d, "copy"), Ok(Some("again".into())));
+        assert!(set_password(d, "nope", "x").is_err());
+        // Delete removes the file (a second delete of the missing file is fine).
         assert!(delete(d, "kc-newer").unwrap());
-        assert_eq!(secrets::get("kc-newer"), Err(SecretError::Missing));
-        assert!(!delete(d, "kc-newer").unwrap());
+        assert!(!has_password(d, "kc-newer") && !delete(d, "kc-newer").unwrap());
     }
 
     #[test]
-    fn unavailable_keychain_saves_the_rest_and_reports() {
+    fn unreadable_key_saves_the_rest_and_reports() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        let f = form("kc-off");
-        secrets::set_unavailable(true);
-        let r = save(d, &f, None);
-        secrets::set_unavailable(false);
-        let e = r.unwrap().expect("a password error");
-        assert!(e.contains("keychain unavailable"), "{e}");
+        fs::write(crypto::key_path(d), [1u8; 3]).unwrap();
+        let e = save(d, &form("kc-off"), None).unwrap().expect("a password error");
+        assert!(e.contains("32 bytes"), "{e}");
         assert_eq!(json(d, "kc-off")["host"], "h");
-        assert!(json(d, "kc-off").get("password").is_none());
-        assert_eq!(secrets::get("kc-off"), Err(SecretError::Missing));
+        assert!(json(d, "kc-off").get("password_enc").is_none());
     }
 
     #[test]
@@ -345,7 +363,9 @@ mod tests {
         f.prod = true;
         let c = f.to_connection(tmp.path(), None).unwrap();
         assert_eq!((c.user, c.password.as_deref(), c.prod, c.port), (std::env::var("PATH").ok(), Some("secret"), true, Some(5432)));
-        secrets::set("kc-stored", "kept").unwrap();
+        let mut stored = form("kc-stored");
+        stored.password = "kept".into();
+        save(tmp.path(), &stored, None).unwrap();
         f.password = String::new();
         assert_eq!(f.to_connection(tmp.path(), Some("kc-stored")).unwrap().password.as_deref(), Some("kept"));
         assert_eq!(f.to_connection(tmp.path(), None).unwrap().password, None);

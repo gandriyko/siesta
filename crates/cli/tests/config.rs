@@ -1,5 +1,5 @@
 //! CLI behaviour that needs a config dir but no database. Every test points `SIESTA_CONFIG_DIR` at its
-//! own temp dir (never the real `~/.config/siesta`) and holds `ENV` meanwhile; the keychain is the in-memory mock.
+//! own temp dir (never the real `~/.config/siesta`) and holds `ENV` meanwhile; its encryption key lives in that dir too.
 
 use serde_json::Value;
 
@@ -14,7 +14,6 @@ impl Env {
     /// A config dir with one file per `(name, json)` connection.
     fn new(conns: &[(&str, &str)]) -> Env {
         let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        db_conn::secrets::use_memory_store();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("config/connections")).unwrap();
         for (n, j) in conns {
@@ -78,13 +77,21 @@ fn connections_list_is_masked_and_shows_password_state() {
         ("cfg-none", r#"{"driver": "postgres", "host": "h"}"#),
         ("cfg-bad", r#"{"driver": "oracle"}"#),
     ]);
-    db_conn::secrets::set("cfg-kc", "hunter2").unwrap();
+    db_conn::set_password(&e.dir.path().join("config"), "cfg-kc", "hunter2").unwrap();
     let (code, v, text) = e.go(&["connections", "--output", "json"]);
     assert_eq!(code, 0);
     assert!(!text.contains("s3cret") && !text.contains("hunter2") && !text.contains("leaked"), "{text}");
     let row = |n: &str| v.as_array().unwrap().iter().find(|c| c["name"] == n).unwrap().clone();
     assert_eq!((row("cfg-url")["password"].as_str(), row("cfg-kc")["password"].as_str(), row("cfg-none")["password"].as_str()), (Some("set"), Some("set"), Some("none")));
     assert!(row("cfg-bad")["error"].as_str().unwrap().contains("oracle"));
+}
+
+#[test]
+fn undecryptable_password_exits_2_with_a_clear_message() {
+    let e = Env::new(&[("cfg-enc", r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1, "password_enc": "v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#)]);
+    let (code, _, text) = e.go(&["connections", "test", "cfg-enc", "--output", "json"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("Can't decrypt the password of `cfg-enc`") && text.contains("Set the password again"), "{text}");
 }
 
 #[test]

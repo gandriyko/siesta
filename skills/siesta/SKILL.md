@@ -18,8 +18,8 @@ From an agent, use the CLI only; never launch the GUI.
   boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
-- Never write passwords into a connection file; they live only in the system keychain
-  (`siesta connections set-password NAME`, done by the user). `siesta connections` shows connections
+- Never write passwords into a connection file; they live only encrypted (`password_enc`, local key in
+  `~/.config/siesta/key`; `siesta connections set-password NAME`, done by the user). Never read or print the key. `siesta connections` shows connections
   with secrets masked and whether a password is set.
 - Results are capped at 100 rows by default; check `rows_truncated`. Narrow the query
   (`WHERE`, `LIMIT`, `count(*)`, aggregates) instead of raising `--max-rows` for a big table.
@@ -37,7 +37,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 | `siesta connections list` | The same as `siesta connections` |
 | `siesta connections test NAME` | Open a connection and report the server version |
 | `siesta connections databases NAME` | Databases on the server of a connection that its credentials can access (`name`); with `-d` / `-- @database` you can run in any of them |
-| `siesta connections set-password NAME` | Store the password of a connection in the system keychain (hidden prompt, or one line from stdin); the user does this, not you |
+| `siesta connections set-password NAME` | Store the password of a connection, encrypted, in its file (hidden prompt, or one line from stdin); the user does this, not you |
 | `siesta schema [TABLE]` | Every table and view, or one table (`table` or `schema.table`) with columns and indexes |
 
 `list`, `run`, `exec`, `connections` and `schema` take `--output table|json|jsonl|csv`
@@ -160,10 +160,12 @@ project-level connection files.
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
   There is no `password` key.
 - `${env:NAME}` reads the environment.
-- The password lives only in the OS keychain (service `siesta`, account = the connection name), read when
-  a session opens; the user sets it in the connection form or with `siesta connections set-password NAME`.
-  Without an entry Siesta connects without a password; if the server then rejects the login, the error says
-  to set one (exit `2`): ask the user to run `set-password`; never type a password yourself.
+- The password lives only as `password_enc` in the connection file, encrypted with the key in
+  `~/.config/siesta/key` and decrypted when a session opens; the user sets it in the connection form or
+  with `siesta connections set-password NAME`. Without `password_enc` Siesta connects without a password;
+  if the server then rejects the login, the error says to set one (exit `2`): ask the user to run
+  `set-password`; never type a password yourself. "Can't decrypt the password of `X`" (exit `2`) means the
+  key is missing or different: the user sets the password again.
 - Check with `siesta connections`, then `siesta connections test NAME`. The environment variable
   `SIESTA_CONFIG_DIR` replaces `~/.config/siesta`.
 

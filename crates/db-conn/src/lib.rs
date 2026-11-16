@@ -2,8 +2,8 @@
 //! (`~/.config/siesta` unless `SIESTA_CONFIG_DIR` says otherwise); the file name is the connection name.
 //!
 //! A file holds driver, url | host / port / database / user, ssl, read_only, prod, schema, init_sql, color.
-//! Values may use `${env:NAME}`. There is no password key: the password lives only in the system
-//! keychain (`secrets`, service `siesta`, account = connection name), read when a session opens.
+//! Values may use `${env:NAME}`. The password lives only as `password_enc` (encrypted with the local
+//! key `<config dir>/key`, see [`crypto`]), decrypted when a session opens.
 //! A broken connection lands in `errors`, a suspicious key in `warnings`; the rest loads.
 
 use std::collections::BTreeMap;
@@ -13,13 +13,13 @@ use serde_json::{Map, Value};
 
 mod global;
 mod legacy;
-pub mod secrets;
-pub use global::{ConnectionForm, delete, names, read_form, save};
+pub mod crypto;
+pub use global::{ConnectionForm, delete, has_password, names, read_form, save, set_password};
 pub use legacy::migrate;
 mod urlparse;
 pub use urlparse::{ParsedUrl, parse_url};
 
-const KEYS: [&str; 12] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
+const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color", "password_enc"];
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
 
 /// `~/.config/siesta`, where connections (and the settings) live; `SIESTA_CONFIG_DIR` overrides it
@@ -82,9 +82,11 @@ pub struct Connection {
     pub port: Option<u16>,
     pub database: Option<String>,
     pub user: Option<String>,
-    /// `None` after loading: the keychain is read only when a session opens (see
+    /// `None` after loading: `password_enc` is decrypted only when a session opens (see
     /// [`Connection::resolve_password`]). Set by the form's Test with a typed password.
     pub password: Option<String>,
+    /// The `password_enc` value of the file (`v1:<base64>`, see [`crypto`]).
+    pub password_enc: Option<String>,
     pub ssl: Ssl,
     pub read_only: bool,
     /// A production connection: red, and every run asks for confirmation.
@@ -98,20 +100,27 @@ pub struct Connection {
 impl Connection {
     /// Whether a password is already known: set explicitly or written in the url.
     pub fn has_password(&self) -> bool {
-        self.password.is_some() || self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
+        self.password.is_some() || self.password_enc.is_some() || self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
     }
 
-    /// A copy with the password read from the system keychain (account = connection name) when none
-    /// is known yet. No entry (or no keychain) means no password: some local databases need none.
-    /// Call right before connecting: on macOS a read may prompt, so loading never does it.
+    /// A copy with `password_enc` decrypted (key of the global config dir) when no password is
+    /// given explicitly or in the url. No `password_enc` means no password: some local databases need none.
+    /// Call right before connecting; loading never decrypts.
     pub fn resolve_password(&self) -> Result<Connection, String> {
+        match global_dir() {
+            Some(d) => self.resolve_password_in(&d),
+            None if self.password_enc.is_some() => Err("no home directory: can't find the password key".into()),
+            None => Ok(self.clone()),
+        }
+    }
+
+    /// [`resolve_password`](Self::resolve_password) with an explicit config dir (where `key` lives).
+    pub fn resolve_password_in(&self, config: &Path) -> Result<Connection, String> {
         let mut c = self.clone();
-        if !c.has_password() {
-            match secrets::get(&self.name) {
-                Ok(p) => c.password = Some(p),
-                Err(secrets::SecretError::Missing | secrets::SecretError::Unavailable(_)) => {}
-                Err(e) => return Err(e.to_string()),
-            }
+        if self.password.is_none() && !self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
+            && let Some(enc) = &self.password_enc
+        {
+            c.password = Some(crypto::decrypt(config, &self.name, enc)?);
         }
         Ok(c)
     }
@@ -238,6 +247,7 @@ pub fn masked(c: &Connection) -> Value {
     put("schema", s(&c.schema));
     put("init_sql", s(&c.init_sql));
     put("color", s(&c.color));
+    put("password_enc", c.password_enc.as_ref().map(|_| "***".into()));
     Value::Object(m)
 }
 
@@ -322,13 +332,13 @@ fn parse_driver(driver: Option<&str>, url: Option<&str>) -> Result<Driver, Strin
 }
 
 /// One connection's JSON object: unknown keys noted, `${env:}` substituted, ssl paths made absolute
-/// (relative ones against `dir`), values checked. `password` is not a key (the keychain holds it).
+/// (relative ones against `dir`), values checked. `password` is not a key (only `password_enc` is).
 fn parse(name: &str, obj: &Map<String, Value>, dir: &Path, warnings: &mut Vec<String>) -> Result<Connection, String> {
     let at = || dir.join(format!("{name}.json")).display().to_string();
     let mut f = Map::new();
     for (k, v) in obj {
         if k == "password" {
-            warnings.push(format!("{}: 'password' is ignored: passwords live in the system keychain", at()));
+            warnings.push(format!("{}: 'password' is ignored: set it in the connection form or with `siesta connections set-password {name}`", at()));
         } else if !KEYS.contains(&k.as_str()) {
             warnings.push(format!("{}: unknown key '{k}'", at()));
         } else if let (Value::Object(ssl), "ssl") = (v, k.as_str()) {
@@ -402,6 +412,7 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         database: str_of("database")?,
         user: str_of("user")?,
         password: None,
+        password_enc: str_of("password_enc")?,
         ssl,
         read_only,
         prod,
@@ -442,23 +453,26 @@ mod tests {
     }
 
     #[test]
-    fn password_comes_from_the_keychain_by_name() {
-        secrets::use_memory_store();
-        let t = config(&[("kc-lazy", r#"{"driver": "postgres", "host": "h"}"#), ("kc-url", r#"{"url": "postgres://u:pw@h/db"}"#)]);
+    fn password_is_decrypted_lazily_from_password_enc() {
+        let t = config(&[("lazy", r#"{"driver": "postgres", "host": "h"}"#)]);
+        let enc = crypto::encrypt(t.path(), "lazy", "pw1").unwrap();
+        let url_enc = crypto::encrypt(t.path(), "viaurl", "other").unwrap();
+        fs::write(connections_dir(t.path()).join("enc.json"), format!(r#"{{"driver": "postgres", "password_enc": "{}"}}"#, crypto::encrypt(t.path(), "enc", "pw2").unwrap())).unwrap();
+        fs::write(connections_dir(t.path()).join("viaurl.json"), format!(r#"{{"url": "postgres://u:pw@h/db", "password_enc": "{url_enc}"}}"#)).unwrap();
+        fs::write(connections_dir(t.path()).join("moved.json"), format!(r#"{{"driver": "postgres", "password_enc": "{enc}"}}"#)).unwrap();
         let c = Connections::load(t.path());
-        let lazy = &c.connections["kc-lazy"];
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         // Nothing stored: no password, no error (some local databases need none).
-        assert_eq!(lazy.resolve_password().unwrap().password, None);
-        secrets::set("kc-lazy", "pw1").unwrap();
-        assert_eq!(lazy.resolve_password().unwrap().password.as_deref(), Some("pw1"));
-        // A password in the url wins; the keychain is not consulted.
-        secrets::set("kc-url", "other").unwrap();
-        assert_eq!(c.connections["kc-url"].resolve_password().unwrap().password, None);
-        // Unavailable keychain: connect without a password.
-        secrets::set_unavailable(true);
-        let r = lazy.resolve_password();
-        secrets::set_unavailable(false);
-        assert_eq!(r.unwrap().password, None);
+        assert!(!c.connections["lazy"].has_password());
+        assert_eq!(c.connections["lazy"].resolve_password_in(t.path()).unwrap().password, None);
+        assert!(c.connections["enc"].has_password() && c.connections["enc"].password.is_none());
+        assert_eq!(c.connections["enc"].resolve_password_in(t.path()).unwrap().password.as_deref(), Some("pw2"));
+        // A password in the url wins; nothing is decrypted.
+        assert_eq!(c.connections["viaurl"].resolve_password_in(t.path()).unwrap().password, None);
+        // The ciphertext of another connection does not decrypt.
+        assert!(c.connections["moved"].resolve_password_in(t.path()).unwrap_err().contains("Can't decrypt the password of `moved`"));
+        // password_enc is masked in CLI output.
+        assert_eq!(masked(&c.connections["enc"])["password_enc"], "***");
     }
 
     #[test]
@@ -494,7 +508,7 @@ mod tests {
         let t = config(&[("a", r#"{"driver": "postgres", "colour": "red", "password": "x", "ssl": {"cA": "x"}}"#), ("broken", "{ not json"), ("arr", "[]")]);
         let c = Connections::load(t.path());
         let w = c.warnings.join("\n");
-        assert!(w.contains("unknown key 'colour'") && w.contains("'password' is ignored") && w.contains("ssl.cA"), "{w}");
+        assert!(w.contains("unknown key 'colour'") && w.contains("'password' is ignored") && w.contains("ssl.cA") && !w.contains("password_enc"), "{w}");
         assert!(w.contains("broken.json") && w.contains("invalid JSON") && w.contains("arr.json"), "{w}");
         // The rest still loaded, and the password did not.
         assert_eq!(c.connections["a"].password, None);

@@ -22,9 +22,9 @@ A `.sql` file picks its connection with `-- @connection dev-pg` on the first lin
 
 `database` is only the connection's default and is optional. A file can use any database the credentials can access: pick it in the second dropdown at the top right (the choice is remembered per file), or write `-- @database app` under `-- @connection` (the CLI takes `-d app`; the flag wins over the directive). `siesta connections databases NAME` lists them.
 
-There is no password in the file. The password lives only in the system keychain (macOS Keychain, Linux Secret Service, service `siesta`, account = connection name): type it in the connection form, or run `siesta connections set-password NAME`. It is read only when a connection opens; without an entry Siesta connects without a password. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
+The password is never written in the file as plain text. Type it in the connection form, or run `siesta connections set-password NAME`: it is stored encrypted as `"password_enc": "v1:…"` (XChaCha20-Poly1305, the connection name is bound to it) with a random key in `~/.config/siesta/key` (mode 0600, created on first use). The key is the secret: keep it out of backups and sync that carry the connection files, and a password has to be set again if the key is lost. This keeps passwords out of screenshots, `grep`, backups and synced connection files without the key; it does not protect against malware running as your user, which can read the key too. The password is decrypted only when a connection opens; without `password_enc` Siesta connects without a password. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
 
-An old `~/.config/siesta/connections.json` (with `connections.private.json`) is split into per-connection files on first start and renamed to `*.migrated`; its passwords move into the keychain.
+An old `~/.config/siesta/connections.json` (with `connections.private.json`) is split into per-connection files on first start and renamed to `*.migrated`; its literal passwords are encrypted into `password_enc` (old `${keychain…}` markers are dropped with a warning: enter the password again).
 
 ## CLI
 
@@ -65,16 +65,11 @@ crates/
   app/        GPUI desktop app
   cli/        siesta CLI commands
   sql-split/  statement splitter, directives
-  db-conn/    connection files, keychain passwords
+  db-conn/    connection files, encrypted passwords
   db-exec/    sqlx sessions, paging, schema
   settings/   settings.json
   workspace/  project folder, file index, UI state
 ```
-
-Keychain: an unsigned debug binary changes identity on every rebuild, so macOS asks for keychain access
-again each time. Create a self-signed code-signing certificate named "Siesta Dev" once (Keychain Access,
-Certificate Assistant, Create a Certificate, type Code Signing). `cargo run` / `cargo test` then sign the
-binary through `scripts/sign-dev.sh` and "Always Allow" sticks. Without the certificate nothing is signed.
 
 Integration tests need Docker (Postgres and MariaDB): `scripts/test-db.sh`; `--down` stops the containers.
 
