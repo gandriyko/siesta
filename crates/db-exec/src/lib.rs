@@ -418,14 +418,8 @@ impl Session {
     /// Runs one statement (or, for unwrapped kinds, a script). If the connection turned out to be
     /// dead it is reopened once and the statement rerun, with a notice that session state was lost.
     pub async fn run(&mut self, sql: &str, kind: Kind, page: &Page) -> Result<Outcome, DbError> {
-        if self.spec.read_only && read_write_switch(sql, self.dialect()) {
-            return Err(DbError {
-                message: "Refused on a read_only connection: the statement switches the session to read-write. \
-                          read_only is a safety default of the session, not a security boundary; use a read-only database user for real protection."
-                    .into(),
-                refused: true,
-                ..Default::default()
-            });
+        if self.spec.read_only {
+            read_only_check(sql, self.dialect())?;
         }
         match self.run_once(sql, kind, page).await {
             Err(e) if e.connection_lost => {
@@ -789,6 +783,21 @@ pub(crate) fn autocommit_setting(sql: &str, d: Dialect) -> Option<bool> {
         }
     }
     out
+}
+
+/// The `read_only` guard: refuses a switch to read-write and everything that writes (by text,
+/// see `sql_split::read_only_violation`). Public so a caller can check a whole batch up front.
+pub fn read_only_check(sql: &str, d: Dialect) -> Result<(), DbError> {
+    let message = if read_write_switch(sql, d) {
+        "Read-only connection: the statement switches the session to read-write, which is not allowed. \
+         read_only is a safety default, not a security boundary; use a read-only database user for real protection."
+            .to_string()
+    } else if let Some(m) = sql_split::read_only_violation(sql, d) {
+        m
+    } else {
+        return Ok(());
+    };
+    Err(DbError { message, refused: true, ..Default::default() })
 }
 
 /// A statement that would lift the session's read-only state (the cheap guard behind

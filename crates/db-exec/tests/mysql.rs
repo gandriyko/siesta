@@ -256,9 +256,16 @@ async fn read_only_and_init_sql() {
     c.init_sql = Some("SET @from_init = 7; SET @second = 8;".into());
     let mut ro = Session::open(&c).await.unwrap();
     assert_eq!(ints(&run(&mut ro, "SELECT @from_init + @second").await), [15]);
+    // Refused by the client, not the server (no SQLSTATE), and the table stays empty.
     let e = try_run(&mut ro, "INSERT INTO siesta_ro_test VALUES (1)").await.unwrap_err();
-    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
+    assert!(e.refused && e.code.is_none() && e.message.starts_with("Read-only connection: INSERT"), "{e:?}");
+    let e = try_run(&mut ro, "DROP TABLE siesta_ro_test").await.unwrap_err();
+    assert!(e.refused && e.code.is_none(), "{e:?}");
+    assert_eq!(ints(&run(&mut s, "SELECT count(*) FROM siesta_ro_test").await), [0]);
     assert_eq!(ints(&run(&mut ro, "SELECT 1").await), [1]);
+    run(&mut ro, "SET @x = 1").await;
+    run(&mut ro, "START TRANSACTION").await;
+    run(&mut ro, "ROLLBACK").await;
     run(&mut s, "DROP TABLE siesta_ro_test").await;
 }
 
@@ -438,7 +445,7 @@ async fn read_only_refuses_switching_to_read_write() {
     }
     // Still read-only afterwards.
     let e = try_run(&mut ro, "INSERT INTO siesta_ro_guard VALUES (1)").await.unwrap_err();
-    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
+    assert!(e.refused, "{e:?}");
     run(&mut s, "DROP TABLE siesta_ro_guard").await;
 }
 

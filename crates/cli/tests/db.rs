@@ -119,11 +119,14 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     let (_, v) = f.json(&with(&["exec", "-c", "c", "SELECT count(*) FROM siesta_cli_t"]));
     assert_eq!(v["rows"][0][0], 4);
 
-    // read-only: the server refuses the write (5), reads work; flag and config alike.
+    // read-only: siesta refuses any write itself (4), reads work; flag and config alike.
     let (code, v) = f.json(&with(&["exec", "-c", "c", "--read-only", "INSERT INTO siesta_cli_t VALUES (7, 'q')"]));
-    assert_eq!((code, v["error"]["sqlstate"].as_str()), (5, Some("25006")), "{v}");
-    let (code, _) = f.json(&with(&["exec", "-c", "ro", "INSERT INTO siesta_cli_t VALUES (7, 'q')"]));
-    assert_eq!(code, 5);
+    assert_eq!((code, v["error"]["code"].as_str()), (4, Some("read_only_refused")), "{v}");
+    let (code, v) = f.json(&with(&["exec", "-c", "ro", "INSERT INTO siesta_cli_t VALUES (7, 'q')"]));
+    assert_eq!((code, v["error"]["code"].as_str()), (4, Some("read_only_refused")), "{v}");
+    // The whole batch is checked first: the leading SELECT does not run either.
+    let (code, v) = f.json(&with(&["exec", "-c", "ro", "SELECT 1; DROP TABLE siesta_cli_t"]));
+    assert_eq!((code, v["error"]["code"].as_str()), (4, Some("read_only_refused")), "{v}");
     let (code, _) = f.json(&with(&["exec", "-c", "ro", "SELECT 1"]));
     assert_eq!(code, 0);
     // Switching the session to read-write is refused by siesta itself: exit 4, nothing sent.

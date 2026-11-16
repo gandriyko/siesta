@@ -387,7 +387,9 @@ impl Siesta {
         // A prod connection asks for every run, one dialog listing the whole batch. Page, sort,
         // filter and "Count all" re-run an already confirmed result and do not come through here.
         let mode = self.settings.settings.run.confirm_destructive;
-        let ask: Vec<&Spec> = specs.iter().filter(|s| conn.prod || needs_confirm(s, mode, dialect)).collect();
+        // A statement the read-only guard refuses is never asked about: it fails in the result panel.
+        let refused = |s: &Spec| conn.read_only && db_exec::read_only_check(&s.text, dialect).is_err();
+        let ask: Vec<&Spec> = specs.iter().filter(|s| !refused(s) && (conn.prod || needs_confirm(s, mode, dialect))).collect();
         if ask.is_empty() {
             return self.execute(path, name, conn, specs, window, cx);
         }

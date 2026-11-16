@@ -14,7 +14,7 @@ From an agent, use the CLI only; never launch the GUI.
   gives the columns, types, primary key and indexes. Do not guess column names.
 - Pass `--output json` (or `jsonl`) when you read the result; without a TTY JSON is the default.
 - Prefer a read-only connection. Add `--read-only` to anything that must not change data: the
-  server rejects writes. Use it for every exploratory query. It is a safety default, not a security
+  client refuses writes before sending (and the server session is read-only). Use it for every exploratory query. It is a safety default, not a security
   boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
@@ -66,7 +66,7 @@ Exit codes:
 | `0` | OK |
 | `2` | Connection error: cannot connect, authentication failed, connection lost |
 | `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, bad arguments |
-| `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to switch to read-write |
+| `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to run a statement that writes (or switch to read-write) |
 | `5` | SQL error from the server |
 
 With several statements the first failure stops the run (setting `run.stop_on_error`); the exit code is
@@ -164,11 +164,14 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
   anything, so a batch is never half-run. In a terminal it asks `[y/N]`. `--yes` skips the question.
 - `siesta connections` shows the `prod` flag of every connection. For a prod connection prefer `--read-only`
   and ask the user before every run.
-- `--read-only` and `"read_only": true` are a safety default of the session, enforced by the server
-  (not by parsing the SQL), plus a cheap guard: statements that switch the session to read-write
-  (`BEGIN READ WRITE`, `SET TRANSACTION READ WRITE`, `SET default_transaction_read_only`, `RESET ALL`, …)
-  are refused with exit `4` and error code `read_only_refused`. It is **not a security boundary**: for real
-  protection connect with a read-only database user.
+- `--read-only` and `"read_only": true` set a read-only session on the server, plus a client-side check by
+  statement text: anything that writes (INSERT, UPDATE, DELETE, DDL, `SELECT … INTO`, `FOR UPDATE`,
+  data-modifying `WITH`, `EXPLAIN ANALYZE <DML>`, CALL, COPY, PREPARE, unknown statements, …) and every
+  switch to read-write (`BEGIN READ WRITE`, `SET default_transaction_read_only`, `RESET ALL`, …) is refused
+  before it is sent: exit `4`, error code `read_only_refused`. The whole batch is checked before anything
+  runs. Reads (SELECT, SHOW, DESCRIBE, EXPLAIN) and plain `SET` / transaction control pass. A function that
+  writes inside a SELECT is not seen by the text check; the server's read-only session stops it. It is
+  **not a security boundary**: for real protection connect with a read-only database user.
 
 ## Workflow for a query
 

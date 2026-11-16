@@ -441,6 +441,37 @@ pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
     split_words(text, dialect, true).1.iter().any(|w| changes(w))
 }
 
+/// Why a `read_only` connection must not run `text` (`None`: allowed). Client-side check by
+/// statement text: reads (`Query` / `Read`) and harmless session / transaction statements pass,
+/// everything else (including `SELECT … INTO`, `FOR UPDATE`, data-modifying `WITH`,
+/// `EXPLAIN ANALYZE <DML>`, `PREPARE`, unknown words) is refused. Switches to read-write are
+/// the caller's separate guard. A function that writes inside a SELECT is not seen here;
+/// the server's read-only session stops it.
+// ponytail: token check, not a parser; a CTE column named `delete` is a false refusal.
+pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
+    split_words(text, dialect, true).1.iter().find_map(|w| {
+        let &(_, first) = w.first()?;
+        if classify(w) != Kind::Other {
+            return None;
+        }
+        let second = w.get(1).map_or("", |&(_, s)| s);
+        let ok = match first.to_ascii_lowercase().as_str() {
+            "set" => !w.iter().any(|(_, s)| is(s, &["password", "global", "persist", "persist_only"])),
+            "start" => is(second, &["transaction"]),
+            "reset" | "begin" | "commit" | "rollback" | "end" | "abort" | "savepoint" | "release" | "use" | "listen" | "unlisten" => true,
+            _ => false,
+        };
+        (!ok).then(|| {
+            let f = first.to_ascii_uppercase();
+            if matches!(f.as_str(), "SELECT" | "WITH" | "TABLE" | "VALUES" | "EXPLAIN") {
+                format!("Read-only connection: {f} that writes or takes locks (INTO, FOR UPDATE, data-modifying) is not allowed.")
+            } else {
+                format!("Read-only connection: {f} is not allowed.")
+            }
+        })
+    })
+}
+
 /// What the top level of a SELECT-like statement has, for the page wrapper.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopLevel {
@@ -504,6 +535,65 @@ fn word_end(b: &[u8], i: usize) -> usize {
 mod tests {
     use super::*;
     use Dialect::{MySql as MY, Postgres as PG};
+
+    #[test]
+    fn read_only_violations() {
+        for (sql, d, want) in [
+            ("SELECT 1", PG, true),
+            ("WITH a AS (SELECT 1) SELECT * FROM a", PG, true),
+            ("TABLE t", PG, true),
+            ("VALUES (1)", PG, true),
+            ("SHOW tables", MY, true),
+            ("DESCRIBE t", MY, true),
+            ("EXPLAIN UPDATE t SET a = 1", PG, true),
+            ("EXPLAIN ANALYZE SELECT 1", PG, true),
+            ("SET search_path = a", PG, true),
+            ("SET NAMES utf8mb4", MY, true),
+            ("RESET search_path", PG, true),
+            ("BEGIN", PG, true),
+            ("START TRANSACTION READ ONLY", MY, true),
+            ("COMMIT; ROLLBACK; SAVEPOINT a; RELEASE a", PG, true),
+            ("USE shop", MY, true),
+            ("LISTEN ch", PG, true),
+            ("-- c\nSELECT 'delete'; SELECT 2", PG, true),
+            ("", PG, true),
+            ("SELECT * INTO t2 FROM t", PG, false),
+            ("SELECT * FROM t FOR UPDATE", PG, false),
+            ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", PG, false),
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1", PG, false),
+            ("INSERT INTO t VALUES (1)", PG, false),
+            ("UPDATE t SET a = 1", MY, false),
+            ("DELETE FROM t", PG, false),
+            ("REPLACE INTO t VALUES (1)", MY, false),
+            ("MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE", PG, false),
+            ("DROP TABLE t", PG, false),
+            ("CREATE TABLE t (a int)", PG, false),
+            ("ALTER TABLE t ADD c int", PG, false),
+            ("TRUNCATE t", PG, false),
+            ("RENAME TABLE a TO b", MY, false),
+            ("GRANT ALL ON t TO u", PG, false),
+            ("COMMENT ON TABLE t IS 'x'", PG, false),
+            ("CALL p()", MY, false),
+            ("DO $$ begin end $$", PG, false),
+            ("COPY t FROM '/x'", PG, false),
+            ("LOAD DATA INFILE 'x' INTO TABLE t", MY, false),
+            ("LOCK TABLES t WRITE", MY, false),
+            ("VACUUM", PG, false),
+            ("ANALYZE t", PG, false),
+            ("REFRESH MATERIALIZED VIEW v", PG, false),
+            ("PREPARE p AS DELETE FROM t", PG, false),
+            ("EXECUTE p", PG, false),
+            ("DISCARD ALL", PG, false),
+            ("SET PASSWORD = 'x'", MY, false),
+            ("SET GLOBAL max_connections = 1", MY, false),
+            ("START REPLICA", MY, false),
+            ("SELECT 1; UPDATE t SET a = 1", PG, false),
+            ("FROBNICATE", PG, false),
+        ] {
+            assert_eq!(read_only_violation(sql, d).is_none(), want, "{sql}");
+        }
+        assert_eq!(read_only_violation("update t set a = 1", PG).unwrap(), "Read-only connection: UPDATE is not allowed.");
+    }
 
     fn texts(src: &str, d: Dialect) -> Vec<&str> {
         split(src, d).statements.iter().map(|s| s.text(src)).collect()

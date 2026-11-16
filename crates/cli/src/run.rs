@@ -256,6 +256,18 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
         return Err(CliError::new("no_statements", "nothing to run", 3));
     }
     conn.read_only |= o.read_only;
+    if conn.read_only {
+        // Before any confirmation and before anything runs: a refusal never leaves a half-run batch.
+        for j in &jobs {
+            if let Err(e) = db_exec::read_only_check(&j.text, dialect_of(conn.driver)) {
+                let err = CliError::new("read_only_refused", e.message, 4);
+                return Err(match file {
+                    Some(p) => err.at(p, Some(j.line)),
+                    None => err.at_line(j.line),
+                });
+            }
+        }
+    }
     confirm(env, &conn, &jobs, file, o.yes)?;
     let cap = row_limit(o.max_rows, env.settings.results.max_rows);
     let rt = runtime();

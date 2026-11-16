@@ -273,9 +273,30 @@ async fn read_only_schema_and_init_sql() {
     assert_eq!(texts(&run(&mut s, "SHOW application_name").await), ["from_init"]);
     assert_eq!(texts(&run(&mut s, "SHOW search_path").await), ["pg_catalog, public"]);
     assert_eq!(texts(&run(&mut s, "SHOW default_transaction_read_only").await), ["on"]);
-    let e = try_run(&mut s, "CREATE TABLE ro_denied (a int)").await.unwrap_err();
-    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
     assert_eq!(ints(&run(&mut s, "SELECT 1").await), [1]);
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+async fn read_only_refuses_writes_client_side() {
+    let mut w = open_pg().await;
+    run(&mut w, "DROP TABLE IF EXISTS ro_client").await;
+    run(&mut w, "CREATE TABLE ro_client (a int)").await;
+    run(&mut w, "INSERT INTO ro_client VALUES (1)").await;
+    let mut c = connection(PG);
+    c.read_only = true;
+    let mut s = Session::open(&c).await.unwrap();
+    for (sql, word) in [("UPDATE ro_client SET a = 2", "UPDATE"), ("DROP TABLE ro_client", "DROP"), ("SELECT * INTO ro_copy FROM ro_client", "SELECT")] {
+        let e = try_run(&mut s, sql).await.unwrap_err();
+        // The client's refusal: no SQLSTATE (the server never saw it).
+        assert!(e.refused && e.code.is_none() && e.message.starts_with(&format!("Read-only connection: {word}")), "{sql}: {e:?}");
+    }
+    assert_eq!(ints(&run(&mut w, "SELECT a FROM ro_client").await), [1]);
+    assert_eq!(ints(&run(&mut s, "SELECT a FROM ro_client").await), [1]);
+    run(&mut s, "SET application_name = 'ro'").await;
+    run(&mut s, "BEGIN").await;
+    run(&mut s, "ROLLBACK").await;
+    run(&mut w, "DROP TABLE ro_client").await;
 }
 
 #[tokio::test]
@@ -424,8 +445,6 @@ async fn read_only_refuses_switching_to_read_write() {
         assert!(e.refused && e.code.is_none(), "{sql}: {e:?}");
     }
     assert_eq!(texts(&run(&mut s, "SHOW default_transaction_read_only").await), ["on"]);
-    let e = try_run(&mut s, "CREATE TABLE ro_denied2 (a int)").await.unwrap_err();
-    assert_eq!(e.code.as_deref(), Some("25006"), "{e:?}");
 }
 
 #[tokio::test]
