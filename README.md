@@ -17,7 +17,7 @@ Connections are plain JSON: `siesta.json` (committed, no secrets) and `siesta.pr
 
 A `.sql` file picks its connection with `-- @connection dev-pg` on the first line. Values like `${env:SHOP_DB_PASSWORD}` are read from the environment.
 
-Your own connections can live outside any repo: `~/.config/siesta/connections.json` plus `connections.private.json` for passwords (the desktop app's "New connection" form writes both). A project's `siesta.json` overrides a global connection of the same name. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
+Your own connections can live outside any repo: `~/.config/siesta/connections.json` (the desktop app's "New connection" form writes it). The form stores the password in the system keychain (macOS Keychain, Linux Secret Service, service `siesta`) and writes `"password": "${keychain}"` (account = connection name; `${keychain:ACCOUNT}` names it, handy in a team's `siesta.json`; each developer runs `siesta connections set-password NAME`). The keychain is read only when a connection opens. Where no keychain is available the password falls back to `connections.private.json` (mode 0600). A project's `siesta.json` overrides a global connection of the same name. `"prod": true` marks production: a red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation (the CLI needs `--yes` for those; `SELECT` / `SHOW` / `EXPLAIN` run freely).
 
 ## CLI
 

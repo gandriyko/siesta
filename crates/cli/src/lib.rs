@@ -5,7 +5,7 @@
 mod output;
 mod run;
 
-use std::io::Write;
+use std::io::{BufRead, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,6 +59,11 @@ enum ConnCmd {
     /// Open a connection and report the server version
     Test {
         /// Connection name
+        name: String,
+    },
+    /// Store a connection's password in the system keychain (prompt without echo, or stdin when piped)
+    SetPassword {
+        /// Connection name; its password must be `"${keychain}"` or `"${keychain:ACCOUNT}"`
         name: String,
     },
 }
@@ -139,8 +144,39 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
         Cmd::Exec(a) => run::exec(a, out),
         Cmd::Connections { cmd: None | Some(ConnCmd::List), files, .. } => connections(&files.files, format, out),
         Cmd::Connections { cmd: Some(ConnCmd::Test { name }), files, .. } => test_connection(&name, &files.files, format, out),
+        Cmd::Connections { cmd: Some(ConnCmd::SetPassword { name }), files, .. } => {
+            let stdin = std::io::stdin();
+            let tty = stdin.is_terminal();
+            set_password(&name, &files.files, tty, &mut stdin.lock(), format, out)
+        }
         Cmd::Schema(a) => schema(a, format, out),
     }
+}
+
+/// `connections set-password`: the password is read from a prompt without echo (`tty`) or from `input`
+/// (one line), and stored under the account of the connection's `${keychain}` marker.
+fn set_password(name: &str, extra: &[PathBuf], tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    let conn = Env::load(&cwd_probe(), extra).pick(name)?;
+    let Some(account) = conn.keychain else {
+        return Err(CliError::new("no_keychain_marker", format!("connection '{name}' does not use the keychain"), 3).hint("set \"password\": \"${keychain}\" (or \"${keychain:ACCOUNT}\") in its file first"));
+    };
+    let password = if tty {
+        rpassword::prompt_password(format!("Password for '{name}' (account '{account}'): ")).map_err(|e| CliError::new("io_error", e.to_string(), 3))?
+    } else {
+        let mut line = String::new();
+        input.read_line(&mut line).map_err(|e| CliError::new("io_error", e.to_string(), 3))?;
+        line.trim_end_matches(['\n', '\r']).to_string()
+    };
+    if password.is_empty() {
+        return Err(CliError::new("no_password", "empty password", 3));
+    }
+    db_conn::secrets::set(&account, &password).map_err(|e| CliError::new("keychain_error", e.to_string(), 2))?;
+    if format.human() {
+        put(out, format!("Stored the password of '{name}' in the system keychain (service `{}`, account `{account}`)", db_conn::secrets::SERVICE));
+    } else {
+        put(out, json!({ "connection": name, "ok": true, "service": db_conn::secrets::SERVICE, "account": account }).to_string());
+    }
+    Ok(0)
 }
 
 /// `{"error":{"code","message","file","line","hint"}}` in JSON mode, `error: …` otherwise.
@@ -263,7 +299,7 @@ fn connections(extra: &[PathBuf], format: Format, out: &mut dyn Write) -> Result
         .collect();
     rows.extend(env.conns.errors.iter().map(|(n, e)| json!({ "name": n, "error": e })));
     rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    emit_objects(out, format, &["name", "driver", "url", "host", "port", "database", "user", "read_only", "prod", "error"], &rows);
+    emit_objects(out, format, &["name", "driver", "url", "host", "port", "database", "user", "password", "read_only", "prod", "error"], &rows);
     Ok(0)
 }
 
@@ -445,6 +481,28 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0]["name"].as_str(), rows[0]["line"].as_u64(), rows[0]["kind"].as_str()), (Some("one"), Some(2), Some("query")));
         assert_eq!((rows[1]["statement"].as_str(), rows[1]["kind"].as_str()), (Some("DELETE FROM t"), Some("other")));
+    }
+
+    #[test]
+    fn set_password_from_stdin_then_resolves() {
+        db_conn::secrets::use_memory_store();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.json");
+        std::fs::write(&file, r#"{"kc-cli-a": {"driver": "postgres", "host": "h", "password": "${keychain}"}, "kc-cli-b": {"driver": "postgres", "host": "h", "password": "${keychain:team-db}"}, "plain": {"driver": "postgres", "host": "h"}}"#).unwrap();
+        let extra = [file.clone()];
+        let set = |name: &str, input: &str| set_password(name, &extra, false, &mut input.as_bytes(), Format::Json, &mut vec![]);
+        assert_eq!(set("kc-cli-a", "hunter2\r\nignored\n").unwrap(), 0);
+        assert_eq!(set("kc-cli-b", "s3cret\n").unwrap(), 0);
+        assert_eq!(db_conn::secrets::get("kc-cli-a").as_deref(), Ok("hunter2"));
+        assert_eq!(db_conn::secrets::get("team-db").as_deref(), Ok("s3cret"));
+        assert_eq!(set("plain", "x\n").unwrap_err().code, "no_keychain_marker");
+        assert_eq!(set("nope", "x\n").unwrap_err().code, "unknown_connection");
+        assert_eq!(set("kc-cli-a", "\n").unwrap_err().code, "no_password");
+        // `connections` shows the marker, never a secret.
+        let mut out = vec![];
+        assert_eq!(run_with(args(&["siesta", "connections", "--connections-file", file.to_str().unwrap(), "--output", "json"]), &mut out), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("${keychain}") && text.contains("${keychain:team-db}") && !text.contains("hunter2") && !text.contains("s3cret"), "{text}");
     }
 
     #[test]

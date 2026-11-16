@@ -1,7 +1,7 @@
 //! New / Edit connection form (a dialog): reached from the connection picker and the DB tab.
 //!
-//! It edits the GLOBAL connection files only (`~/.config/siesta/connections.json`, and the
-//! password in `connections.private.json`); the reading, merging and writing is `db_conn::global`.
+//! It edits the GLOBAL connection files only (`~/.config/siesta/connections.json`; the password
+//! goes to the system keychain, or to `connections.private.json` when that is unavailable); the reading, merging and writing is `db_conn::global`.
 //! A connection that a workspace `siesta.json` (or an extra file) defines belongs to the team's
 //! files: the dialog shows where it lives and offers to open that file instead.
 
@@ -50,6 +50,8 @@ pub(crate) struct ConnForm {
     original: Option<String>,
     /// Keys of the entry the form does not show (kept on save).
     base: serde_json::Map<String, serde_json::Value>,
+    /// The keychain account of the stored password (an empty password field keeps it).
+    keychain: Option<String>,
     pub name: Entity<InputState>,
     url: Entity<InputState>,
     pub host: Entity<InputState>,
@@ -79,9 +81,11 @@ impl ConnForm {
         };
         let password = {
             let value = f.password.clone();
-            cx.new(|cx| InputState::new(window, cx).placeholder("Stored in connections.private.json").masked(true).default_value(value))
+            let hint = if f.keychain.is_some() { "Leave empty to keep the password in the system keychain" } else { "Stored in the system keychain" };
+            cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true).default_value(value))
         };
         Self {
+            keychain: f.keychain.clone(),
             app,
             dir,
             target,
@@ -131,6 +135,7 @@ impl ConnForm {
             color: v(&self.color),
             read_only: self.read_only,
             prod: self.prod,
+            keychain: self.keychain.clone(),
             base: self.base.clone(),
         }
     }
@@ -138,12 +143,18 @@ impl ConnForm {
     /// Writes the global files; on success the dialog closes and the file it was opened for picks the connection.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let form = self.collect(cx);
-        if let Err(e) = db_conn::save_global(&self.dir, &form, self.original.as_deref()) {
-            self.error = Some(e);
-            return cx.notify();
-        }
+        let warning = match db_conn::save_global(&self.dir, &form, self.original.as_deref()) {
+            Ok(w) => w,
+            Err(e) => {
+                self.error = Some(e);
+                return cx.notify();
+            }
+        };
         let (name, target) = (form.name.trim().to_string(), self.target.clone());
         window.close_dialog(cx);
+        if let Some(w) = warning {
+            window.push_notification(w, cx);
+        }
         self.app.update(cx, |this, cx| this.connection_saved(target, name, window, cx)).ok();
     }
 
@@ -184,7 +195,7 @@ impl ConnForm {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete connection '{name}'?"),
-            Some("It is removed from connections.json and connections.private.json (the password too)."),
+            Some("It is removed from connections.json and connections.private.json; its password is deleted from the system keychain."),
             &["Delete", "Cancel"],
             cx,
         );
@@ -291,7 +302,7 @@ impl Render for ConnForm {
             .child(field("Schema (search_path)", &self.schema))
             .child(field("Init SQL", &self.init_sql))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))
-            .child(div().text_xs().text_color(muted).child("Saved to connections.json; the password goes to connections.private.json. A project's siesta.json overrides a connection of the same name."))
+            .child(div().text_xs().text_color(muted).child("Saved to connections.json; the password goes to the system keychain. A project's siesta.json overrides a connection of the same name."))
             .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))
             .children(status)
             .child(

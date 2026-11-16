@@ -281,6 +281,9 @@ fn sql_str(s: &str) -> sqlx::SqlStr {
 impl Session {
     /// Connects and applies `schema`, `read_only` and `init_sql`.
     pub async fn open(c: &Connection) -> Result<Session, DbError> {
+        // The one place a `${keychain}` password is read (also on reconnect: `spec` keeps the resolved copy).
+        let resolved = c.resolve_password().map_err(DbError::msg)?;
+        let c = &resolved;
         let e = |e| DbError::from_sqlx(e, 0, 0);
         let (conn, opts) = match c.driver {
             Driver::Postgres => {

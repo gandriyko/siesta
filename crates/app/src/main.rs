@@ -1737,6 +1737,7 @@ mod tests {
     #[gpui::test]
     fn form_saves_into_the_config_dir_and_picks_for_its_own_file_only(tcx: &mut TestAppContext) {
         use db_conn::Driver;
+        db_conn::secrets::use_memory_store();
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (a, b) = (ws.path().join("a.sql"), ws.path().join("b.sql"));
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
@@ -1761,15 +1762,16 @@ mod tests {
             })
         });
         let read = |name: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap();
-        assert_eq!(read("connections.json")["fresh"], serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1}));
-        assert_eq!(read("connections.private.json")["fresh"], serde_json::json!({"password": "pw"}));
+        assert_eq!(read("connections.json")["fresh"], serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1, "password": "${keychain}"}));
+        assert!(read("connections.private.json").get("fresh").is_none());
+        assert_eq!(db_conn::secrets::get("fresh").as_deref(), Ok("pw"));
         // Every open file sees the connection; only `a.sql` (the file the form was opened for) picked it.
         let (pa, pb, pw) = cx.update(|_, cx| {
             let this = app.read(cx);
             let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
-            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections["fresh"].password.clone())
+            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections["fresh"].keychain.clone())
         });
-        assert_eq!((pa.as_deref(), pb, pw.as_deref()), (Some("fresh"), None, Some("pw")));
+        assert_eq!((pa.as_deref(), pb, pw.as_deref()), (Some("fresh"), None, Some("fresh")));
         let state = siesta_workspace::load_state(base.path(), ws.path());
         assert_eq!((state.connections[&a].as_deref(), state.connections.get(&b)), (Some("fresh"), None));
         // Edit: the same dialog on the saved connection, then Delete clears the pick.

@@ -18,8 +18,8 @@ From an agent, use the CLI only; never launch the GUI.
   boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
-- Never write passwords into `siesta.json`; they belong in `siesta.private.json` (git-ignored) or
-  `${env:NAME}`. `siesta connections` shows connections with secrets masked.
+- Never write passwords into `siesta.json`; they belong in the system keychain (`"password": "${keychain}"`),
+  `siesta.private.json` (git-ignored) or `${env:NAME}`. `siesta connections` shows connections with secrets masked.
 - Results are capped at 100 rows by default; check `rows_truncated`. Narrow the query
   (`WHERE`, `LIMIT`, `count(*)`, aggregates) instead of raising `--max-rows` for a big table.
 
@@ -35,6 +35,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 | `siesta connections` | Connections visible from the current directory, secrets masked |
 | `siesta connections list` | The same as `siesta connections` |
 | `siesta connections test NAME` | Open a connection and report the server version |
+| `siesta connections set-password NAME` | Store the password of a `${keychain}` connection in the system keychain (hidden prompt, or one line from stdin); the user does this, not you |
 | `siesta schema [TABLE]` | Every table and view, or one table (`table` or `schema.table`) with columns and indexes |
 
 `list`, `run`, `exec`, `connections` and `schema` take `--output table|json|jsonl|csv`
@@ -149,6 +150,11 @@ Plain JSON, committed without secrets, with secrets in a private file next to it
   `user` / `password`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
 - `${env:NAME}` reads the environment, `${dotenv:NAME}` the `.env` next to the file.
+- `"password": "${keychain}"` reads the password from the OS keychain (service `siesta`, account = the
+  connection name) only when a session opens; `${keychain:ACCOUNT}` names the account, so a committed
+  `siesta.json` can share the marker while each developer stores their own password
+  (`siesta connections set-password NAME`). A missing entry is a connection error (exit `2`: "No password
+  for `NAME` in the system keychain"): ask the user to run `set-password`; never type a password yourself.
 - Files are found in every folder from the project root down to the `.sql` file; deeper folders and
   the private file win. The user's global connections (`~/.config/siesta/connections.json` and
   `connections.private.json`, written by the desktop app's "New connection" form) are read first, so a

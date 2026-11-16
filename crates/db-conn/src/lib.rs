@@ -14,7 +14,24 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 mod global;
-pub use global::{ConnectionForm, delete_global, global_names, read_global_form, save_global};
+pub mod secrets;
+pub use global::{ConnectionForm,delete_global, global_names, read_global_form, save_global};
+
+/// `${keychain}` is `Some(None)` (the account is the connection name), `${keychain:ACCOUNT}` is
+/// `Some(Some(ACCOUNT))`; anything else is not a marker.
+fn keychain_marker(s: &str) -> Option<Option<&str>> {
+    let inner = s.trim().strip_prefix("${")?.strip_suffix('}')?.trim();
+    match inner.split_once(':') {
+        None if inner == "keychain" => Some(None),
+        Some(("keychain", a)) if !a.trim().is_empty() => Some(Some(a.trim())),
+        _ => None,
+    }
+}
+
+/// The marker as written to JSON: the short form when the account is the connection name.
+fn marker_text(account: &str, name: &str) -> String {
+    if account == name { "${keychain}".into() } else { format!("${{keychain:{account}}}") }
+}
 
 const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "password", "ssl", "read_only", "prod", "schema", "init_sql", "color"];
 const GLOBAL_PUBLIC: &str = "connections.json";
@@ -66,6 +83,9 @@ pub struct Connection {
     pub database: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
+    /// The account of a `"${keychain}"` / `"${keychain:ACCOUNT}"` password, read from the system
+    /// keychain only when a session opens (see [`Connection::resolve_password`]); `password` is `None` then.
+    pub keychain: Option<String>,
     pub ssl: Ssl,
     pub read_only: bool,
     /// A production connection: red, and every run asks for confirmation.
@@ -77,6 +97,23 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A copy with the password read from the system keychain (when it is a `${keychain}` one).
+    /// Call right before connecting: on macOS a read may prompt, so loading never does it.
+    pub fn resolve_password(&self) -> Result<Connection, String> {
+        let mut c = self.clone();
+        if let Some(account) = &self.keychain {
+            c.password = Some(secrets::get(account).map_err(|e| match e {
+                secrets::SecretError::Missing => format!(
+                    "No password for `{}` in the system keychain (service `{}`, account `{account}`). Edit the connection to set it.",
+                    self.name,
+                    secrets::SERVICE
+                ),
+                e => e.to_string(),
+            })?);
+        }
+        Ok(c)
+    }
+
     /// The strip / dot colour: `color`, else red for a production connection.
     pub fn display_color(&self) -> Option<&str> {
         self.color.as_deref().or(self.prod.then_some("red"))
@@ -200,7 +237,8 @@ pub fn masked(c: &Connection) -> Value {
     put("port", c.port.map(Value::from));
     put("database", s(&c.database));
     put("user", s(&c.user));
-    put("password", c.password.as_ref().map(|_| "***".into()));
+    // The marker is not a secret; a literal password is.
+    put("password", c.keychain.as_ref().map(|a| marker_text(a, &c.name).into()).or(c.password.as_ref().map(|_| "***".into())));
     let mut ssl = Map::new();
     if let Some(mode) = c.ssl.mode {
         ssl.insert("mode".into(), mode_name(mode).into());
@@ -289,6 +327,10 @@ fn read_entry(obj: &Map<String, Value>, dir: &Path, private: bool, file: &Path, 
         }
         let literal = |s: &str| !s.contains("${");
         match (k.as_str(), v) {
+            ("password", Value::String(s)) if keychain_marker(s).is_some() => {
+                let account = keychain_marker(s).flatten().unwrap_or(name);
+                out.insert(k.clone(), Map::from_iter([("$keychain".to_string(), account.into())]).into());
+            }
             ("ssl", Value::Object(ssl)) => {
                 let mut o = Map::new();
                 for (sk, sv) in ssl {
@@ -391,6 +433,8 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         Some(_) => Err(format!("'{k}' must be true or false")),
     };
     let (read_only, prod) = (flag("read_only")?, flag("prod")?);
+    let keychain = f.get("password").and_then(|v| v.get("$keychain")).and_then(Value::as_str).map(String::from);
+    let password = if keychain.is_some() { None } else { str_of("password")? };
     let mut ssl = Ssl::default();
     if let Some(Value::Object(o)) = f.get("ssl") {
         let path = |k: &str| o.get(k).and_then(Value::as_str).map(PathBuf::from);
@@ -413,7 +457,8 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         port,
         database: str_of("database")?,
         user: str_of("user")?,
-        password: str_of("password")?,
+        password,
+        keychain,
         ssl,
         read_only,
         prod,
@@ -430,6 +475,33 @@ mod tests {
 
     fn load(root: &Path, file: &str) -> Connections {
         Connections::load(&root.join(file), root, &[], None)
+    }
+
+    #[test]
+    fn keychain_markers_resolve_lazily_and_mask() {
+        secrets::use_memory_store();
+        assert_eq!((keychain_marker("${keychain}"), keychain_marker(" ${keychain: a b }"), keychain_marker("${keychain:}"), keychain_marker("${env:X}"), keychain_marker("pw")), (Some(None), Some(Some("a b")), None, None, None));
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        // The marker is fine in a public file (no "literal password" warning).
+        fs::write(r.join("siesta.json"), r#"{"kc-lazy": {"driver": "postgres", "host": "h", "password": "${keychain}"}, "kc-team": {"driver": "postgres", "host": "h", "password": "${keychain:kc-shared}"}}"#).unwrap();
+        let c = load(r, "q.sql");
+        assert!(c.warnings.is_empty() && c.errors.is_empty(), "{:?} {:?}", c.warnings, c.errors);
+        let (lazy, team) = (&c.connections["kc-lazy"], &c.connections["kc-team"]);
+        assert_eq!((lazy.keychain.as_deref(), lazy.password.as_deref(), team.keychain.as_deref()), (Some("kc-lazy"), None, Some("kc-shared")));
+        // Nothing stored yet: a clear error naming the account.
+        let e = lazy.resolve_password().unwrap_err();
+        assert_eq!(e, "No password for `kc-lazy` in the system keychain (service `siesta`, account `kc-lazy`). Edit the connection to set it.");
+        secrets::set("kc-lazy", "pw1").unwrap();
+        secrets::set("kc-shared", "pw2").unwrap();
+        assert_eq!((lazy.resolve_password().unwrap().password.as_deref(), team.resolve_password().unwrap().password.as_deref()), (Some("pw1"), Some("pw2")));
+        // `masked` shows the marker as written, not a secret.
+        assert_eq!((masked(lazy)["password"].as_str(), masked(team)["password"].as_str()), (Some("${keychain}"), Some("${keychain:kc-shared}")));
+        // A later file's literal password replaces the marker.
+        fs::write(r.join("siesta.private.json"), r#"{"kc-lazy": {"password": "lit"}}"#).unwrap();
+        let c = load(r, "q.sql");
+        assert_eq!((c.connections["kc-lazy"].keychain.clone(), c.connections["kc-lazy"].password.as_deref()), (None, Some("lit")));
+        assert_eq!(masked(&c.connections["kc-lazy"])["password"], "***");
     }
 
     #[test]

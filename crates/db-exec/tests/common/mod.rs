@@ -18,6 +18,7 @@ pub fn connection(driver: Driver) -> Connection {
         database: None,
         user: None,
         password: None,
+        keychain: None,
         ssl: Ssl::default(),
         read_only: false,
         prod: false,
