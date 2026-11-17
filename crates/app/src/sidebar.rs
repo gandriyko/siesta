@@ -385,9 +385,10 @@ impl Siesta {
             }
             SideTab::Db => self.db_body(cx),
         };
-        let footer = div().flex_none().mx_1().mb_1().child(
+        let item = |id: &'static str, icon: Icon, label: &'static str| {
             div()
-                .id("open-settings")
+                .id(id)
+                .flex_1()
                 .h(px(30.))
                 .px_2()
                 .rounded_md()
@@ -398,10 +399,21 @@ impl Siesta {
                 .text_color(muted)
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover))
-                .child(Icon::new(IconName::Settings).size_3p5())
-                .child("Settings")
-                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
-        );
+                .child(icon.size_3p5())
+                .child(label)
+        };
+        let footer = div()
+            .flex_none()
+            .mx_1()
+            .mb_1()
+            .flex()
+            .gap_1()
+            .child(item("open-settings", Icon::new(IconName::Settings), "Settings").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
+            .child(
+                item("open-history", Icon::default().data(include_bytes!("../assets/clock.svg")), "History")
+                    .when(self.show_history, |d| d.text_color(cx.theme().foreground))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_history(window, cx))),
+            );
         div()
             .size_full()
             .flex()

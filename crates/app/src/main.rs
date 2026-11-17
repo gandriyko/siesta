@@ -6,6 +6,7 @@
 
 mod complete;
 mod conn_form;
+mod history_page;
 mod connections_page;
 mod dbtab;
 mod doc;
@@ -47,7 +48,7 @@ actions!(
     [
         RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, OpenFolder, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
-        NextStatement, FocusEditor, ToggleFilters, RefreshSchema,
+        NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
         CopyCells, OpenCell, OpenRow, NextPage, PrevPage, PopupPrev, PopupNext
     ]
@@ -146,6 +147,14 @@ pub(crate) struct Siesta {
     /// The open New / Edit connection form. Weak: the dialog owns it, so closing the dialog any way
     /// (Esc, ×, Close) drops the form and with it a running Test.
     conn_form: Option<WeakEntity<conn_form::ConnForm>>,
+    /// History page (Cmd+Y) in place of the editor.
+    show_history: bool,
+    /// This project's history, newest first; read when the page opens and after runs.
+    history: Vec<db_exec::history::Entry>,
+    /// Indices into `history` matching the filter (the list's rows).
+    history_rows: Vec<usize>,
+    history_filter: Entity<InputState>,
+    history_scroll: UniformListScrollHandle,
     /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Siesta" context.
     focus: FocusHandle,
     /// Theme's own monospace font, used when `font_family` is empty.
@@ -208,6 +217,7 @@ impl Siesta {
         }
         let sidebar_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search statements"));
         let db_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search tables and columns"));
+        let history_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: SQL, connection, file, error"));
         // The close button: with unsaved files, ask (as Quit does) instead of closing.
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -229,6 +239,12 @@ impl Siesta {
             }),
             cx.subscribe_in(&db_filter, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&history_filter, window, |this, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
                 }
             }),
@@ -284,6 +300,11 @@ impl Siesta {
             connections_window: None,
             config_dir,
             conn_form: None,
+            show_history: false,
+            history: vec![],
+            history_rows: vec![],
+            history_filter,
+            history_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             default_mono: cx.theme().mono_font_family.clone(),
             _subs,
@@ -510,6 +531,8 @@ impl Siesta {
 
     /// Switch to `path`'s tab, opening it first if needed (`text` overrides the file content).
     fn open(&mut self, path: PathBuf, text: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        // Opening a file (sidebar, Cmd+P, history …) shows it, so leave the History page.
+        self.show_history = false;
         let ix = match self.docs.iter().position(|d| *d.path == path) {
             Some(ix) => ix,
             None => {
@@ -765,6 +788,8 @@ impl Siesta {
             s.set_cursor_position(Position::new(line.saturating_sub(1) as u32, 0), window, cx);
             s.focus(window, cx);
         });
+        // The editor observer syncs the active statement only after this update: a run below needs it now.
+        self.docs[ix].sync_active(cx);
         center_line(self.docs[ix].editor.clone(), line.saturating_sub(1), true, window, cx);
         self.remember(cx);
         if run {
@@ -1278,6 +1303,10 @@ impl Siesta {
     }
 
     fn center(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        if self.show_history {
+            let page = self.history_page(cx);
+            return card(focused, cx).child(page).into_any_element();
+        }
         let body = match self.doc() {
             Some(d) => div().flex_1().min_h_0().relative().child(Editor::new(&d.editor).size_full()).child(d.statement_tint()),
             None => div()
@@ -1430,6 +1459,7 @@ impl Render for Siesta {
                 this.result_open = !this.result_open;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| this.toggle_history(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
                 use siesta_settings::Split;
                 let next = if this.settings.settings.split == Split::Vertical { Split::Horizontal } else { Split::Vertical };
@@ -1485,6 +1515,7 @@ fn set_menus(cx: &mut App) {
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Toggle Result Panel", ToggleResult),
+            MenuItem::action("History", ToggleHistory),
             MenuItem::action("Toggle Split Orientation", ToggleSplit),
             MenuItem::action("Next Tab", NextTab),
             MenuItem::separator(),
@@ -1519,6 +1550,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Next Statement", Box::new(NextStatement)),
         ("Focus Editor", Box::new(FocusEditor)),
         ("Toggle Result Panel", Box::new(ToggleResult)),
+        ("History", Box::new(ToggleHistory)),
         ("Toggle Split Orientation", Box::new(ToggleSplit)),
         ("Toggle Sidebar", Box::new(ToggleSidebar)),
         ("Next Tab", Box::new(NextTab)),
@@ -2152,6 +2184,56 @@ mod tests {
     }
 
     #[gpui::test]
+    fn history_records_filters_and_inserts(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let b = ws.path().join("b.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(b.clone()));
+        let entry = |sql: &str, error: Option<&str>| db_exec::history::Entry { connection: "dev".into(), sql: sql.into(), error: error.map(Into::into), rows: Some(1), ..Default::default() };
+        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&b, vec![entry("SELECT 42", None), entry("SELECT nope", Some("42703 column does not exist"))], cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| app.update(cx, |this, cx| this.toggle_history(window, cx)));
+        let shown = |cx: &mut VisualTestContext| cx.update(|_, cx| {
+            let this = app.read(cx);
+            (this.show_history, this.history.iter().map(|e| (e.sql.clone(), e.file.clone(), e.outcome())).collect::<Vec<_>>())
+        });
+        assert_eq!(shown(&mut cx), (true, vec![("SELECT nope".into(), "b.sql".into(), "42703 column does not exist".into()), ("SELECT 42".into(), "b.sql".into(), "1 row".into())]));
+        // The filter matches errors too; rows are computed when the page renders.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.history_filter.update(cx, |s, cx| s.set_value("42703", window, cx))));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| app.read(cx).history_rows.clone()), vec![0]);
+        // Insert: after the current statement, with a `;`; the page closes.
+        cx.update(|window, cx| app.update(cx, |this, cx| _ = this.history_insert(1, window, cx)));
+        assert_eq!(text_of(&app, &mut cx), "SELECT 'b';\nSELECT 42;\n");
+        assert!(!shown(&mut cx).0);
+    }
+
+    #[gpui::test]
+    fn a_failed_run_lands_in_history(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.select_connection(Some("dev".into()), window, cx);
+                this.go_to(a.clone(), 3, true, window, cx);
+            })
+        });
+        // Nothing listens on port 1: the run fails on the tokio thread, then `finish` records it.
+        let mut list = vec![];
+        for _ in 0..200 {
+            cx.run_until_parked();
+            list = db_exec::history::Store::open(base.path(), ws.path()).unwrap().list();
+            if !list.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let e = &list[0];
+        assert_eq!((e.sql.as_str(), e.connection.as_str(), e.file.as_str(), e.line, e.source.as_str()), ("SELECT 2", "dev", "a.sql", 3, "gui"));
+        assert!(e.error.is_some() && e.rows.is_none());
+    }
+
+    #[gpui::test]
     fn typed_at_connection_resets_the_database_pick(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
         let a = ws.path().join("a.sql");
@@ -2310,7 +2392,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn json_cells_make_tall_rows_until_toggled_off(tcx: &mut TestAppContext) {
+    fn json_cells_stay_one_line_until_toggled_on(tcx: &mut TestAppContext) {
         use db_exec::Value::{Int, Json, Text};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
         let a = ws.path().join("a.sql");
@@ -2322,9 +2404,15 @@ mod tests {
             let g = app.read(cx).ui.table.read(cx).delegate();
             (g.has_json, g.tall())
         });
-        assert_eq!(grid(&mut cx), (true, true)); // results.json_preview_lines defaults to 4
-        cx.update(|_, cx| app.update(cx, |this, cx| this.toggle_json_preview(cx)));
-        shown_at(&app, &mut cx, 0);
+        assert_eq!(grid(&mut cx), (true, false)); // results.json_preview_lines defaults to 0
+        // The `{ }` toggle turns it on (4 lines when the setting is 0) and off again.
+        let toggle = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| app.update(cx, |this, cx| this.toggle_json_preview(cx)));
+            shown_at(&app, cx, 0);
+        };
+        toggle(&mut cx);
+        assert_eq!((grid(&mut cx), cx.update(|_, cx| app.read(cx).json_lines())), ((true, true), 4));
+        toggle(&mut cx);
         assert_eq!(grid(&mut cx), (true, false));
     }
 

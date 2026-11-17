@@ -144,6 +144,8 @@ pub struct Stmt {
     pub kind: Kind,
     pub page: Page,
     pub range: Option<Range<usize>>,
+    /// A run the user started (goes to history); page / sort / filter re-runs do not.
+    pub fresh: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -450,7 +452,7 @@ impl Siesta {
             e.count = None;
             e.running = Some(Instant::now());
             e.tab = Tab::Result;
-            stmts.push(Stmt { text: s.text.clone(), kind: s.kind, page: e.page.clone(), range: s.range.clone() });
+            stmts.push(Stmt { text: s.text.clone(), kind: s.kind, page: e.page.clone(), range: s.range.clone(), fresh: true });
             keys.push(key);
         }
         self.store.batches.insert(path.clone(), if keys.len() > 1 { keys.clone() } else { vec![] });
@@ -467,7 +469,7 @@ impl Siesta {
         let conn = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).map(|c| c.with_database(done.database.as_deref()))).unwrap_or(conn);
         let e = self.store.entries.get_mut(key).expect("entry");
         e.running = Some(Instant::now());
-        let stmt = Stmt { text: done.text.clone(), kind: done.kind, page: e.page.clone(), range: done.range.clone() };
+        let stmt = Stmt { text: done.text.clone(), kind: done.kind, page: e.page.clone(), range: done.range.clone(), fresh: false };
         self.spawn_job(key.0.clone(), done.conn.clone(), conn, vec![stmt], vec![key.clone()], window, cx);
     }
 
@@ -503,10 +505,28 @@ impl Siesta {
         let dialect = crate::doc::dialect_of(conn.driver);
         let schema_changed = stmts.iter().zip(&report.results).any(|(s, r)| r.is_ok() && sql_split::is_schema_changing(&s.text, dialect));
         let mut position = None;
+        let src = self.docs.iter().find(|d| *d.path == path).map(|d| d.editor.read(cx).value().to_string());
+        let mut history = vec![];
         for (i, (stmt, key)) in stmts.into_iter().zip(keys).enumerate() {
+            let result = report.results.get(i).cloned();
+            if let (Some(r), true, false) = (&result, stmt.fresh, report.skipped) {
+                let start = src.as_deref().and_then(|s| statement_start(s, &stmt.text, stmt.range.clone()).map(|at| s[..at].matches('\n').count() + 1));
+                history.push(db_exec::history::Entry {
+                    source: "gui".into(),
+                    line: start.unwrap_or(0),
+                    connection: name.clone(),
+                    database: conn.database.clone(),
+                    sql: stmt.text.clone(),
+                    duration_ms: r.as_ref().map_or(0, |o| o.duration.as_millis() as u64),
+                    rows: r.as_ref().ok().filter(|o| o.rows_affected.is_none()).map(|o| o.rows.len() as u64),
+                    affected: r.as_ref().ok().and_then(|o| o.rows_affected),
+                    error: r.as_ref().err().map(|e| e.to_string()),
+                    ..Default::default()
+                });
+            }
             let Some(e) = self.store.entries.get_mut(&key) else { continue };
             e.running = None;
-            let Some(result) = report.results.get(i).cloned() else { continue };
+            let Some(result) = result else { continue };
             if let Err(err) = &result
                 && let Some(p) = err.position
             {
@@ -515,6 +535,7 @@ impl Siesta {
             e.id += 1;
             e.done = Some(Arc::new(Done { text: stmt.text, kind: stmt.kind, page: stmt.page, range: stmt.range, conn: name.clone(), database: conn.database.clone(), color: color.clone(), driver: conn.driver, result }));
         }
+        self.record_history(&path, history, cx);
         if let Some((text, range, p, msg)) = position {
             self.underline_error(&path, &text, range, p, &msg, cx);
         }
@@ -866,7 +887,7 @@ mod tests {
         use super::{Handles, Opts, Stmt, run_job};
         let (h, rt) = (Handles::new(), &*super::RT);
         let opts = Opts { stop_on_error: true, timeout_ms: None, connect_timeout_ms: 10_000, max_rows: 10 };
-        let stmts = || vec![Stmt { text: "SELECT 1".into(), kind: Kind::Query, page: Default::default(), range: None }];
+        let stmts = || vec![Stmt { text: "SELECT 1".into(), kind: Kind::Query, page: Default::default(), range: None, fresh: false }];
         // A run holds the session; a second one queues behind it.
         let running = rt.block_on(h.session.clone().lock_owned());
         let queued = rt.spawn(run_job(h.clone(), fake_conn(), stmts(), opts, h.token()));
@@ -943,7 +964,7 @@ mod tests {
             color: None,
         };
         let opts = Opts { stop_on_error: true, timeout_ms: Some(5000), connect_timeout_ms: 10_000, max_rows: 1000 };
-        let stmt = |text: &str, kind| Stmt { text: text.into(), kind, page: db_exec::Page { size: 2, ..Default::default() }, range: None };
+        let stmt = |text: &str, kind| Stmt { text: text.into(), kind, page: db_exec::Page { size: 2, ..Default::default() }, range: None, fresh: false };
         let slot = Slot::new();
         let h = slot.handles.clone();
         let rt = &*super::RT;

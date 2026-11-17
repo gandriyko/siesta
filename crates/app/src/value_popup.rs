@@ -8,7 +8,7 @@ use db_exec::Value;
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
-    button::Button,
+    button::{Button, ButtonGroup},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
     table::TableState,
@@ -205,11 +205,18 @@ impl Render for Popup {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    // Room for the dialog's own close button in the top-right corner.
+                    .pr_8()
                     .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(self.title()))
-                    .when(bytes, |r| r.child(Button::new("popup-save").label("Save to file").small().on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))))
-                    .child(Button::new("popup-copy").icon(IconName::Copy).label("Copy").small().on_click(cx.listener(|this, _, window, cx| this.copy(window, cx))))
-                    .child(Button::new("popup-prev").icon(IconName::ArrowUp).small().disabled(self.pos == 0).tooltip("Previous row (↑)").on_click(cx.listener(|this, _, window, cx| this.step(-1, window, cx))))
-                    .child(Button::new("popup-next").icon(IconName::ArrowDown).small().disabled(self.pos >= last).tooltip("Next row (↓)").on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx)))),
+                    .child(
+                        ButtonGroup::new("popup-actions")
+                            .outline()
+                            .small()
+                            .when(bytes, |g| g.child(Button::new("popup-save").label("Save to file").on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))))
+                            .child(Button::new("popup-copy").icon(IconName::Copy).label("Copy").on_click(cx.listener(|this, _, window, cx| this.copy(window, cx))))
+                            .child(Button::new("popup-prev").icon(IconName::ArrowUp).disabled(self.pos == 0).tooltip("Previous row (↑)").on_click(cx.listener(|this, _, window, cx| this.step(-1, window, cx))))
+                            .child(Button::new("popup-next").icon(IconName::ArrowDown).disabled(self.pos >= last).tooltip("Next row (↓)").on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx)))),
+                    ),
             )
             .child(div().h(h).border_1().border_color(cx.theme().border).rounded_md().child(Editor::new(&self.editor).size_full().bordered(false)))
             .when(wide, |c| c.child(div().flex_none().child(Input::new(&self.filter).small().cleanable(true))))

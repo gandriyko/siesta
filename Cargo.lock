@@ -1375,6 +1375,7 @@ dependencies = [
 name = "db-exec"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "db-conn",
  "futures-util",
  "serde",

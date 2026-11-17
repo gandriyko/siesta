@@ -72,6 +72,7 @@ fn defaults() -> Vec<Spec> {
         spec(key("j"), ToggleResult, Both),
         spec(key("\\"), ToggleSplit, Both),
         spec(key("alt-f"), ToggleFilters, Both),
+        spec(key("y"), ToggleHistory, Both),
         // The result table.
         spec(key("c"), CopyCells, In("ResultTable")),
         spec("enter", OpenCell, In("ResultTable")),

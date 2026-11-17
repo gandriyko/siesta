@@ -7,6 +7,7 @@
 //! Notices: MySQL warnings are read with `SHOW WARNINGS` after non-query statements. Postgres
 //! `NOTICE`s are not reachable (sqlx only logs them), so `notices` stays empty for Postgres.
 
+pub mod history;
 mod schema;
 mod value;
 mod wrap;

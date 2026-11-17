@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -28,6 +29,121 @@ use gpui_component::{
 use sql_split::{Dialect, Kind};
 
 use crate::{Siesta, RUN_KEY, doc::dialect_of, format::*, runner::Spec};
+
+/// Lines a hover tip shows; the rest is one line pointing at the value dialog.
+const TIP_LINES: usize = 2000;
+/// Characters of one line a hover tip keeps.
+const TIP_LINE_CHARS: usize = 4000;
+
+/// Token kinds of a pretty-printed JSON line, named after the theme's syntax styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Key,
+    Str,
+    Num,
+    Bool,
+    Null,
+}
+
+impl Tok {
+    fn style(self) -> &'static str {
+        match self {
+            Tok::Key => "property",
+            Tok::Str => "string",
+            Tok::Num => "number",
+            Tok::Bool => "boolean",
+            Tok::Null => "constant",
+        }
+    }
+}
+
+/// Byte ranges of the tokens of one line of `serde_json::to_string_pretty` output (a cut-off
+/// line just ends inside its token). Punctuation stays unstyled.
+fn json_tokens(line: &str) -> Vec<(Range<usize>, Tok)> {
+    let b = line.as_bytes();
+    let (mut out, mut i) = (vec![], 0);
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                let key = line[i..].trim_start().starts_with(':');
+                out.push((start..i, if key { Tok::Key } else { Tok::Str }));
+            }
+            b'-' | b'0'..=b'9' => {
+                while i < b.len() && matches!(b[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    i += 1;
+                }
+                out.push((start..i, Tok::Num));
+            }
+            b't' | b'f' | b'n' => {
+                while i < b.len() && b[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                out.push((start..i, if b[start] == b'n' { Tok::Null } else { Tok::Bool }));
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The hover tip of a JSON cell: the document pretty-printed and highlighted, scrollable both ways.
+struct JsonTip {
+    lines: Vec<SharedString>,
+}
+
+impl JsonTip {
+    fn new(j: &serde_json::Value) -> Self {
+        let pretty = serde_json::to_string_pretty(j).unwrap_or_default();
+        let total = pretty.lines().count();
+        let mut lines: Vec<SharedString> = pretty
+            .lines()
+            .take(TIP_LINES)
+            .map(|l| if l.len() > TIP_LINE_CHARS { format!("{}…", l.chars().take(TIP_LINE_CHARS).collect::<String>()).into() } else { l.to_string().into() })
+            .collect();
+        if total > TIP_LINES {
+            lines.push(format!("… {} more lines: double-click the cell for the whole value", total - TIP_LINES).into());
+        }
+        Self { lines }
+    }
+}
+
+impl Render for JsonTip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A hoverable tip survives clicks (GPUI only hides plain tooltips on mouse down): once a
+        // double click opened the value dialog, draw nothing.
+        if gpui_component::WindowExt::has_active_dialog(window, cx) {
+            return div().id("json-tip");
+        }
+        let t = cx.theme();
+        let syntax = t.highlight_theme.clone();
+        let lines = self.lines.iter().map(|l| {
+            let runs: Vec<(Range<usize>, HighlightStyle)> = json_tokens(l).into_iter().filter_map(|(r, k)| Some((r, syntax.style(k.style())?))).collect();
+            div().whitespace_nowrap().child(StyledText::new(l.clone()).with_highlights(runs))
+        });
+        div()
+            .id("json-tip")
+            .max_w(px(640.))
+            .max_h(px(420.))
+            .overflow_scroll()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_color(t.popover_foreground)
+            .shadow_md()
+            .font_family(t.mono_font_family.clone())
+            // Smaller than the grid, so more of the document fits.
+            .text_size(t.mono_font_size * 0.8)
+            .children(lines)
+    }
+}
 
 /// A statement of a file: where its result lives. Edit the text and it is a new statement.
 pub type Key = (PathBuf, String);
@@ -226,8 +342,7 @@ impl TableDelegate for Grid {
     fn render_th(&mut self, ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let Some(col) = self.outcome().map(|o| o.columns[ix].clone()) else { return div().into_any_element() };
         let t = cx.theme();
-        let (muted, fs) = (t.muted_foreground, t.font_size);
-        let mark = self.sort.iter().position(|(n, _)| *n == col.name).map(|i| {
+        let mark =self.sort.iter().position(|(n, _)| *n == col.name).map(|i| {
             let arrow = if self.sort[i].1 { "↓" } else { "↑" };
             if self.sort.len() > 1 { format!("{arrow}{}", i + 1) } else { arrow.to_string() }
         });
@@ -249,7 +364,8 @@ impl TableDelegate for Grid {
                     .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(col.name.clone()))
                     .children(mark.map(|m| div().flex_none().text_color(t.primary).child(if local { format!("{m} local") } else { m }))),
             )
-            .child(div().truncate().text_size(fs * 0.78).font_weight(FontWeight::NORMAL).text_color(muted).child(col.type_name.clone()));
+            // Only names in the header; the type is a hover away.
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(col.type_name.clone()).build(window, cx));
         let filter = self.show_filters.then(|| self.filters.get(ix).cloned()).flatten().map(|input| {
             // A click in the field must not sort.
             div().id(("th-filter", ix)).w_full().pt_1().on_click(|_, _, cx| cx.stop_propagation()).child(Input::new(&input).small().cleanable(true))
@@ -267,24 +383,27 @@ impl TableDelegate for Grid {
     fn render_td(&mut self, row: usize, col: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let Some(v) = self.value(row, col) else { return div().into_any_element() };
         let t = cx.theme();
+        // JSON cells: hovering shows the whole document, formatted; the tip stays while the
+        // pointer is on it, so it can be scrolled.
+        let json_tip = |el: Div| -> AnyElement {
+            let Some(j) = cell_json(v) else { return el.into_any_element() };
+            let j = j.into_owned();
+            el.id(("json-cell", col)).hoverable_tooltip(move |_, cx| cx.new(|_| JsonTip::new(&j)).into()).into_any_element()
+        };
         if let Some(lines) = self.order.get(row).and_then(|&r| self.previews.get(&(r, col))) {
             let (mono, size, line_h) = (t.mono_font_family.clone(), t.mono_font_size, self.line_h);
-            return div()
-                .w_full()
-                .font_family(mono)
-                .text_size(size)
-                .children(lines.iter().map(|l| div().w_full().h(line_h).truncate().child(l.clone())))
-                .into_any_element();
+            return json_tip(div().w_full().font_family(mono).text_size(size).children(lines.iter().map(|l| div().w_full().h(line_h).truncate().child(l.clone()))));
         }
         let text = cell_display(v, &self.null_text, self.preview_bytes);
-        div()
-            .w_full()
-            .truncate()
-            .when(matches!(v, Value::Null), |d| d.italic().text_color(t.muted_foreground))
-            .when(matches!(v, Value::Bytes(_)), |d| d.text_color(t.muted_foreground))
-            .when(self.numeric.get(col) == Some(&true), |d| d.text_right())
-            .child(text)
-            .into_any_element()
+        json_tip(
+            div()
+                .w_full()
+                .truncate()
+                .when(matches!(v, Value::Null), |d| d.italic().text_color(t.muted_foreground))
+                .when(matches!(v, Value::Bytes(_)), |d| d.text_color(t.muted_foreground))
+                .when(self.numeric.get(col) == Some(&true), |d| d.text_right())
+                .child(text),
+        )
     }
 
     fn context_menu(&mut self, row: usize, menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> gpui_component::menu::PopupMenu {
@@ -421,7 +540,7 @@ impl Siesta {
 
     /// Lines of JSON per cell while the preview is on, else 0: the header toggle (from the setting
     /// at first); a setting of 0 gives 4 when the toggle is switched on.
-    fn json_lines(&self) -> usize {
+    pub(crate) fn json_lines(&self) -> usize {
         let n = self.settings.settings.results.json_preview_lines;
         if self.ui.json_on.unwrap_or(n > 0) { if n == 0 { 4 } else { n } } else { 0 }
     }
@@ -860,8 +979,8 @@ impl Siesta {
     fn table_view(&self, loading: bool, _primary: Hsla, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let open = self.ui.filters_open;
-        // Two lines (name, type) and, with the filter row, a field under them.
-        let head = t.font_size * if open { 4.6 } else { 2.9 };
+        // The names alone: a row's own height (the table's default). The filter row adds a field under them.
+        let head = t.font_size * 3.4;
         div()
             .id("result-table")
             .key_context("ResultTable")
@@ -873,7 +992,7 @@ impl Siesta {
             .on_action(cx.listener(|this, _: &crate::OpenRow, window, cx| this.open_selected_row(window, cx)))
             .on_action(cx.listener(|this, _: &crate::NextPage, window, cx| this.step_page(true, window, cx)))
             .on_action(cx.listener(|this, _: &crate::PrevPage, window, cx| this.step_page(false, window, cx)))
-            .child(DataTable::new(&self.ui.table).small().bordered(false).stripe(true).header_row_height(head))
+            .child(DataTable::new(&self.ui.table).small().bordered(false).stripe(true).when(open, |d| d.header_row_height(head)))
             .into_any_element()
     }
 
@@ -921,5 +1040,33 @@ impl Siesta {
             None => row.child(Button::new("count-all").label("Count all").ghost().xsmall().on_click(cx.listener(|this, _, window, cx| this.count_all(window, cx)))),
         };
         Some(row.into_any_element())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
+    use super::{JsonTip, TIP_LINE_CHARS, TIP_LINES, Tok, json_tokens};
+
+    #[test]
+    fn json_line_tokens() {
+        let toks = |l: &str| json_tokens(l).into_iter().map(|(r, k)| (l[r].to_string(), k)).collect::<Vec<_>>();
+        assert_eq!(toks(r#"  "a\"b": "x:y","#), [(r#""a\"b""#.into(), Tok::Key), (r#""x:y""#.into(), Tok::Str)]);
+        assert_eq!(toks(r#"  "n": -1.5e3,"#), [(r#""n""#.into(), Tok::Key), ("-1.5e3".into(), Tok::Num)]);
+        assert_eq!(toks("  true, false, null"), [("true".into(), Tok::Bool), ("false".into(), Tok::Bool), ("null".into(), Tok::Null)]);
+        // A cut-off line ends inside its string.
+        assert_eq!(toks(r#"  "ключ…"#), [(r#""ключ…"#.into(), Tok::Str)]);
+        assert!(toks("  },").is_empty());
+    }
+
+    #[test]
+    fn json_tip_is_pretty_and_capped() {
+        let small = JsonTip::new(&serde_json::json!({"a": [1, 2]}));
+        assert_eq!(small.lines, ["{", "  \"a\": [", "    1,", "    2", "  ]", "}"]);
+        let big = JsonTip::new(&serde_json::Value::Array((0..TIP_LINES).map(|i| i.into()).collect()));
+        assert_eq!(big.lines.len(), TIP_LINES + 1);
+        assert_eq!(big.lines.last().unwrap().as_ref(), "… 2 more lines: double-click the cell for the whole value");
+        let wide = JsonTip::new(&serde_json::json!(["x".repeat(TIP_LINE_CHARS + 10)]));
+        assert_eq!(wide.lines[1].chars().count(), TIP_LINE_CHARS + 1);
     }
 }

@@ -59,7 +59,7 @@ pub struct Settings {
     pub split: Split,
     /// The editor's share of the editor + result area, 0.2–0.8.
     pub split_ratio: f32,
-    /// Theme family (`"Gruvbox"`, `"Catppuccin"`, …); `"Default"` = built-in.
+    /// Theme family (`"macOS Classic"` by default, `"Gruvbox"`, …); `"Default"` = gpui-component's built-in.
     pub theme: String,
     /// UI text size, px.
     pub ui_font_size: f32,
@@ -123,7 +123,7 @@ impl Default for Settings {
             keymap: Keymap::Default,
             split: Split::Horizontal,
             split_ratio: 0.55,
-            theme: "Default".into(),
+            theme: "macOS Classic".into(),
             ui_font_size: 14.,
             font_family: String::new(),
             font_size: 14.,
@@ -143,7 +143,7 @@ impl Default for Editor {
 
 impl Default for Results {
     fn default() -> Self {
-        Self { page_size: 100, max_rows: 10_000, cell_preview_kb: 8, null_text: "NULL".into(), json_preview_lines: 4 }
+        Self { page_size: 100, max_rows: 10_000, cell_preview_kb: 8, null_text: "NULL".into(), json_preview_lines: 0 }
     }
 }
 
@@ -268,7 +268,7 @@ mod tests {
         assert!(s.run.stop_on_error);
         assert_eq!((s.run.confirm_destructive, s.run.statement_timeout_ms), (ConfirmDestructive::Prod, None));
         assert_eq!(s.run.connect_timeout_ms, 10_000);
-        assert_eq!((s.results.json_preview_lines, s.history.total), (4, 500));
+        assert_eq!((s.results.json_preview_lines, s.history.total), (0, 500));
         // an empty layer set yields exactly the defaults
         assert_eq!(Loaded::load_from(None, None).settings, s);
     }

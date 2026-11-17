@@ -132,12 +132,23 @@ impl Siesta {
     /// `SELECT * FROM table;` on a new line after the statement under the cursor, with the cursor
     /// on it. A statement without `;` gets one, or the new one would join it. `false`: nothing inserted.
     pub(crate) fn insert_select(&mut self, schema: &str, table: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.current.filter(|&i| self.docs[i].sql).is_none() {
+            window.push_notification("Open a .sql file first", cx);
+            return false;
+        }
+        let Some(name) = self.table_sql(schema, table) else { return false };
+        self.insert_statement(&format!("SELECT * FROM {name};"), window, cx)
+    }
+
+    /// `sql` (a `;` is added when it has none) on a new line after the statement under the cursor
+    /// of the current file, with the cursor on it. `false`: no `.sql` file is current.
+    pub(crate) fn insert_statement(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(ix) = self.current.filter(|&i| self.docs[i].sql) else {
             window.push_notification("Open a .sql file first", cx);
             return false;
         };
-        let Some(name) = self.table_sql(schema, table) else { return false };
-        let sql = format!("SELECT * FROM {name};");
+        let sql = sql.trim();
+        let sql = if sql.ends_with(';') { sql.to_string() } else { format!("{sql};") };
         let d = &self.docs[ix];
         let src = d.editor.read(cx).value().to_string();
         let cursor = d.cursor_offset(cx).min(src.len());
