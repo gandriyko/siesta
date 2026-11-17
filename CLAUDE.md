@@ -4,6 +4,11 @@ Lightweight desktop SQL client (Postgres, MySQL / MariaDB) on Rust + GPUI + gpui
 The spec is `Siesta специфікація легкого SQL-клієнта на Rust + GPUI.md` — the source of truth for
 behaviour; update it in the same change when a decision changes.
 
+## Git
+
+Work, commit and push straight on `main`. Never create branches (no feature branches, no PRs)
+unless asked.
+
 ## Sibling project: Respite
 
 `/Users/andrew/Projects/respite` is Siesta's sibling: a text-based REST client with the same shell
