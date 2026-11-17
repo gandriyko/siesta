@@ -945,7 +945,8 @@ impl Siesta {
                 let view = view.clone();
                 PopupMenuItem::new(name).on_click(move |_, window, cx| _ = view.update(cx, |this, cx| this.refresh_databases(window, cx)))
             };
-            let mut menu = menu.item(PopupMenuItem::new(default_label.clone()).checked(explicit.is_none()).on_click(pick(None))).separator();
+            // A server can hold hundreds of databases: a short list that scrolls.
+            let mut menu = menu.scrollable(true).max_h(px(320.)).item(PopupMenuItem::new(default_label.clone()).checked(explicit.is_none()).on_click(pick(None))).separator();
             for row in &rows {
                 menu = match row {
                     DbRow::Loading => menu.item(PopupMenuItem::new("Loading…").disabled(true)),
@@ -982,6 +983,12 @@ impl Siesta {
         })
     }
 
+    /// The current file's connection colour (its own, or red for prod), in the theme's shade.
+    fn connection_color(&self, cx: &App) -> Option<Hsla> {
+        let d = self.doc().filter(|d| d.sql)?;
+        format::parse_color(d.conns.connections.get(d.connection()?)?.display_color()?, cx.theme().is_dark())
+    }
+
     /// Top-right connection picker: the connections, "No connection", and the form / page entries. The dot is grey until sessions exist (green / red later).
     fn connection_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
@@ -1005,16 +1012,20 @@ impl Siesta {
         let conn_of = |n: &str| d.conns.connections.get(n);
         let prod = current.as_deref().and_then(conn_of).is_some_and(|c| c.prod);
         // Each connection's colour (its own, or red for prod) marks it in the picker.
-        let colors: std::collections::HashMap<String, Hsla> = names.iter().filter_map(|n| Some((n.clone(), format::parse_color(conn_of(n)?.display_color()?)?))).collect();
-        let strip = current.as_ref().and_then(|n| colors.get(n).copied());
+        let dark = cx.theme().is_dark();
+        let colors: std::collections::HashMap<String, Hsla> = names.iter().filter_map(|n| Some((n.clone(), format::parse_color(conn_of(n)?.display_color()?, dark)?))).collect();
+        let own = current.as_ref().and_then(|n| colors.get(n).copied());
         let status = self.dot_of(&d.path, current.as_deref(), d.shown_database());
         let (can_test, can_disconnect) = (current.is_some(), self.slots.keys().any(|(p, ..)| *p == *d.path));
         let t = cx.theme();
         let (muted, fs) = (t.muted_foreground, t.font_size);
-        let status_color = match status {
-            runner::Dot::Grey => muted.opacity(0.6),
-            runner::Dot::Green => t.success,
-            runner::Dot::Red => t.danger,
+        // The dot is the connection's colour: dimmed until a session is live; a failed one shows red.
+        let status_color = match (status, own) {
+            (runner::Dot::Red, _) => t.danger,
+            (runner::Dot::Grey, Some(c)) => c.opacity(0.5),
+            (runner::Dot::Green, Some(c)) => c,
+            (runner::Dot::Grey, None) => muted.opacity(0.6),
+            (runner::Dot::Green, None) => t.success,
         };
         let dot = |color: Hsla| div().flex_none().size(fs * 0.55).rounded_full().bg(color);
         let label = current.clone().unwrap_or_else(|| "No connection".into());
@@ -1022,7 +1033,7 @@ impl Siesta {
         Some(
             Button::new("connection-picker")
                 .icon(IconName::Network)
-                .child(h_flex().gap_1p5().children(strip.map(|c| div().flex_none().w(px(3.)).h(fs).rounded_full().bg(c))).child(dot(status_color)).child(label))
+                .child(h_flex().gap_1p5().child(dot(status_color)).child(label))
                 .dropdown_caret(true)
                 .small()
                 .when(prod || unknown.is_some(), |b| b.danger())
@@ -1191,7 +1202,9 @@ impl Siesta {
         };
         let tabs = (!self.docs.is_empty()).then(|| self.tabs(cx));
         let crumbs = self.breadcrumbs(cx);
-        let card = card(focused, cx).children(self.banner(cx)).children(crumbs).child(body);
+        // The editor's frame takes the file's connection colour (dimmed while unfocused).
+        let frame = self.connection_color(cx).map(|c| if focused { c } else { c.opacity(0.5) });
+        let card = card(focused, cx).when_some(frame, |c, f| c.border_color(f)).children(self.banner(cx)).children(crumbs).child(body);
         div().size_full().flex().flex_col().children(tabs).child(card).into_any_element()
     }
 

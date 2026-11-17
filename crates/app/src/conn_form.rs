@@ -11,7 +11,7 @@ use db_conn::{ConnectionForm, Driver, SslMode};
 use db_exec::{DbError, Session};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -21,7 +21,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::{Siesta, runner::RT};
+use crate::{Siesta, format, runner::RT};
 
 const DRIVERS: [(&str, Driver); 2] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql)];
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
@@ -81,7 +81,8 @@ pub(crate) struct ConnForm {
     pub password: Entity<InputState>,
     schema: Entity<InputState>,
     init_sql: Entity<InputState>,
-    color: Entity<InputState>,
+    /// A name from `format::COLORS`, a `#rrggbb` written by hand (kept), or empty.
+    color: String,
     pub driver: Option<Driver>,
     ssl: Option<SslMode>,
     read_only: bool,
@@ -89,6 +90,12 @@ pub(crate) struct ConnForm {
     error: Option<String>,
     test: Test,
     running: Option<Running>,
+    /// Databases the last ↻ listed: the Database field offers them.
+    databases: Vec<String>,
+    /// The running ↻ (dropped with the form: the connection attempt is aborted).
+    loading_dbs: Option<Running>,
+    /// "Loading…" or why the list could not be read; muted under the field.
+    db_note: Option<String>,
 }
 
 impl ConnForm {
@@ -102,7 +109,9 @@ impl ConnForm {
             let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored encrypted in the connection file" };
             cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true))
         };
-        let url = input("postgres://user:password@host:5432/db (fills the fields below)", "", window, cx);
+        // A saved connection's driver may not be Postgres, so its form shows no example URL.
+        let url_hint = if original.is_some() { "" } else { "postgres://user:password@host:5432/db (fills the fields below)" };
+        let url = input(url_hint, "", window, cx);
         let _sub = cx.subscribe_in(&url, window, |this, url, ev: &InputEvent, window, cx| {
             if matches!(ev, InputEvent::Change) {
                 let text = url.read(cx).value().to_string();
@@ -127,7 +136,7 @@ impl ConnForm {
             password,
             schema: input("public (Postgres search_path)", &f.schema, window, cx),
             init_sql: input("SET TIME ZONE 'UTC'", &f.init_sql, window, cx),
-            color: input("red, blue, #rrggbb", &f.color, window, cx),
+            color: f.color.trim().to_string(),
             driver: f.driver,
             ssl: f.ssl_mode,
             read_only: f.read_only,
@@ -136,6 +145,9 @@ impl ConnForm {
             error: None,
             test: Test::Idle,
             running: None,
+            databases: Vec::new(),
+            loading_dbs: None,
+            db_note: None,
         }
     }
 
@@ -180,7 +192,7 @@ impl ConnForm {
             ssl_mode: self.ssl,
             schema: v(&self.schema),
             init_sql: v(&self.init_sql),
-            color: v(&self.color),
+            color: self.color.clone(),
             read_only: self.read_only,
             prod: self.prod,
             has_password: self.has_password,
@@ -254,6 +266,47 @@ impl ConnForm {
             .ok();
         });
         self.running = Some(Running { _task: task, abort });
+        cx.notify();
+    }
+
+    /// The ↻ in the Database field: connects with the form's values (the database field left out,
+    /// so a wrong name doesn't block the list) and offers the databases the credentials can open.
+    fn load_databases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut form = self.collect(cx);
+        form.database.clear();
+        let conn = match form.to_connection(&self.dir, &self.keys, self.original.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.db_note = Some(e);
+                return cx.notify();
+            }
+        };
+        self.db_note = Some("Loading…".into());
+        let timeout = self.app.read_with(cx, |a, _| Duration::from_millis(a.settings.settings.run.connect_timeout_ms)).unwrap_or(db_exec::CONNECT_TIMEOUT);
+        let handle = RT.spawn(async move {
+            let mut s = Session::open_with(&conn, timeout).await?;
+            let names = s.databases().await;
+            s.close().await;
+            names
+        });
+        let abort = handle.abort_handle();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let r = handle.await;
+            this.update(cx, |this, cx| {
+                this.loading_dbs = None;
+                match r {
+                    Ok(Ok(names)) => {
+                        this.db_note = names.is_empty().then(|| "No databases".to_string());
+                        this.databases = names;
+                    }
+                    Ok(Err(e)) => this.db_note = Some(e.to_string()),
+                    Err(e) => this.db_note = Some(e.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.loading_dbs = Some(Running { _task: task, abort });
         cx.notify();
     }
 
@@ -343,6 +396,62 @@ impl Render for ConnForm {
                 cx.notify();
             }))
         };
+        // ↻ loads the server's databases; then ⌄ picks one, or "(none)" for the server default.
+        let database = {
+            let refresh = Button::new("conn-db-refresh")
+                .icon(IconName::RefreshCw)
+                .ghost()
+                .xsmall()
+                .loading(self.loading_dbs.is_some())
+                .tooltip("Load the server's databases")
+                .on_click(cx.listener(|this, _, window, cx| this.load_databases(window, cx)));
+            let input = Input::new(&self.database);
+            if self.databases.is_empty() {
+                input.suffix(refresh)
+            } else {
+                let (view, names, db) = (cx.entity().downgrade(), self.databases.clone(), self.database.clone());
+                let current = db.read(cx).value().to_string();
+                input.suffix(h_flex().child(refresh).child(Button::new("conn-db-list").icon(IconName::ChevronDown).ghost().xsmall().dropdown_menu(move |menu, _, _| {
+                    std::iter::once("").chain(names.iter().map(String::as_str)).fold(menu.scrollable(true).max_h(px(320.)), |menu, name| {
+                        let (view, db, value) = (view.clone(), db.clone(), name.to_string());
+                        let label = if name.is_empty() { "(none)".to_string() } else { value.clone() };
+                        menu.item(PopupMenuItem::new(label).checked(current == name).on_click(move |_, window, cx| {
+                            db.update(cx, |s, cx| s.set_value(value.clone(), window, cx));
+                            view.update(cx, |_, cx| cx.notify()).ok();
+                        }))
+                    })
+                })))
+            }
+        };
+        let database = v_flex().gap_1().child(database).children(self.db_note.clone().map(|n| div().text_xs().text_color(muted).child(n)));
+        // Colour: "None" or one of the palette, each a swatch in the current theme's shade.
+        let color = {
+            let dark = cx.theme().is_dark();
+            let swatch = move |name: &str| div().flex_none().size(px(10.)).rounded_full().when_some(format::parse_color(name, dark), |d, c| d.bg(c)).when(name.is_empty(), |d| d.border_1().border_color(muted));
+            let label = |name: &str| if name.is_empty() { "None".to_string() } else { name.to_string() };
+            let (view, current) = (cx.entity().downgrade(), self.color.clone());
+            Button::new("conn-color")
+                .outline()
+                .w_full()
+                .dropdown_caret(true)
+                .child(h_flex().flex_1().gap_2().items_center().child(swatch(&current)).child(label(&current)))
+                .dropdown_menu(move |menu, _, _| {
+                    std::iter::once("").chain(format::COLORS.iter().map(|(n, ..)| *n)).fold(menu.scrollable(true), |menu, name| {
+                        let (view, value, text) = (view.clone(), name.to_string(), label(name));
+                        menu.item(
+                            PopupMenuItem::element(move |_, _| h_flex().gap_2().items_center().child(swatch(name)).child(text.clone()))
+                                .checked(current.eq_ignore_ascii_case(name))
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.color = value.clone();
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
+                })
+        };
         let testing = matches!(self.test, Test::Running);
         let status = self.status(cx);
         let editing = self.original.is_some();
@@ -354,9 +463,9 @@ impl Render for ConnForm {
             .child(field("URL", &self.url))
             .children(self.url_note.clone().map(|n| div().text_xs().text_color(muted).child(n)))
             .child(h_flex().gap_2().child(div().flex_1().child(field("Host", &self.host))).child(div().w(px(100.)).child(field("Port", &self.port))))
-            .child(h_flex().gap_2().child(div().flex_1().child(field("Database", &self.database))).child(div().flex_1().child(field("User", &self.user))))
+            .child(h_flex().gap_2().child(div().flex_1().child(Self::field("Database", muted, database))).child(div().flex_1().child(field("User", &self.user))))
             .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))
-            .child(h_flex().gap_2().child(div().flex_1().child(Self::field("SSL mode", muted, ssl))).child(div().flex_1().child(field("Color", &self.color))))
+            .child(h_flex().gap_2().child(div().flex_1().child(Self::field("SSL mode", muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
             .child(field("Schema (search_path)", &self.schema))
             .child(field("Init SQL", &self.init_sql))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))

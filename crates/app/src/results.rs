@@ -823,7 +823,8 @@ impl Siesta {
                 Ok(o) => status.child(div().text_color(fg).font_weight(FontWeight::SEMIBOLD).child(rows_label(o))).child(duration_label(o.duration)),
                 Err(_) => status.child(pill("Error".into(), danger)),
             };
-            let strip = d.color.as_deref().and_then(parse_color).unwrap_or(muted.opacity(0.5));
+            let dark = cx.theme().is_dark();
+            let strip = d.color.as_deref().and_then(|c| parse_color(c, dark)).unwrap_or(muted.opacity(0.5));
             status = status.child(h_flex().gap_1().items_center().child(div().w(px(3.)).h(fs).rounded_full().bg(strip)).child(d.label()));
             if d.outcome().is_some_and(|o| o.in_transaction) || self.in_tx(&key.as_ref().expect("key").0) {
                 status = status.child(div().text_color(warning).font_weight(FontWeight::BOLD).child("TX ●"));

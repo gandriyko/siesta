@@ -228,22 +228,36 @@ pub fn page_label(offset: u64, size: u64, count: Option<u64>) -> String {
     }
 }
 
-/// `#rrggbb` or a basic colour name, for the connection's `color`.
-pub fn parse_color(s: &str) -> Option<gpui::Hsla> {
+/// The connection colours the form offers: (name, on a dark theme, on a light theme). One family of
+/// steps (Tailwind 400 on dark, 600 on light), so they sit together and each reads on its background.
+pub const COLORS: [(&str, u32, u32); 16] = [
+    ("red", 0xf87171, 0xdc2626),
+    ("orange", 0xfb923c, 0xea580c),
+    ("amber", 0xfbbf24, 0xd97706),
+    ("yellow", 0xfacc15, 0xca8a04),
+    ("lime", 0xa3e635, 0x65a30d),
+    ("green", 0x4ade80, 0x16a34a),
+    ("emerald", 0x34d399, 0x059669),
+    ("teal", 0x2dd4bf, 0x0d9488),
+    ("cyan", 0x22d3ee, 0x0891b2),
+    ("sky", 0x38bdf8, 0x0284c7),
+    ("blue", 0x60a5fa, 0x2563eb),
+    ("indigo", 0x818cf8, 0x4f46e5),
+    ("purple", 0xc084fc, 0x9333ea),
+    ("fuchsia", 0xe879f9, 0xc026d3),
+    ("pink", 0xf472b6, 0xdb2777),
+    ("gray", 0x9ca3af, 0x6b7280),
+];
+
+/// A colour name from [`COLORS`] (in the shade for a `dark` or light theme) or `#rrggbb`, for the connection's `color`.
+pub fn parse_color(s: &str, dark: bool) -> Option<gpui::Hsla> {
     let lower = s.trim().to_lowercase();
-    let named = match lower.as_str() {
-        "red" => "dc2626",
-        "orange" => "ea580c",
-        "yellow" => "ca8a04",
-        "green" => "16a34a",
-        "teal" => "0d9488",
-        "blue" => "2563eb",
-        "purple" => "9333ea",
-        "pink" => "db2777",
-        "gray" | "grey" => "6b7280",
-        other => other.trim_start_matches('#'),
-    };
-    (named.len() == 6).then(|| u32::from_str_radix(named, 16).ok()).flatten().map(|v| gpui::rgb(v).into())
+    let name = if lower == "grey" { "gray" } else { lower.as_str() };
+    if let Some(&(_, d, l)) = COLORS.iter().find(|(n, ..)| *n == name) {
+        return Some(gpui::rgb(if dark { d } else { l }).into());
+    }
+    let hex = name.trim_start_matches('#');
+    (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(|v| gpui::rgb(v).into())
 }
 
 #[cfg(test)]
@@ -370,6 +384,7 @@ mod tests {
         assert_eq!(cell_json(&Value::Text(" {\"a\":1}".into())).as_deref(), Some(&serde_json::json!({"a": 1})));
         assert!(cell_json(&Value::Text("123".into())).is_none() && cell_json(&Value::Text("{x".into())).is_none() && cell_json(&Value::Int(1)).is_none());
         assert!(cell_json(&Value::Json(serde_json::json!(5))).is_some());
-        assert!(parse_color("#ff0000").is_some() && parse_color("red").is_some() && parse_color("nope").is_none());
+        assert!(parse_color("#ff0000", true).is_some() && parse_color("Grey", false).is_some() && parse_color("nope", true).is_none());
+        assert_ne!(parse_color("red", true), parse_color("red", false));
     }
 }

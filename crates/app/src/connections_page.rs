@@ -173,7 +173,8 @@ impl ConnectionsPage {
     fn render_row(&self, ix: usize, r: &ConnRow, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let (muted, fs) = (t.muted_foreground, t.font_size);
-        let dot = r.color.as_deref().and_then(parse_color).unwrap_or(muted.opacity(0.6));
+        let dark = t.is_dark();
+        let dot = r.color.as_deref().and_then(|c| parse_color(c, dark)).unwrap_or(muted.opacity(0.6));
         let badge = |label: &'static str, bg: Hsla, fg: Hsla| div().flex_none().px_1p5().rounded_sm().text_xs().bg(bg).text_color(fg).child(label);
         let driver = match r.driver {
             Some(Driver::Postgres) => "Postgres",
