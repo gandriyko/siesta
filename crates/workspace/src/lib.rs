@@ -160,6 +160,24 @@ pub fn save_state(base: &Path, ws: &Workspace, state: &WorkspaceState) {
         ws.retain(|k, _| recent.contains(k));
     }
     all["recent"] = recent.into();
+    write(base, &all);
+}
+
+/// Drops `ws` from `recent` and its saved state: the set of chosen files changed, so the old set
+/// is not a workspace to offer any more.
+pub fn forget(base: &Path, ws: &Workspace) {
+    let mut all = read(base);
+    let key = ws.key();
+    if let Some(r) = all["recent"].as_array_mut() {
+        r.retain(|v| v.as_str() != Some(key.as_str()));
+    }
+    if let Some(w) = all["workspaces"].as_object_mut() {
+        w.remove(&key);
+    }
+    write(base, &all);
+}
+
+fn write(base: &Path, all: &serde_json::Value) {
     let write = std::fs::create_dir_all(base).and_then(|()| {
         let tmp = base.join("state.json.tmp");
         std::fs::write(&tmp, all.to_string())?;
@@ -260,6 +278,10 @@ mod tests {
         assert_eq!(recent(base.path()), [root.clone(), files.clone()]);
         drop(other);
         assert_eq!(recent(base.path()), std::slice::from_ref(root));
+        // Forgetting drops it from the list and its state; the last one stays as it is.
+        forget(base.path(), root);
+        assert!(recent(base.path()).is_empty());
+        assert_eq!(load_state(base.path(), root), WorkspaceState::default());
     }
 
     #[test]

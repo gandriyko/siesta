@@ -737,6 +737,40 @@ impl Siesta {
         siesta_workspace::save_state(base, &self.workspace, &state);
     }
 
+    /// Chosen files only: the workspace becomes `files`. Its key changes with the set, so the tabs
+    /// and picks are saved under the new set and the old set leaves RECENT.
+    pub(crate) fn set_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(new) = Workspace::from_paths(files).filter(|w| matches!(w, Workspace::Files(_))) else { return };
+        let old = std::mem::replace(&mut self.workspace, new);
+        self.rescan();
+        self.remember(cx);
+        if let Some(base) = &self.base {
+            siesta_workspace::forget(base, &old);
+        }
+        if self.show_history {
+            self.reload_history();
+        }
+        cx.notify();
+    }
+
+    /// × on a chosen file: it leaves the workspace (and its tab closes); the file stays on disk.
+    /// The last file can't go, and an unsaved or mid-transaction tab has to be dealt with first.
+    pub(crate) fn remove_from_workspace(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Workspace::Files(files) = &self.workspace else { return };
+        let rest: Vec<PathBuf> = files.iter().filter(|f| *f != path).cloned().collect();
+        if rest.is_empty() {
+            return;
+        }
+        if let Some(ix) = self.docs.iter().position(|d| *d.path == *path) {
+            if self.docs[ix].dirty || self.in_tx(path) {
+                return window.push_notification(format!("Save {} and end its transaction before removing it", self.docs[ix].name()), cx);
+            }
+            self.close_now(ix, window, cx);
+        }
+        self.expanded.remove(path);
+        self.set_files(rest, cx);
+    }
+
     /// A dirty tab needs a second close (or a save) — no silent data loss.
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.docs.get(ix) else { return };
@@ -2261,7 +2295,31 @@ mod tests {
         // The folder it left is offered in RECENT; switching back and forth keeps each one's state.
         assert_eq!(recent, [folder_ws(ws.path())]);
         cx.update(|_, cx| app.read(cx).remember(cx));
-        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(picked));
+        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(picked.clone()));
+
+        // A run of a.sql under this set, then z.sql (open in a tab) is dropped from the workspace.
+        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&a, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'a'".into(), ..Default::default() }], cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open(z.clone(), None, window, cx);
+                this.remove_from_workspace(&z, window, cx);
+                this.reload_history();
+            })
+        });
+        let (files, tabs, history) = cx.update(|_, cx| {
+            let this = app.read(cx);
+            (this.files.clone(), this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>(), this.history.iter().map(|e| e.sql.clone()).collect::<Vec<_>>())
+        });
+        assert_eq!((files, tabs.contains(&z), z.is_file()), (vec![a.clone()], false, true));
+        // The run made under the old set still shows; the old set left RECENT, the new one is last.
+        assert_eq!(history, ["SELECT 'a'"]);
+        let now = Workspace::Files(vec![a.clone()]);
+        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(now.clone()));
+        assert!(!siesta_workspace::recent(base.path()).contains(&picked));
+        // The last file can't be dropped.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.remove_from_workspace(&a, window, cx)));
+        assert_eq!(cx.update(|_, cx| app.read(cx).workspace.clone()), now);
     }
 
     #[gpui::test]

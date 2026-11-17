@@ -135,6 +135,25 @@ impl Siesta {
             }))
     }
 
+    /// Hover `×` on a chosen file (when there are others): drop it from the workspace, not from disk.
+    fn remove_button(&self, ix: usize, path: PathBuf, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let Workspace::Files(files) = &self.workspace else { return None };
+        (files.len() > 1).then(|| {
+            div()
+                .id(("remove-file", ix))
+                .flex_none()
+                .rounded_sm()
+                .invisible()
+                .group_hover("row", |s| s.visible())
+                .hover(|s| s.bg(cx.theme().list_active))
+                .child(Icon::new(IconName::Close).size_3().text_color(cx.theme().muted_foreground))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.remove_from_workspace(&path, window, cx);
+                }))
+        })
+    }
+
     pub(crate) fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_new_path(dir, Some("query.sql"));
         cx.spawn_in(window, async move |this, cx| {
@@ -150,7 +169,11 @@ impl Siesta {
                     window.push_notification(format!("{}: {e}", path.display()), cx);
                     return;
                 }
-                this.rescan();
+                // Chosen files: the new file joins them, so the tree shows it.
+                match &this.workspace {
+                    Workspace::Files(files) => this.set_files(files.iter().cloned().chain([path.clone()]).collect(), cx),
+                    Workspace::Folder(_) => this.rescan(),
+                }
                 this.open(path, None, window, cx);
                 cx.notify();
             })
@@ -361,6 +384,7 @@ impl Siesta {
                     .child(icon(IconName::FileText, if current { t.foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
                     .children(path.parent().map(|d| self.add_button(ix, d.to_path_buf(), cx)))
+                    .children(self.remove_button(ix, path.clone(), cx))
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let is_current = this.doc().is_some_and(|d| *d.path == p);

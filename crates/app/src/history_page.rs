@@ -2,7 +2,10 @@
 //! the statement into the current file after the statement under the cursor; Run runs it again in
 //! its own file (where it still is), else inserted into the current file.
 
-use std::{ops::Range, path::Path};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use db_exec::history::{Entry, Store};
 use gpui::{prelude::FluentBuilder as _, *};
@@ -11,8 +14,14 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::Input,
 };
+use siesta_workspace::Workspace;
 
 use crate::Siesta;
+
+/// The file an entry was run in: its `file` counts from the folder of the workspace it was recorded in.
+fn entry_path(e: &Entry) -> PathBuf {
+    Workspace::from_key(&e.workspace).folder().join(&e.file)
+}
 
 const TIME_W: f32 = 104.;
 const CONN_W: f32 = 140.;
@@ -66,8 +75,14 @@ impl Siesta {
         cx.notify();
     }
 
+    /// A folder: the runs made in it. Chosen files: the runs of those files, whatever set they were
+    /// chosen with then (adding or dropping a file changes the set, not the files' history).
     pub(crate) fn reload_history(&mut self) {
-        self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
+        let Some(s) = self.history_store() else { return self.history = vec![] };
+        self.history = match &self.workspace {
+            Workspace::Folder(_) => s.list(),
+            Workspace::Files(files) => s.list_all().into_iter().filter(|e| files.contains(&entry_path(e))).collect(),
+        };
     }
 
     /// Indices of entries matching every word of the filter (SQL, connection, database, file, outcome).
@@ -88,7 +103,7 @@ impl Siesta {
     /// note when that one is on another connection. The page closes.
     pub(crate) fn history_insert(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let e = self.history[i].clone();
-        let path = self.folder().join(&e.file);
+        let path = entry_path(&e);
         if !(path.is_file() && self.open(path, None, window, cx).is_some()) {
             let now = self.doc().filter(|d| d.sql).map(|d| d.connection().map(str::to_string));
             if let Some(now) = now.filter(|n| n.as_deref() != Some(e.connection.as_str())) {
@@ -107,7 +122,7 @@ impl Siesta {
     /// connection decides, as for any run), else inserted as Insert does and run there.
     fn history_run(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let e = self.history[i].clone();
-        let path = self.folder().join(&e.file);
+        let path = entry_path(&e);
         // The recorded file becomes the current one (when it exists), so a missing statement is inserted there.
         let line = path.is_file().then(|| self.open(path.clone(), None, window, cx)).flatten().and_then(|ix| {
             let d = &self.docs[ix];

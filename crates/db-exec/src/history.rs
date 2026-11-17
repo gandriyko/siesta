@@ -112,13 +112,14 @@ impl Store {
     }
 
     /// This workspace's entries, newest first.
-    // ponytail: reads every entry (≤ `total` small files) when the window opens; add an index file if it shows up.
     pub fn list(&self) -> Vec<Entry> {
-        self.ids()
-            .iter()
-            .filter_map(|id| serde_json::from_slice::<Entry>(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok())
-            .filter(|e| e.workspace == self.workspace)
-            .collect()
+        self.list_all().into_iter().filter(|e| e.workspace == self.workspace).collect()
+    }
+
+    /// Every workspace's entries, newest first.
+    // ponytail: reads every entry (≤ `total` small files) when the window opens; add an index file if it shows up.
+    pub fn list_all(&self) -> Vec<Entry> {
+        self.ids().iter().filter_map(|id| serde_json::from_slice::<Entry>(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok()).collect()
     }
 }
 
@@ -144,6 +145,7 @@ mod tests {
         let list = sa.list();
         assert_eq!(list.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["DELETE", "SELECT 2"]);
         assert_eq!(sb.list().iter().map(|e| (e.sql.as_str(), e.file.as_str())).collect::<Vec<_>>(), [("SELECT b", "x.sql")]);
+        assert_eq!(sa.list_all().iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["DELETE", "SELECT b", "SELECT 2"]);
         assert_eq!((list[0].workspace.as_str(), list[0].file.as_str()), ("/w1/app", "q/reports.sql"));
         assert_eq!((list[0].outcome(), list[1].outcome()), ("42P01 no table".into(), "2 rows".into()));
         assert!(list[0].time.ends_with('Z') && !list[0].time_label().is_empty());
