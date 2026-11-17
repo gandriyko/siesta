@@ -1670,6 +1670,10 @@ mod tests {
         if !cx.update(|cx| cx.has_global::<gpui_component::Theme>()) {
             cx.update(gpui_component::init);
         }
+        // A picked connection loads its schema on the tokio runtime (nothing listens on port 1, so
+        // it fails at once); its result wakes GPUI from the tokio thread, which the deterministic
+        // scheduler would otherwise report as an error at a random point.
+        cx.executor().allow_parking();
         let mut view = None;
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
@@ -2201,36 +2205,44 @@ mod tests {
         cx.update(|window, cx| app.update(cx, |this, cx| this.history_filter.update(cx, |s, cx| s.set_value("42703", window, cx))));
         cx.run_until_parked();
         assert_eq!(cx.update(|_, cx| app.read(cx).history_rows.clone()), vec![0]);
-        // Insert: after the current statement, with a `;`; the page closes.
-        cx.update(|window, cx| app.update(cx, |this, cx| _ = this.history_insert(1, window, cx)));
-        assert_eq!(text_of(&app, &mut cx), "SELECT 'b';\nSELECT 42;\n");
+        // Insert: into the file it was recorded in (b.sql, though a.sql is current), after a blank
+        // line, with a `;`; the page closes.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open(ws.path().join("a.sql"), None, window, cx);
+                this.show_history = true;
+                _ = this.history_insert(1, window, cx);
+            })
+        });
+        let current = cx.update(|_, cx| (*app.read(cx).doc().unwrap().path).clone());
+        assert_eq!((current, text_of(&app, &mut cx)), (b.clone(), "SELECT 'b';\n\nSELECT 42;\n".into()));
         assert!(!shown(&mut cx).0);
     }
 
     #[gpui::test]
-    fn a_failed_run_lands_in_history(tcx: &mut TestAppContext) {
+    fn a_finished_run_lands_in_history_but_a_page_change_does_not(tcx: &mut TestAppContext) {
+        use crate::runner::{Report, Stmt};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
         let a = ws.path().join("a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
-        cx.update(|window, cx| {
-            app.update(cx, |this, cx| {
-                this.select_connection(Some("dev".into()), window, cx);
-                this.go_to(a.clone(), 3, true, window, cx);
-            })
-        });
-        // Nothing listens on port 1: the run fails on the tokio thread, then `finish` records it.
-        let mut list = vec![];
-        for _ in 0..200 {
+        // `finish` with a ready report: a real run would wake the test scheduler from the tokio thread.
+        let finish = |cx: &mut VisualTestContext, fresh: bool| {
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    let conn = this.doc().unwrap().conns.connections["dev"].clone();
+                    let stmt = Stmt { text: "SELECT 2".into(), kind: sql_split::Kind::Query, page: Default::default(), range: None, fresh };
+                    let report = Report { results: vec![Err(db_exec::DbError { message: "connection refused".into(), ..Default::default() })], in_tx: false, live: false, skipped: false };
+                    this.finish(a.clone(), "dev".into(), conn, vec![stmt], vec![(a.clone(), "SELECT 2".into())], report, window, cx);
+                })
+            });
             cx.run_until_parked();
-            list = db_exec::history::Store::open(base.path(), ws.path()).unwrap().list();
-            if !list.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+            db_exec::history::Store::open(base.path(), ws.path()).unwrap().list()
+        };
+        assert!(finish(&mut cx, false).is_empty());
+        let list = finish(&mut cx, true);
         let e = &list[0];
         assert_eq!((e.sql.as_str(), e.connection.as_str(), e.file.as_str(), e.line, e.source.as_str()), ("SELECT 2", "dev", "a.sql", 3, "gui"));
-        assert!(e.error.is_some() && e.rows.is_none());
+        assert_eq!((e.error.as_deref(), e.rows), (Some("connection refused"), None));
     }
 
     #[gpui::test]
@@ -2459,14 +2471,15 @@ mod tests {
         // The cursor is on the first statement: the new one goes right below it and becomes the active one.
         let ok = cx.update(|window, cx| app.update(cx, |this, cx| this.insert_select("public", "users", window, cx)));
         assert!(ok);
-        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\nSELECT * FROM users;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n");
+        // A blank line separates it from the statement above.
+        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\n\nSELECT * FROM users;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n");
         let active = cx.update(|_, cx| {
             let d = app.read(cx).doc().unwrap();
             let src = d.editor.read(cx).value();
             d.active_statement().map(|s| (s.line, s.text(&src).to_string()))
         });
-        assert_eq!(active, Some((2, "SELECT * FROM users".to_string())));
-        assert_eq!(cursor_line(&app, &mut cx), 1);
+        assert_eq!(active, Some((3, "SELECT * FROM users".to_string())));
+        assert_eq!(cursor_line(&app, &mut cx), 2);
         // Outside the default schema the name is qualified; a statement without `;` gets one.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
@@ -2475,7 +2488,7 @@ mod tests {
                 assert!(this.insert_select("analytics", "events", window, cx));
             })
         });
-        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\nSELECT * FROM analytics.events;");
+        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\n\nSELECT * FROM analytics.events;");
         // "Insert name" replaces the selection.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {

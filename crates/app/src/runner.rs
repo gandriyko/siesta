@@ -493,7 +493,7 @@ impl Siesta {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn finish(&mut self, path: PathBuf, name: String, conn: Connection, stmts: Vec<Stmt>, keys: Vec<Key>, report: Report, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn finish(&mut self, path: PathBuf, name: String, conn: Connection, stmts: Vec<Stmt>, keys: Vec<Key>, report: Report, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get_mut(&(path.clone(), name.clone(), conn.database.clone()))
             && !report.skipped
         {

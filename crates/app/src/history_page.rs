@@ -83,10 +83,19 @@ impl Siesta {
             .collect()
     }
 
-    /// Insert: after the statement under the cursor of the current file (the page closes).
+    /// Insert: into the file it was recorded in (opened, after the statement under its cursor), so
+    /// it lands under that file's connection. A file that is gone leaves the current file, with a
+    /// note when that one is on another connection. The page closes.
     pub(crate) fn history_insert(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let sql = self.history[i].sql.clone();
-        if self.insert_statement(&sql, window, cx) {
+        let e = self.history[i].clone();
+        let path = self.root.join(&e.file);
+        if !(path.is_file() && self.open(path, None, window, cx).is_some()) {
+            let now = self.doc().filter(|d| d.sql).map(|d| d.connection().map(str::to_string));
+            if let Some(now) = now.filter(|n| n.as_deref() != Some(e.connection.as_str())) {
+                window.push_notification(format!("{} is gone; inserted here. Recorded on `{}`, this file uses `{}`", e.file, e.connection, now.as_deref().unwrap_or("no connection")), cx);
+            }
+        }
+        if self.insert_statement(&e.sql, window, cx) {
             self.show_history = false;
             cx.notify();
             return true;
@@ -95,7 +104,7 @@ impl Siesta {
     }
 
     /// Run again: in its own file at the statement when the file still has it (that file's
-    /// connection decides, as for any run), else inserted into the current file and run there.
+    /// connection decides, as for any run), else inserted as Insert does and run there.
     fn history_run(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let e = self.history[i].clone();
         let path = self.root.join(&e.file);
@@ -106,13 +115,14 @@ impl Siesta {
             d.file.statements.iter().find(|s| s.text(&src).trim() == e.sql.trim()).map(|s| s.line)
         });
         match line {
-            Some(line) => self.go_to(path, line, false, window, cx),
+            Some(line) => self.go_to(path.clone(), line, false, window, cx),
             None if !self.history_insert(i, window, cx) => return,
             None => {}
         }
         self.show_history = false;
+        // (A file that is gone was already noted by Insert.)
         let now = self.doc().and_then(|d| d.connection().map(str::to_string));
-        if now.as_deref() != Some(e.connection.as_str()) {
+        if path.is_file() && now.as_deref() != Some(e.connection.as_str()) {
             window.push_notification(format!("Recorded on `{}`; runs on this file's connection `{}`", e.connection, now.as_deref().unwrap_or("none")), cx);
         }
         self.run_current(window, cx);

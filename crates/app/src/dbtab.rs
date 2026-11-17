@@ -140,8 +140,8 @@ impl Siesta {
         self.insert_statement(&format!("SELECT * FROM {name};"), window, cx)
     }
 
-    /// `sql` (a `;` is added when it has none) on a new line after the statement under the cursor
-    /// of the current file, with the cursor on it. `false`: no `.sql` file is current.
+    /// `sql` (a `;` is added when it has none) after a blank line below the statement under the
+    /// cursor of the current file, with the cursor on it. `false`: no `.sql` file is current.
     pub(crate) fn insert_statement(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(ix) = self.current.filter(|&i| self.docs[i].sql) else {
             window.push_notification("Open a .sql file first", cx);
@@ -165,12 +165,17 @@ impl Siesta {
                 if !semi {
                     edits.push((end, ";".to_string()));
                 }
-                edits.push((line_end, format!("\n{sql}")));
+                // A blank line keeps it apart from the statement above.
+                edits.push((line_end, format!("\n\n{sql}")));
                 // `;` added before the new text moves it by one.
-                (edits, line_end + usize::from(!semi) + 1)
+                (edits, line_end + usize::from(!semi) + 2)
             }
             None if src.trim().is_empty() => (vec![(0, format!("{sql}\n"))], 0),
-            None => (vec![(src.len(), format!("{}{sql}", if src.ends_with('\n') { "" } else { "\n" }))], src.len() + usize::from(!src.ends_with('\n'))),
+            None => {
+                // Up to one blank line after the text that is already there.
+                let gap = "\n".repeat(2 - src.len().saturating_sub(src.trim_end_matches('\n').len()).min(2));
+                (vec![(src.len(), format!("{gap}{sql}"))], src.len() + gap.len())
+            }
         };
         // Two inserts at one position would be ambiguous: merge them.
         let mut merged: Vec<(usize, String)> = vec![];
