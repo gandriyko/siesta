@@ -143,8 +143,9 @@ pub(crate) struct Siesta {
     connections_window: Option<WindowHandle<Root>>,
     /// `~/.config/siesta`: `connections/<name>.json` live here; `None` = no connections.
     config_dir: Option<PathBuf>,
-    /// The open New / Edit connection form.
-    conn_form: Option<Entity<conn_form::ConnForm>>,
+    /// The open New / Edit connection form. Weak: the dialog owns it, so closing the dialog any way
+    /// (Esc, ×, Close) drops the form and with it a running Test.
+    conn_form: Option<WeakEntity<conn_form::ConnForm>>,
     /// Holds focus when nothing else does (no tabs), so shortcuts still reach the "Siesta" context.
     focus: FocusHandle,
     /// Theme's own monospace font, used when `font_family` is empty.
@@ -535,14 +536,28 @@ impl Siesta {
                     s
                 });
                 let subs = vec![
-                    cx.subscribe(&editor, |this, editor, ev: &InputEvent, cx| {
-                        if let (InputEvent::Change, Some(d)) = (ev, this.docs.iter_mut().find(|d| d.editor == editor)) {
-                            d.dirty = true;
-                            d.reparse(cx);
-                            // `-- @connection` may have just changed.
-                            if let Some(key) = d.schema_key() {
-                                this.load_cached_schema(&key);
+                    cx.subscribe_in(&editor, window, |this, editor, ev: &InputEvent, window, cx| {
+                        let Some(ix) = this.docs.iter().position(|d| d.editor == *editor) else { return };
+                        if !matches!(ev, InputEvent::Change) {
+                            return;
+                        }
+                        let d = &mut this.docs[ix];
+                        let before = d.connection().map(str::to_string);
+                        d.dirty = true;
+                        d.reparse(cx);
+                        // A typed `-- @connection` that names another connection acts like the picker:
+                        // the database pick resets and the schema loads.
+                        if d.connection() != before.as_deref() {
+                            let path = (*d.path).clone();
+                            if d.picked_db.take().is_some() {
+                                this.db_picks.remove(&path);
+                                this.docs[ix].reparse(cx);
+                                this.remember(cx);
                             }
+                            this.autoload_schema(&path, window, cx);
+                        }
+                        if let Some(key) = this.docs[ix].schema_key() {
+                            this.load_cached_schema(&key);
                         }
                     }),
                     // Cursor moves and scrolling only notify; re-render overlays and the active statement.
@@ -805,13 +820,7 @@ impl Siesta {
             _ => sql_split::rewrite_connection(&old, d.dialect, name),
         };
         let Some(new) = rewritten else { return };
-        let (range, text) = doc::changed(&old, &new);
-        d.editor.update(cx, |s, cx| {
-            let rope = s.text().clone();
-            let edit = lsp_types::TextEdit { range: lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end)), new_text: text };
-            s.apply_lsp_edits(&vec![edit], window, cx);
-        });
-        self.docs[ix].reparse(cx);
+        self.replace_text(ix, &old, &new, window, cx);
         // Another connection starts from its default database.
         if self.docs[ix].connection().map(str::to_string) != before {
             self.db_picks.remove(path);
@@ -820,6 +829,76 @@ impl Siesta {
             self.remember(cx);
         }
         cx.notify();
+    }
+
+    /// Turns doc `ix`'s text `old` into `new` as one undoable edit of the changed span, then re-splits.
+    fn replace_text(&mut self, ix: usize, old: &str, new: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (range, text) = doc::changed(old, new);
+        self.docs[ix].editor.update(cx, |s, cx| {
+            let rope = s.text().clone();
+            let edit = lsp_types::TextEdit { range: lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end)), new_text: text };
+            s.apply_lsp_edits(&vec![edit], window, cx);
+        });
+        self.docs[ix].reparse(cx);
+    }
+
+    /// Connection `old` was renamed to `new`: stored picks follow silently; files whose
+    /// `-- @connection old` line would now name an unknown connection are offered a rewrite
+    /// (open tabs as an undoable edit, other workspace files on disk).
+    pub(crate) fn rename_references(&mut self, old: &str, new: &str, window: &mut Window, cx: &mut Context<Self>) {
+        for pick in self.picks.values_mut().filter(|p| p.as_deref() == Some(old)) {
+            *pick = Some(new.to_string());
+        }
+        for d in self.docs.iter_mut().filter(|d| d.picked.as_deref() == Some(old)) {
+            d.picked = Some(new.to_string());
+            d.reparse(cx);
+        }
+        self.remember(cx);
+        let names = |f: &Path| f.strip_prefix(&self.root).unwrap_or(f).display().to_string();
+        let open: Vec<PathBuf> = self.docs.iter().filter(|d| d.locked() == Some(old)).map(|d| (*d.path).clone()).collect();
+        let closed: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|f| siesta_workspace::is_sql(f) && !self.docs.iter().any(|d| *d.path == **f))
+            .filter(|f| std::fs::read_to_string(f).is_ok_and(|t| sql_split::split(&t, Default::default()).connection.as_deref() == Some(old)))
+            .cloned()
+            .collect();
+        if open.is_empty() && closed.is_empty() {
+            return;
+        }
+        let list: Vec<String> = open.iter().chain(&closed).map(|f| names(f)).collect();
+        let detail = format!("These files set `-- @connection {old}`:\n{}\n\nRewrite it to `-- @connection {new}`?", list.join("\n"));
+        let answer = window.prompt(PromptLevel::Info, "Connection renamed", Some(&detail), &["Rewrite", "Leave"], cx);
+        let (old, new) = (old.to_string(), new.to_string());
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                for p in open {
+                    let Some(ix) = this.docs.iter().position(|d| *d.path == p && d.locked() == Some(old.as_str())) else { continue };
+                    let text = this.docs[ix].editor.read(cx).value().to_string();
+                    if let Some(t) = sql_split::rewrite_connection(&text, this.docs[ix].dialect, Some(&new)) {
+                        this.replace_text(ix, &text, &t, window, cx);
+                    }
+                }
+                let failed: Vec<String> = closed
+                    .iter()
+                    .filter_map(|f| {
+                        let t = std::fs::read_to_string(f).ok()?;
+                        (sql_split::split(&t, Default::default()).connection.as_deref() == Some(old.as_str())).then_some(())?;
+                        let r =sql_split::rewrite_connection(&t, Default::default(), Some(&new))?;
+                        std::fs::write(f, r).err().map(|e| format!("{}: {e}", f.display()))
+                    })
+                    .collect();
+                if !failed.is_empty() {
+                    window.push_notification(failed.join("\n"), cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The database picker's choice for the current file (`None` = the connection's default).
@@ -1008,6 +1087,19 @@ impl Siesta {
         // A directive naming a connection that does not exist: shown in red.
         let unknown = d.locked().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
+        // Nothing to pick yet: the picker becomes the way to make the first connection.
+        if names.is_empty() && !forced {
+            return Some(
+                Button::new("connection-add")
+                    .icon(IconName::Plus)
+                    .label("Add connection")
+                    .small()
+                    .primary()
+                    .tooltip("No connections yet: create one to run queries")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_conn_form(None, window, cx)))
+                    .into_any_element(),
+            );
+        }
         let conn_of = |n: &str| d.conns.connections.get(n);
         let prod = current.as_deref().and_then(conn_of).is_some_and(|c| c.prod);
         // Each connection's colour (its own, or red for prod) marks it in the picker.
@@ -2020,7 +2112,7 @@ mod tests {
                 this.open(b.clone(), None, window, cx);
             })
         });
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().expect("the form is open"));
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).expect("the form is open"));
         cx.update(|window, cx| {
             form.update(cx, |f, cx| {
                 f.name.update(cx, |s, cx| s.set_value("fresh", window, cx));
@@ -2053,10 +2145,82 @@ mod tests {
                 this.open_conn_form(Some("fresh".into()), window, cx);
             })
         });
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
         assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "127.0.0.1");
         cx.update(|window, cx| app.update(cx, |this, cx| this.connection_deleted("fresh", window, cx)));
         cx.update(|_, cx| assert!(app.read(cx).docs.iter().all(|d| d.picked.is_none())));
+    }
+
+    #[gpui::test]
+    fn typed_at_connection_resets_the_database_pick(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        let type_text = |cx: &mut VisualTestContext, text: &'static str| {
+            cx.update(|window, cx| {
+                let editor = app.read(cx).doc().unwrap().editor.clone();
+                editor.update(cx, |s, cx| {
+                    s.set_value(text, window, cx);
+                    cx.emit(gpui_component::input::InputEvent::Change); // what typing sends
+                });
+            });
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut VisualTestContext| cx.update(|_, cx| {
+            let this = app.read(cx);
+            (this.doc().unwrap().connection().map(str::to_string), this.doc().unwrap().picked_db.clone(), this.db_picks.get(&a).cloned())
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.select_connection(Some("dev".into()), window, cx);
+                this.select_database(Some("other".into()), window, cx);
+            })
+        });
+        assert_eq!(state(&mut cx), (Some("dev".into()), Some("other".into()), Some("other".into())));
+        // Same connection typed: the pick stays.
+        type_text(&mut cx, "-- @connection dev\nSELECT 1;\n");
+        assert_eq!(state(&mut cx).1.as_deref(), Some("other"));
+        type_text(&mut cx, "-- @connection my\nSELECT 1;\n");
+        assert_eq!(state(&mut cx), (Some("my".into()), None, None));
+    }
+
+    #[gpui::test]
+    fn rename_moves_picks_and_offers_to_rewrite_directives_and_closing_drops_the_form(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let (a, c, d) = (ws.path().join("a.sql"), ws.path().join("c.sql"), ws.path().join("d.sql"));
+        std::fs::write(&d, "-- @connection my\nSELECT 'd';\n").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.select_connection(Some("my".into()), window, cx);
+                this.open(c.clone(), None, window, cx);
+                this.open_conn_form_for(Some("my".into()), false, false, window, cx);
+            })
+        });
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
+        cx.update(|window, cx| {
+            form.update(cx, |f, cx| {
+                f.name.update(cx, |s, cx| s.set_value("mine", window, cx));
+                f.save(window, cx);
+            })
+        });
+        drop(form);
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Rewrite");
+        cx.run_until_parked();
+        let (picked, c_text) = cx.update(|_, cx| {
+            let this = app.read(cx);
+            let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
+            (doc(&a).picked.clone(), doc(&c).editor.read(cx).value().to_string())
+        });
+        assert_eq!(picked.as_deref(), Some("mine"));
+        assert_eq!(c_text, "-- @connection mine\nSELECT 'c';\n");
+        assert_eq!(std::fs::read_to_string(&d).unwrap(), "-- @connection mine\nSELECT 'd';\n");
+        // Esc / × close the dialog without the form's buttons: the form (and a running Test) goes with it.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("mine".into()), false, false, window, cx)));
+        cx.update(gpui_component::WindowExt::close_dialog);
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).is_none()));
     }
 
     #[gpui::test]
@@ -2070,7 +2234,7 @@ mod tests {
                 this.open_conn_form(None, window, cx);
             })
         });
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
         cx.update(|window, cx| {
             form.update(cx, |f, cx| {
                 f.name.update(cx, |s, cx| s.set_value("viaurl", window, cx));
@@ -2122,12 +2286,12 @@ mod tests {
         VisualTestContext::from_window(page.into(), tcx).run_until_parked();
         // Duplicate: a new form prefilled from `gl`, no password.
         cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), true, false, window, cx)));
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
         let f = cx.update(|_, cx| form.read(cx).collect(cx));
         assert_eq!((f.name.as_str(), f.host.as_str(), f.password.as_str(), f.has_password), ("gl-copy", "h", "", false));
         // Edit a connection the file did not pick: the pick stays; the stored password is announced, not shown.
         cx.update(|window, cx| app.update(cx, |this, cx| this.open_conn_form_for(Some("gl".into()), false, false, window, cx)));
-        let form = cx.update(|_, cx| app.read(cx).conn_form.clone().unwrap());
+        let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
         let f = cx.update(|_, cx| form.read(cx).collect(cx));
         assert_eq!((f.name.as_str(), f.password.as_str(), f.has_password), ("gl", "", true));
         cx.update(|window, cx| {

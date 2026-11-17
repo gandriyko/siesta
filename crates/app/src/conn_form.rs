@@ -190,6 +190,7 @@ impl ConnForm {
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let form = self.collect(cx);
         let name = form.name.trim().to_string();
+        let renamed = self.original.clone().filter(|o| *o != name);
         let password_error = match db_conn::save(&self.dir, &form, self.original.as_deref()) {
             Ok(e) => e,
             Err(e) => {
@@ -199,15 +200,22 @@ impl ConnForm {
         };
         if let Some(e) = password_error {
             // The file is written: a second Save is an edit of it.
-            self.original = Some(name);
+            self.original = Some(name.clone());
             self.error = Some(format!("Saved, but the password was not: {e}"));
-            self.app.update(cx, |this, cx| this.connection_changed(window, cx)).ok();
+            self.app
+                .update(cx, |this, cx| {
+                    this.connection_changed(window, cx);
+                    if let Some(old) = &renamed {
+                        this.rename_references(old, &name, window, cx);
+                    }
+                })
+                .ok();
             return cx.notify();
         }
         let target = self.target.clone();
         self.running = None;
         window.close_dialog(cx);
-        self.app.update(cx, |this, cx| this.connection_saved(target, name, window, cx)).ok();
+        self.app.update(cx, |this, cx| this.connection_saved(target, renamed, name, window, cx)).ok();
     }
 
     /// A throwaway session with the form's values; the result is shown in the form, nothing is saved.
@@ -406,7 +414,7 @@ impl Siesta {
         };
         let app = cx.entity().downgrade();
         let form = cx.new(|cx| ConnForm::new(app, dir, target, original, data, window, cx));
-        self.conn_form = Some(form.clone());
+        self.conn_form = Some(form.downgrade());
         let name_input = form.read(cx).name.clone();
         window.open_dialog(cx, move |dialog, _, _| dialog.w(px(560.)).title(title.clone()).child(form.clone()));
         name_input.update(cx, |s, cx| s.focus(window, cx));
@@ -419,11 +427,16 @@ impl Siesta {
         self.conns_seen = Some(self.conns_stamp());
     }
 
-    /// The form saved `name`: every open file sees it; only `target` (the file the form was opened for) picks it.
-    pub(crate) fn connection_saved(&mut self, target: Option<PathBuf>, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// The form saved `name` (`renamed`: it was called that before): every open file sees it; only
+    /// `target` (the file the form was opened for) picks it.
+    pub(crate) fn connection_saved(&mut self, target: Option<PathBuf>, renamed: Option<String>, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.connection_changed(window, cx);
         // The next run reconnects with the saved values and password.
         self.close_connection_sessions(&name);
+        if let Some(old) = &renamed {
+            self.close_connection_sessions(old);
+            self.rename_references(old, &name, window, cx);
+        }
         if let Some(target) = target {
             self.pick_for(&target, Some(name), window, cx);
         }

@@ -282,6 +282,26 @@ impl Siesta {
     pub(crate) fn db_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let note = |text: String| div().flex_1().px_3().pt_2().text_sm().text_color(muted).child(text).into_any_element();
+        if self.conns.connections.is_empty() {
+            // First run: say so and offer the form right here (any file picks it up from the picker).
+            let add = Button::new("db-add-connection")
+                .icon(IconName::Plus)
+                .label("Add connection")
+                .small()
+                .primary()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let pick = this.doc().is_some_and(|d| d.sql);
+                    this.open_conn_form_for(None, false, pick, window, cx)
+                }));
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(note("No connections yet. Add one (Postgres or MySQL / MariaDB) to run queries and browse its schema.".into()))
+                .child(div().px_3().flex().child(add))
+                .into_any_element();
+        }
         let Some(d) = self.doc().filter(|d| d.sql) else { return note("Open a .sql file to see its connection's schema".into()) };
         let Some(conn) = d.connection().map(str::to_string) else {
             let new = Button::new("db-new-connection").label("New connection…").small().on_click(cx.listener(|this, _, window, cx| this.open_conn_form(None, window, cx)));
