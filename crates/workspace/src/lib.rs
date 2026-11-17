@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// `~/.siesta`
+/// `~/.siesta`: what Siesta writes itself (state, history, schema cache), apart from the
+/// user-edited config in `~/.config/siesta`.
 pub fn base_dir() -> Option<PathBuf> {
     Some(std::env::home_dir()?.join(".siesta"))
 }
@@ -17,15 +18,25 @@ pub fn is_sql(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql"))
 }
 
-/// `.sql` files under `root` (every file with `all`), respecting `.gitignore`.
-pub fn scan(root: &Path, all: bool) -> Vec<PathBuf> {
+/// The folder relative paths are counted from: the workspace folder, or the folder of a
+/// single-file workspace.
+pub fn folder(root: &Path) -> &Path {
+    if root.is_file() { root.parent().unwrap_or(root) } else { root }
+}
+
+/// `.sql` files under `root` (nothing else is shown: configuration lives outside the project),
+/// respecting `.gitignore`. A single-file workspace (`root` is a file) has just that file.
+pub fn scan(root: &Path) -> Vec<PathBuf> {
+    if !root.is_dir() {
+        return [root.to_path_buf()].into_iter().filter(|p| p.is_file() && is_sql(p)).collect();
+    }
     // ponytail: depth cap guards against a root like $HOME; raise if real projects nest deeper.
     let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .max_depth(Some(8))
         .build()
         .flatten()
         .map(|e| e.into_path())
-        .filter(|p| p.is_file() && (all || is_sql(p)))
+        .filter(|p| p.is_file() && is_sql(p))
         .collect();
     files.sort();
     files
@@ -69,8 +80,14 @@ pub fn save_state(base: &Path, root: &Path, state: &WorkspaceState) {
     if !all["workspaces"].is_object() {
         all["workspaces"] = serde_json::json!({});
     }
-    all["workspaces"][root.to_string_lossy().as_ref()] = serde_json::to_value(state).unwrap_or_default();
-    all["last"] = root.to_string_lossy().into();
+    let key = root.to_string_lossy().into_owned();
+    all["workspaces"][key.as_str()] = serde_json::to_value(state).unwrap_or_default();
+    all["last"] = key.clone().into();
+    // Newest first, without repeats.
+    let mut recent: Vec<String> = all["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).filter(|r| *r != key).map(str::to_string).collect();
+    recent.insert(0, key);
+    recent.truncate(RECENT);
+    all["recent"] = recent.into();
     let write = std::fs::create_dir_all(base).and_then(|()| {
         let tmp = base.join("state.json.tmp");
         std::fs::write(&tmp, all.to_string())?;
@@ -81,10 +98,22 @@ pub fn save_state(base: &Path, root: &Path, state: &WorkspaceState) {
     }
 }
 
-/// The workspace used last, if it still exists: a plain launch reopens it.
+/// How many workspaces `recent` keeps.
+const RECENT: usize = 10;
+
+/// Workspaces (folders and single files) opened before, newest first, that still exist. A state
+/// written before the list existed gives its known workspaces instead.
+pub fn recent(base: &Path) -> Vec<PathBuf> {
+    let all = read(base);
+    let listed: Vec<PathBuf> = all["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(PathBuf::from).collect();
+    let paths = if listed.is_empty() { all["workspaces"].as_object().into_iter().flat_map(|m| m.keys()).map(PathBuf::from).collect() } else { listed };
+    paths.into_iter().filter(|p| p.exists()).collect()
+}
+
+/// The workspace used last (a folder, or a single file), if it still exists: a plain launch reopens it.
 pub fn last_root(base: &Path) -> Option<PathBuf> {
     let root = PathBuf::from(read(base)["last"].as_str()?);
-    root.is_dir().then_some(root)
+    root.exists().then_some(root)
 }
 
 #[cfg(test)]
@@ -103,9 +132,12 @@ mod tests {
         }
         std::fs::write(r.join(".gitignore"), "ignored/\n").unwrap();
         std::fs::create_dir(r.join(".git")).unwrap(); // .gitignore applies inside a git repo
-        let rel = |all| -> Vec<String> { scan(r, all).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect() };
-        assert_eq!(rel(false), ["a.sql", "api/v2/b.SQL"]);
-        assert!(rel(true).contains(&"api/notes.txt".to_string()) && rel(true).contains(&"package.json".to_string()));
+        let rel: Vec<String> = scan(r).iter().map(|p| p.strip_prefix(r).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(rel, ["a.sql", "api/v2/b.SQL"]);
+        // A single-file workspace: that file alone, paths relative to its folder.
+        assert_eq!(scan(&r.join("api/v2/b.SQL")), [r.join("api/v2/b.SQL")]);
+        assert!(scan(&r.join("api/notes.txt")).is_empty());
+        assert_eq!((folder(&r.join("a.sql")), folder(r)), (r, r));
     }
 
     #[test]
@@ -127,5 +159,18 @@ mod tests {
         save_state(base.path(), other.path(), &WorkspaceState::default());
         assert_eq!(load_state(base.path(), root.path()), st);
         assert_eq!(last_root(base.path()).as_deref(), Some(other.path()));
+        // Recent: newest first, no repeats, gone paths skipped.
+        save_state(base.path(), root.path(), &st);
+        assert_eq!(recent(base.path()), [root.path(), other.path()]);
+        drop(other);
+        assert_eq!(recent(base.path()), [root.path()]);
+    }
+
+    #[test]
+    fn recent_falls_back_to_known_workspaces() {
+        let (base, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let key = root.path().to_string_lossy().into_owned();
+        std::fs::write(base.path().join("state.json"), serde_json::json!({"workspaces": {key: {}}}).to_string()).unwrap();
+        assert_eq!(recent(base.path()), [root.path()]);
     }
 }

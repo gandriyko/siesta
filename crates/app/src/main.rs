@@ -46,7 +46,7 @@ use siesta_workspace::{OpenFile, WorkspaceState};
 actions!(
     siesta,
     [
-        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, OpenFolder, Quit,
+        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, OpenFolder, OpenSingleFile, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
         NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
@@ -87,13 +87,14 @@ pub(crate) struct Siesta {
     root: PathBuf,
     /// The connections of the config dir, shared by every open file.
     conns: Arc<Connections>,
-    /// Where `state.json` lives (`~/.siesta`); `None` = nothing is saved.
+    /// Where `state.json`, history and the schema cache live (`~/.siesta`); `None` = nothing is saved.
     base: Option<PathBuf>,
     docs: Vec<Doc>,
     current: Option<usize>,
-    /// The workspace's files (`.sql` and connection files, or all of them).
+    /// The workspace's `.sql` files (nothing else is shown).
     files: Vec<PathBuf>,
-    show_all_files: bool,
+    /// Workspaces opened before (newest first), offered when this one has no `.sql` files.
+    recent: Vec<PathBuf>,
     side_tab: SideTab,
     /// Expanded files in the sidebar.
     expanded: HashSet<PathBuf>,
@@ -160,6 +161,12 @@ pub(crate) struct Siesta {
     /// Theme's own monospace font, used when `font_family` is empty.
     default_mono: SharedString,
     _subs: Vec<Subscription>,
+}
+
+/// Global settings with the workspace's `.siesta/settings.json` over them; a single-file
+/// workspace has global settings only.
+fn workspace_settings(root: &Path) -> siesta_settings::Loaded {
+    siesta_settings::Loaded::load(Some(root).filter(|r| r.is_dir()))
 }
 
 /// `path` or `path:line` (1-based). A real file named `a:3` wins over the suffix.
@@ -269,7 +276,7 @@ impl Siesta {
             docs: vec![],
             current: None,
             files: vec![],
-            show_all_files: false,
+            recent: vec![],
             side_tab: SideTab::Files,
             expanded: HashSet::new(),
             outlines: HashMap::new(),
@@ -320,6 +327,8 @@ impl Siesta {
     fn load_workspace(&mut self, open: Option<(PathBuf, Option<u32>)>, window: &mut Window, cx: &mut Context<Self>) {
         self.expanded = HashSet::new();
         self.rescan();
+        let root = self.root.clone();
+        self.recent = self.base.as_deref().map(siesta_workspace::recent).unwrap_or_default().into_iter().filter(|p| *p != root).collect();
         let state = self.base.as_deref().map(|b| siesta_workspace::load_state(b, &self.root)).unwrap_or_default();
         self.picks = state.connections;
         self.db_picks = state.databases;
@@ -342,7 +351,7 @@ impl Siesta {
                 let first = self.files.iter().find(|f| siesta_workspace::is_sql(f)).cloned();
                 match first {
                     Some(path) => self.open(path, None, window, cx),
-                    None => self.open(self.root.join("untitled.sql"), Some(SAMPLE.into()), window, cx),
+                    None => self.open(self.folder().join("untitled.sql"), Some(SAMPLE.into()), window, cx),
                 };
             }
             None => {}
@@ -350,13 +359,12 @@ impl Siesta {
     }
 
     fn rescan(&mut self) {
-        self.files = siesta_workspace::scan(&self.root, self.show_all_files);
+        self.files = siesta_workspace::scan(&self.root);
     }
 
-    pub(crate) fn toggle_all_files(&mut self, cx: &mut Context<Self>) {
-        self.show_all_files = !self.show_all_files;
-        self.rescan();
-        cx.notify();
+    /// The folder relative paths count from: the workspace folder, or the single file's folder.
+    pub(crate) fn folder(&self) -> &Path {
+        siesta_workspace::folder(&self.root)
     }
 
     /// Cmd+O: pick another workspace folder. Refused while there are unsaved files.
@@ -370,9 +378,22 @@ impl Siesta {
         .detach();
     }
 
+    /// File → Open File…: one `.sql` file alone becomes the workspace (its state and history are
+    /// kept under the file's own path). Refused while there are unsaved files.
+    pub(crate) fn open_single_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Open File".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(file) = paths.into_iter().next() else { return };
+            this.update_in(cx, |this, window, cx| this.set_root(file, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Switch the workspace to `root`: a folder, or a single file.
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.docs.iter().any(|d| d.dirty) {
-            window.push_notification("Save or close the unsaved files before opening another folder", cx);
+            window.push_notification("Save or close the unsaved files before opening another workspace", cx);
             return;
         }
         self.remember(cx);
@@ -382,7 +403,7 @@ impl Siesta {
         self.outlines.clear();
         self.collapsed_dirs.clear();
         self.conns_seen = None;
-        self.settings = siesta_settings::Loaded::load(Some(&root));
+        self.settings = workspace_settings(&root);
         for e in &self.settings.errors {
             window.push_notification(format!("Settings: {e}"), cx);
         }
@@ -879,7 +900,7 @@ impl Siesta {
             d.reparse(cx);
         }
         self.remember(cx);
-        let names = |f: &Path| f.strip_prefix(&self.root).unwrap_or(f).display().to_string();
+        let names = |f: &Path| f.strip_prefix(self.folder()).unwrap_or(f).display().to_string();
         let open: Vec<PathBuf> = self.docs.iter().filter(|d| d.locked() == Some(old)).map(|d| (*d.path).clone()).collect();
         let closed: Vec<PathBuf> = self
             .files
@@ -1448,6 +1469,7 @@ impl Render for Siesta {
                 }
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_folder(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSingleFile, window, cx| this.open_single_file(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &OpenConnections, window, cx| this.open_connections(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
@@ -1487,6 +1509,7 @@ fn set_menus(cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Open File…", OpenSingleFile),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Close Tab", CloseTab),
@@ -1557,6 +1580,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Save", Box::new(SaveFile)),
         ("Close Tab", Box::new(CloseTab)),
         ("Open Folder…", Box::new(OpenFolder)),
+        ("Open File…", Box::new(OpenSingleFile)),
         ("Settings…", Box::new(OpenSettings)),
         ("Connections", Box::new(OpenConnections)),
         ("Quit Siesta", Box::new(Quit)),
@@ -1576,7 +1600,8 @@ fn main() -> std::process::ExitCode {
     let base = siesta_workspace::base_dir();
     let (root, open) = match target.map(|t| parse_target(&t)).map(|(p, l)| (std::path::absolute(&p).unwrap_or_else(|_| cwd.join(&p)), l)) {
         Some((p, _)) if p.is_dir() => (p, None),
-        Some((p, line)) => (db_conn::workspace_root(&p), Some((p, line))),
+        // A file opens alone (a single-file workspace), not its repository.
+        Some((p, line)) => (p.clone(), Some((p, line))),
         // No target: the last workspace, else a scratch one (cwd is `/` from Finder, `target/…` from cargo).
         None => {
             let root = base.as_deref().and_then(siesta_workspace::last_root).or_else(|| base.as_ref().map(|b| b.join("workspace")));
@@ -1600,7 +1625,7 @@ fn main() -> std::process::ExitCode {
         let mut view = None;
         let handle = cx
             .open_window(options, |window, cx| {
-                let settings = siesta_settings::Loaded::load(Some(&root));
+                let settings = workspace_settings(&root);
                 let v = cx.new(|cx| Siesta::new(root, open, base, settings, db_conn::global_dir(), window, cx));
                 v.update(cx, |this, cx| this.start_watch(window, cx));
                 view = Some(v.downgrade());
@@ -2185,6 +2210,59 @@ mod tests {
         assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "127.0.0.1");
         cx.update(|window, cx| app.update(cx, |this, cx| this.connection_deleted("fresh", window, cx)));
         cx.update(|_, cx| assert!(app.read(cx).docs.iter().all(|d| d.picked.is_none())));
+    }
+
+    #[gpui::test]
+    fn a_single_file_is_a_workspace_of_its_own(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let b = ws.path().join("b.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), None);
+        cx.update(|window, cx| app.update(cx, |this, cx| this.set_root(b.clone(), window, cx)));
+        let (files, tabs) = cx.update(|_, cx| {
+            let this = app.read(cx);
+            (this.files.clone(), this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>())
+        });
+        assert_eq!((files, tabs), (vec![b.clone()], vec![b.clone()]));
+        // History: its own project, paths relative to the file's folder.
+        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&b, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'b'".into(), ..Default::default() }], cx)));
+        cx.run_until_parked();
+        let store = db_exec::history::Store::open(base.path(), &b).unwrap();
+        assert!(store.dir().ends_with("history/b_sql"));
+        assert_eq!(store.list()[0].file, "b.sql");
+        // State is kept under the file's own path, and a plain launch reopens it.
+        cx.update(|_, cx| app.read(cx).remember(cx));
+        assert_eq!(siesta_workspace::load_state(base.path(), &b).current, Some(b.clone()));
+        assert_eq!(siesta_workspace::last_root(base.path()), Some(b));
+    }
+
+    #[gpui::test]
+    fn clicking_a_column_adds_it_to_the_select_under_the_cursor(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("b.sql")));
+        let set = |cx: &mut VisualTestContext, text: &'static str| {
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.docs[0].editor.update(cx, |s, cx| {
+                        s.set_value(text, window, cx);
+                        s.set_cursor_position(gpui_component::input::Position::new(0, 0), window, cx);
+                    });
+                    this.docs[0].reparse(cx);
+                })
+            })
+        };
+        let click = |cx: &mut VisualTestContext, col: &'static str| {
+            cx.update(|window, cx| app.update(cx, |this, cx| this.add_column(col, window, cx)));
+            text_of(&app, cx)
+        };
+        set(&mut cx, "SELECT * FROM t;\n");
+        assert_eq!(click(&mut cx, "id"), "SELECT id FROM t;\n");
+        assert_eq!(click(&mut cx, "kind"), "SELECT id, kind FROM t;\n");
+        assert_eq!(click(&mut cx, "id"), "SELECT id, kind FROM t;\n"); // already there
+        assert_eq!(click(&mut cx, "Created At"), "SELECT id, kind, \"Created At\" FROM t;\n");
+        // Not a SELECT: the name goes at the cursor.
+        set(&mut cx, "UPDATE t SET  = 1;\n");
+        cx.update(|window, cx| app.update(cx, |this, cx| this.docs[0].editor.update(cx, |s, cx| s.set_cursor_position(gpui_component::input::Position::new(0, 13), window, cx))));
+        assert_eq!(click(&mut cx, "kind"), "UPDATE t SET kind = 1;\n");
     }
 
     #[gpui::test]

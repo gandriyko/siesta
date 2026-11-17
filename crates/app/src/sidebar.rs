@@ -13,8 +13,11 @@ use std::{
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
+    button::Button,
+    h_flex,
     input::Input,
     tab::{Tab, TabBar},
+    v_flex,
 };
 
 use crate::{Siesta, SideTab};
@@ -131,6 +134,50 @@ impl Siesta {
         if !self.collapsed_dirs.remove(path) {
             self.collapsed_dirs.insert(path.to_path_buf());
         }
+    }
+
+    /// No `.sql` files here (a first launch, or the last workspace is gone): ways out, and the
+    /// workspaces opened before.
+    fn empty_files(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme();
+        let (muted, hover) = (t.muted_foreground, t.list_hover);
+        let recent = self.recent.iter().enumerate().map(|(i, p)| {
+            let file = p.is_file();
+            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            let path = p.clone();
+            div()
+                .id(("recent", i))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(if file { IconName::File } else { IconName::Folder }).size_3p5().flex_none().text_color(muted))
+                .child(v_flex().min_w_0().child(div().text_sm().truncate().child(name)).child(div().text_xs().text_color(muted).truncate().child(dir)))
+                .on_click(cx.listener(move |this, _, window, cx| this.set_root(path.clone(), window, cx)))
+        });
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .px_2()
+            .gap_2()
+            .child(div().px_1().text_sm().text_color(muted).child("No .sql files here."))
+            .child(
+                h_flex()
+                    .px_1()
+                    .gap_2()
+                    .child(Button::new("empty-open-folder").label("Open Folder…").small().on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))))
+                    .child(Button::new("empty-open-file").label("Open File…").small().on_click(cx.listener(|this, _, window, cx| this.open_single_file(window, cx)))),
+            )
+            .when(!self.recent.is_empty(), |el| {
+                el.child(div().px_1().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("RECENT"))
+                    .child(div().id("recent-list").flex_1().min_h_0().overflow_y_scroll().children(recent))
+            })
+            .into_any_element()
     }
 
     pub(crate) fn build_rows(&mut self, query: &str, cx: &App) -> Vec<Row> {
@@ -324,7 +371,6 @@ impl Siesta {
             }))
             .child(Tab::new().label("Files"))
             .child(Tab::new().label("DB"));
-        let all = self.show_all_files;
         let header = div()
             .flex_none()
             .h(px(36.))
@@ -335,11 +381,7 @@ impl Siesta {
             .gap_2()
             .child(tabs)
             .child(div().flex().items_center().when(self.side_tab == SideTab::Files, |el| {
-                el.child(
-                    icon_button("all-files", if all { IconName::Eye } else { IconName::EyeOff })
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_all_files(cx))),
-                )
-                .child(icon_button("open-folder", IconName::FolderOpen).on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))))
+                el.child(icon_button("open-folder", IconName::FolderOpen).on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))))
             }));
         let body = match self.side_tab {
             SideTab::Files => {
@@ -380,7 +422,7 @@ impl Siesta {
                             .child(root_name.to_uppercase()),
                     )
                     .child(search)
-                    .child(div().flex_1().min_h_0().child(list.size_full()))
+                    .child(if self.files.is_empty() { self.empty_files(cx) } else { div().flex_1().min_h_0().child(list.size_full()).into_any_element() })
                     .into_any_element()
             }
             SideTab::Db => self.db_body(cx),

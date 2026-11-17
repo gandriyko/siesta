@@ -65,7 +65,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// `base` is `~/.siesta`; `root` is the workspace root (its folder name names the project).
+    /// `base` is `~/.siesta`; `root` is the workspace root (its folder name names the project), or
+    /// the file of a single-file workspace (its file name does).
     pub fn open(base: &Path, root: &Path) -> io::Result<Self> {
         let dir = base.join("history").join(project_name(base, root)?);
         std::fs::create_dir_all(&dir)?;
@@ -90,7 +91,9 @@ impl Store {
         }
         entry.id = id.clone();
         entry.time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        entry.file = file.strip_prefix(&self.root).unwrap_or(file).to_string_lossy().into_owned();
+        // A single-file workspace (`root` is the file) counts from the file's folder.
+        let folder = if self.root.is_file() { self.root.parent().unwrap_or(&self.root) } else { &self.root };
+        entry.file = file.strip_prefix(folder).unwrap_or(file).to_string_lossy().into_owned();
         std::fs::write(self.dir.join(format!("{id}.json")), serde_json::to_vec_pretty(&entry).map_err(io::Error::other)?)?;
         // Prune by file name: no entry needs reading.
         for old in self.ids().into_iter().skip(self.total.max(1)) {

@@ -146,7 +146,7 @@ impl Siesta {
                 let path = f.clone();
                 Item {
                     label: f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                    detail: f.strip_prefix(&self.root).unwrap_or(f).parent().map(|d| d.display().to_string()).unwrap_or_default(),
+                    detail: f.strip_prefix(self.folder()).unwrap_or(f).parent().map(|d| d.display().to_string()).unwrap_or_default(),
                     run: Rc::new(move |this, window, cx| {
                         this.open(path.clone(), None, window, cx);
                     }),
@@ -180,7 +180,7 @@ impl Siesta {
         let mut items = vec![];
         for f in self.files.clone().into_iter().filter(|f| siesta_workspace::is_sql(f)) {
             let outline = self.outline_of(&f, cx);
-            let rel = f.strip_prefix(&self.root).unwrap_or(&f).display().to_string();
+            let rel = f.strip_prefix(self.folder()).unwrap_or(&f).display().to_string();
             for (line, label) in outline {
                 let path = f.clone();
                 items.push(Item {
@@ -248,7 +248,7 @@ impl Siesta {
     pub(crate) fn breadcrumbs(&self, cx: &App) -> Option<impl IntoElement> {
         let d = self.doc()?;
         let mut parts: Vec<String> = vec![];
-        match d.path.strip_prefix(&self.root) {
+        match d.path.strip_prefix(self.folder()) {
             Ok(rel) => parts.extend(rel.iter().map(|c| c.to_string_lossy().into_owned())),
             Err(_) => parts.push(d.name()),
         }

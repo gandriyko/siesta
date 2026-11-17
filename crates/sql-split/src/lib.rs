@@ -521,6 +521,26 @@ pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
     }
 }
 
+/// Byte range in `text` (one statement) of the select list of a plain `SELECT`: after `SELECT`
+/// (and `DISTINCT` / `ALL`) up to the top-level clause that ends it (`FROM`, `WHERE`, …) or the
+/// end, without surrounding whitespace (empty when the list is). `None` for any other statement.
+pub fn select_list(text: &str, dialect: Dialect) -> Option<Range<usize>> {
+    let (_, all) = split_words(text, dialect, true);
+    // Words are slices of `text`: their offsets come from the pointers.
+    let off = |w: &str| w.as_ptr() as usize - text.as_ptr() as usize;
+    let top: Vec<&str> = all.first()?.iter().filter(|(d, _)| *d == 0).map(|(_, w)| *w).collect();
+    if !is(top.first()?, &["select"]) {
+        return None;
+    }
+    let lead = 1 + usize::from(top.get(1).is_some_and(|w| is(w, &["distinct", "all"])));
+    let start = off(top[lead - 1]) + top[lead - 1].len();
+    let ends = ["from", "into", "where", "group", "having", "window", "order", "limit", "offset", "fetch", "for", "union", "intersect", "except", "lock"];
+    let end = top[lead..].iter().find(|w| is(w, &ends)).map_or(text.len(), |w| off(w));
+    let list = &text[start..end];
+    let stop = start + list.trim_end().len();
+    Some((start + list.len() - list.trim_start().len()).min(stop)..stop)
+}
+
 fn reason(words: &[(u32, &str)]) -> Option<&'static str> {
     let &(_, first) = words.first()?;
     if let Some((inner, runs)) = explain_inner(words) {
@@ -836,6 +856,22 @@ mod tests {
             ]
         );
         assert!(split("DROP TABLE t; EXPLAIN DELETE FROM t", PG).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn select_lists() {
+        fn list(s: &str) -> Option<&str> {
+            select_list(s, PG).map(|r| &s[r])
+        }
+        assert_eq!(list("SELECT * FROM t"), Some("*"));
+        assert_eq!(list("select distinct a, b\n  from t where x"), Some("a, b"));
+        // A FROM inside parentheses or a string is not the end.
+        assert_eq!(list("SELECT (SELECT max(x) FROM u) AS m, 'from' FROM t"), Some("(SELECT max(x) FROM u) AS m, 'from'"));
+        assert_eq!(list("SELECT 1"), Some("1"));
+        assert_eq!(list("SELECT "), Some(""));
+        assert_eq!(list("SELECT a ORDER BY a"), Some("a"));
+        assert_eq!(list("UPDATE t SET a = 1"), None);
+        assert_eq!(list("WITH x AS (SELECT 1) SELECT * FROM x"), None);
     }
 
     #[test]

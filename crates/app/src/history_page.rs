@@ -88,7 +88,7 @@ impl Siesta {
     /// note when that one is on another connection. The page closes.
     pub(crate) fn history_insert(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let e = self.history[i].clone();
-        let path = self.root.join(&e.file);
+        let path = self.folder().join(&e.file);
         if !(path.is_file() && self.open(path, None, window, cx).is_some()) {
             let now = self.doc().filter(|d| d.sql).map(|d| d.connection().map(str::to_string));
             if let Some(now) = now.filter(|n| n.as_deref() != Some(e.connection.as_str())) {
@@ -107,7 +107,7 @@ impl Siesta {
     /// connection decides, as for any run), else inserted as Insert does and run there.
     fn history_run(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let e = self.history[i].clone();
-        let path = self.root.join(&e.file);
+        let path = self.folder().join(&e.file);
         // The recorded file becomes the current one (when it exists), so a missing statement is inserted there.
         let line = path.is_file().then(|| self.open(path.clone(), None, window, cx)).flatten().and_then(|ix| {
             let d = &self.docs[ix];

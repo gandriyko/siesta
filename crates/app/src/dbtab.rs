@@ -205,16 +205,50 @@ impl Siesta {
 
     /// "Insert name": the table's name replaces the selection (or goes at the cursor).
     pub(crate) fn insert_name(&mut self, schema: &str, table: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.current.filter(|&i| self.docs[i].sql) else { return window.push_notification("Open a .sql file first", cx) };
         let Some(name) = self.table_sql(schema, table) else { return };
+        self.replace_selection(&name, window, cx);
+    }
+
+    /// `text` replaces the selection of the current file (or goes at the cursor).
+    fn replace_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.current.filter(|&i| self.docs[i].sql) else { return window.push_notification("Open a .sql file first", cx) };
+        let text = text.to_string();
         self.docs[ix].editor.update(cx, |s, cx| {
             let (rope, sel) = (s.text().clone(), s.selected_range());
             let range = lsp_types::Range::new(rope.offset_to_position(sel.start), rope.offset_to_position(sel.end));
-            s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: name.clone() }], window, cx);
-            let p = s.text().offset_to_position(sel.start + name.len());
+            s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text.clone() }], window, cx);
+            let p = s.text().offset_to_position(sel.start + text.len());
             s.set_cursor_position(Position::new(p.line, p.character), window, cx);
             s.focus(window, cx);
         });
+    }
+
+    /// A double click on a column: added to the select list of the `SELECT` under the cursor (`*` becomes
+    /// the column; otherwise `, column` goes at the end of the list). Any other statement, or none:
+    /// the name goes at the cursor. A column already in the list is not added twice.
+    pub(crate) fn add_column(&mut self, column: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.current.filter(|&i| self.docs[i].sql) else { return window.push_notification("Open a .sql file first", cx) };
+        let d = &self.docs[ix];
+        let name = crate::complete::ident(d.dialect, column);
+        let src = d.editor.read(cx).value().to_string();
+        let target = d.active_statement().and_then(|st| sql_split::select_list(st.text(&src), d.dialect).map(|r| (st.range.start + r.start)..(st.range.start + r.end)));
+        let Some(list) = target else { return self.replace_selection(&name, window, cx) };
+        let current = &src[list.clone()];
+        if current.split(',').any(|item| item.trim() == name) {
+            return;
+        }
+        let (range, text) = match current {
+            "*" => (list.clone(), name.clone()),
+            // An empty list sits right after `SELECT`.
+            "" => (list.clone(), format!(" {name}")),
+            _ => (list.end..list.end, format!(", {name}")),
+        };
+        self.docs[ix].editor.update(cx, |s, cx| {
+            let rope = s.text().clone();
+            let edit = lsp_types::TextEdit { range: lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end)), new_text: text };
+            s.apply_lsp_edits(&vec![edit], window, cx);
+        });
+        self.docs[ix].reparse(cx);
     }
 
     fn render_db_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -276,7 +310,15 @@ impl Siesta {
                     .into_any_element()
             }
             DbRow::Column { name, ty, pk, not_null } => base
-                .cursor_default()
+                .on_click({
+                    let name = name.clone();
+                    // Only a double click adds it; a single click does nothing.
+                    cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                        if ev.click_count() >= 2 {
+                            this.add_column(&name, window, cx);
+                        }
+                    })
+                })
                 .child(spacer())
                 .child(div().flex_1().truncate().child(name.clone()))
                 .child(div().flex_none().text_xs().text_color(muted).truncate().max_w(px(90.)).child(ty.clone()))

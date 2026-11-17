@@ -80,7 +80,7 @@ You need a recent stable Rust toolchain (edition 2024).
 
 ## Desktop app
 
-Run `siesta` to reopen the last folder, or `siesta path/to/dir` / `siesta file.sql:12` to open a folder or a file at a line.
+Run `siesta path/to/dir` (or <kbd>⌘</kbd> <kbd>O</kbd>) to open a folder of `.sql` files. `siesta report.sql:12` (or **File → Open File…**) opens just that one file, at a line, with its own state and history. A plain `siesta` reopens whatever was open last.
 
 | Shortcut | Action |
 |---|---|
