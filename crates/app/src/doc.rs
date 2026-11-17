@@ -205,6 +205,70 @@ impl Doc {
         .absolute()
         .inset_0()
     }
+
+    /// A green ▶ in the gutter at each visible statement's first line, right of its number (a red ■
+    /// while it runs; setting `editor.run_button`). Painted over the editor at paint time from the
+    /// layout just made, so it follows edits, wrapping, folding and scrolling. A click runs (or
+    /// stops) that statement. Copied from Respite's `Doc::send_buttons`.
+    pub fn run_buttons(&self, running: Vec<usize>, view: WeakEntity<crate::Siesta>) -> impl IntoElement {
+        let (editor, path) = (self.editor.clone(), self.path.clone());
+        let starts: Vec<usize> = self.file.statements.iter().map(|s| s.range.start).collect();
+        canvas(
+            move |bounds, window, cx| {
+                let s = editor.read(cx);
+                let Some(vis) = s.visible_row_range() else { return vec![] };
+                let (text, map) = (s.text(), s.display_map());
+                let mut out = vec![];
+                for &start in &starts {
+                    let row = text.offset_to_position(start).line as usize;
+                    if map.is_buffer_line_hidden(row) || !vis.contains(&map.buffer_line_to_display_row(row)) {
+                        continue;
+                    }
+                    let line_start = text.line_start_offset(row);
+                    let Some(at) = s.range_to_bounds(&(line_start..line_start)) else { continue };
+                    // A square as tall as the line, ending just before the text: right of the number.
+                    let side = at.size.height;
+                    let rect = Bounds::new(point((at.left() - side - px(2.)).max(bounds.left()), at.top()), size(side, side));
+                    if rect.top() < bounds.top() || rect.bottom() > bounds.bottom() {
+                        continue;
+                    }
+                    let hitbox = window.insert_hitbox(rect, HitboxBehavior::BlockMouseExceptScroll);
+                    out.push((rect, hitbox, row + 1, running.contains(&start)));
+                }
+                out
+            },
+            move |_, buttons, window, cx| {
+                for (rect, hitbox, line, busy) in buttons {
+                    paint_arrow(busy, hitbox.is_hovered(window), rect, window, cx);
+                    window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                    let (view, path) = (view.clone(), path.clone());
+                    window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && e.button == MouseButton::Left && hitbox.is_hovered(window) {
+                            cx.stop_propagation();
+                            view.update(cx, |this, cx| this.run_or_stop(&path, line, busy, window, cx)).ok();
+                        }
+                    });
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+}
+
+/// A green ▶ (red ■ while running) in the gutter, at the statement's first line.
+fn paint_arrow(busy: bool, hover: bool, rect: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let t = cx.theme();
+    let color = if busy { t.danger } else { t.success };
+    if hover {
+        window.paint_quad(fill(rect, t.list_hover).corner_radii(px(4.)));
+    }
+    let font = window.text_style().font();
+    let label = if busy { "■" } else { "▶" };
+    let run = TextRun { len: label.len(), font, color, background_color: None, underline: None, strikethrough: None };
+    let s = window.text_system().shape_line(SharedString::from(label), t.font_size * 1.15, &[run], None);
+    let at = point(rect.left() + (rect.size.width - s.width) / 2., rect.top());
+    let _ = s.paint(at, rect.size.height, TextAlign::Left, None, window, cx);
 }
 
 /// Editor underline for a splitter finding.

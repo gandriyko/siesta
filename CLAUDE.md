@@ -18,5 +18,6 @@ themes, state restore, `.app` bundle, CLI, agent skill). Treat it as the referen
 - Respite's `CLAUDE.md` rules apply here too: same pinned `gpui-pre` / `gpui-component` versions,
   never patch third-party crates, icons via `IconName` or a copied Lucide SVG, icon size from the UI font,
   snake_case in `settings.json`, the agent skill (`skills/siesta/SKILL.md`) updated with every CLI change.
-- The editor stays plain text: no ▶ buttons, CodeLens or inline statuses in editor lines.
+- The editor stays plain text: no CodeLens or inline statuses in editor lines. The only button is
+  Respite's gutter ▶ next to the line number (`editor.run_button`), never in the text.
 - UI text is English.

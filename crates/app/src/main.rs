@@ -759,6 +759,25 @@ impl Siesta {
         }
     }
 
+    /// The ▶ in the gutter (`Doc::run_buttons`): run the statement at `line`, or stop the file's run.
+    pub(crate) fn run_or_stop(&mut self, path: &Path, line: usize, busy: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if busy {
+            return self.cancel_run(window, cx);
+        }
+        self.go_to(path.to_path_buf(), line, true, window, cx);
+    }
+
+    /// Statement start offsets of the current file that are running now (their ▶ shows ■).
+    fn running_starts(&self, cx: &App) -> Vec<usize> {
+        let Some(d) = self.doc() else { return vec![] };
+        let texts: Vec<&str> = self.store.entries.iter().filter(|(k, e)| k.0 == *d.path && e.running.is_some()).map(|(k, _)| k.1.as_str()).collect();
+        if texts.is_empty() {
+            return vec![];
+        }
+        let src = d.editor.read(cx).value();
+        d.file.statements.iter().filter(|s| texts.contains(&s.text(&src))).map(|s| s.range.start).collect()
+    }
+
     /// A click on a statement row in the tree: one click jumps, a double click jumps and runs.
     pub(crate) fn click_statement(&mut self, path: PathBuf, line: usize, clicks: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.go_to(path, line, clicks >= 2, window, cx);
@@ -1191,7 +1210,13 @@ impl Siesta {
             return card(focused, cx).child(page).into_any_element();
         }
         let body = match self.doc() {
-            Some(d) => div().flex_1().min_h_0().relative().child(Editor::new(&d.editor).size_full()).child(d.statement_tint()),
+            Some(d) => div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(Editor::new(&d.editor).size_full())
+                .child(d.statement_tint())
+                .when(d.sql && self.settings.settings.editor.run_button, |el| el.child(d.run_buttons(self.running_starts(cx), cx.entity().downgrade()))),
             None => div()
                 .flex_1()
                 .flex()

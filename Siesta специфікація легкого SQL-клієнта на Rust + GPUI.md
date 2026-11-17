@@ -166,6 +166,7 @@ Nov 16, 2026 · @Andrew
 | Cmd+Enter | Інструкція під курсором |
 | Cmd+Enter з виділенням | Рівно виділений текст (може бути кілька інструкцій) |
 | Кнопка «▶ Run» у шапці панелі результату | Інструкція під курсором |
+| Зелена ▶ у gutter біля першого рядка інструкції (як у Respite; червоний ■ — поки виконується, клік зупиняє) | Ця інструкція (курсор переходить на неї) |
 | Cmd+Shift+Enter | Усі інструкції файлу по черзі |
 | Cmd+Alt+L | Повторити останню |
 | Esc / Cmd+. | Скасувати активний запит |
@@ -486,7 +487,7 @@ Cargo workspace з ядром без залежності від GUI.
 
 Робоча тека перекриває глобальні значення по ключах (вкладені групи зливаються, масиви замінюються); коментарі `//` і `/* */` дозволені; невідомі ключі ігноруються; помилковий файл пропускається з повідомленням.
 
-- UI, як у Respite: `appearance` (`system` | `light` | `dark`), `keymap` (`default` | `vscode` | `jetbrains`), `theme` (`macOS Classic`; `Default` — вбудована тема gpui-component), `ui_font_size` (14), `font_family`, `font_size` (14), `split` (`horizontal` | `vertical`), `split_ratio` (0.55), `editor.line_numbers`, `editor.soft_wrap`, `editor.highlight_current_line`.
+- UI, як у Respite: `appearance` (`system` | `light` | `dark`), `keymap` (`default` | `vscode` | `jetbrains`), `theme` (`macOS Classic`; `Default` — вбудована тема gpui-component), `ui_font_size` (14), `font_family`, `font_size` (14), `split` (`horizontal` | `vertical`), `split_ratio` (0.55), `editor.line_numbers`, `editor.soft_wrap`, `editor.highlight_current_line`, `editor.run_button` (зелена ▶ біля номера рядка кожної інструкції; типово `true`).
 - `results.page_size` (100), `results.max_rows` (10 000), `results.cell_preview_kb` (8), `results.null_text` (`NULL`), `results.json_preview_lines` (0 — вимкнено; кнопка `{ }` вмикає).
 - `run.stop_on_error` (true), `run.confirm_destructive` (`prod` | `always` | `never`, типово `prod`; для prod-підключень підтвердження не-читань не залежить від нього, див. «Конвеєр виконання»), `run.statement_timeout_ms` (немає), `run.connect_timeout_ms` (10000; див. «Сесії»).
 - Налаштувань підключень немає: вони в `~/.config/siesta/connections/`, а продакшн задає прапорець `prod` у підключенні.
@@ -525,7 +526,7 @@ Cargo workspace з ядром без залежності від GUI.
 - **Драйвер: `sqlx`.** Один API для Postgres і MySQL / MariaDB, чистий Rust, rustls. Нестача — скасування — закривається `pg_cancel_backend` / `KILL QUERY` з окремого з'єднання.
 - **Сторінки, сортування й фільтри — на сервері** через обгортку `SELECT * FROM (<запит>) AS q …`. Клієнт ніколи не тримає весь результат.
 - **Сесія на файл + підключення.** `SET` і транзакції працюють як у консольному клієнті.
-- **Редактор чистий**, як у Respite: жодних ▶ і статусів у рядках.
+- **Редактор чистий**, як у Respite: жодних статусів у рядках; єдина кнопка — ▶ у gutter біля номера рядка (`editor.run_button`), не в тексті.
 - **Панель результату (крок 5b):**
   - Результат лежить за ключем (файл, текст інструкції): змінений текст — нова інструкція без результату; закриття файлу забуває його результати й сесії.
   - Пакет: над вкладками рядок `Result 1 | Result 2 …` і `N statements · M rows affected`; клік по вкладці ставить курсор на інструкцію, і панель, як завжди, показує результат інструкції під курсором. Новий запуск однієї інструкції пакет прибирає.

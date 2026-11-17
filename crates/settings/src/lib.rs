@@ -80,6 +80,8 @@ pub struct Editor {
     pub soft_wrap: bool,
     /// Background on the line under the cursor.
     pub highlight_current_line: bool,
+    /// A green ▶ next to each statement's line number (as Respite's `send_button`).
+    pub run_button: bool,
 }
 
 /// The result table (`"results": {…}`).
@@ -137,7 +139,7 @@ impl Default for Settings {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false }
+        Self { line_numbers: true, soft_wrap: false, highlight_current_line: false, run_button: true }
     }
 }
 

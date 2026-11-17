@@ -192,6 +192,7 @@ impl Render for SettingsWindow {
             .child(Self::row("Line numbers", switch("editor.line_numbers", s.editor.line_numbers, cx)))
             .child(Self::row("Soft wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx)))
             .child(Self::row("Highlight the current line", switch("editor.highlight_current_line", s.editor.highlight_current_line, cx)))
+            .child(Self::row("Run arrow next to each statement's line number", switch("editor.run_button", s.editor.run_button, cx)))
             .child(section("Result panel"))
             .child(Self::row("Layout", split))
             .child(Self::row("JSON preview lines", Self::stepper("results.json_preview_lines", s.results.json_preview_lines as f64, 1., 0., 20., cx)))
