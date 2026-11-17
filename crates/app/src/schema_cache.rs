@@ -1,5 +1,5 @@
 //! The structure of each connection's database: in memory (shared with the editors'
-//! completion providers) and on disk under `~/.siesta/cache/<project>/<connection>.json`, so the
+//! completion providers) and on disk under `~/.siesta/cache/<connection>-<hash>.json`, so the
 //! DB tab and autocomplete work right after a start, before any session is open.
 
 use std::{
@@ -33,14 +33,12 @@ pub fn key(c: &db_conn::Connection) -> String {
     format!("{}-{:016x}", c.name, c.fingerprint())
 }
 
-/// `base/cache/<project>/<key>.json`; names are made safe for a file name.
-pub fn path(base: &Path, root: &Path, connection: &str) -> PathBuf {
-    let safe = |s: &str| {
-        let s: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-        if s.is_empty() || s.starts_with('.') { format!("_{s}") } else { s }
-    };
-    let project = root.file_name().map_or_else(|| "workspace".to_string(), |n| n.to_string_lossy().into_owned());
-    base.join("cache").join(safe(&project)).join(format!("{}.json", safe(connection)))
+/// `base/cache/<key>.json`, one file per connection whatever the workspace (the key already names
+/// the server); made safe for a file name.
+pub fn path(base: &Path, connection: &str) -> PathBuf {
+    let s: String = connection.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+    let s = if s.is_empty() || s.starts_with('.') { format!("_{s}") } else { s };
+    base.join("cache").join(format!("{s}.json"))
 }
 
 pub fn load(path: &Path) -> Option<Schema> {
@@ -87,7 +85,7 @@ mod tests {
         assert!(a.starts_with("dev-"));
         // Two files on disk, not one.
         let base = Path::new("/b");
-        assert_ne!(path(base, Path::new("/w/p"), &a), path(base, Path::new("/w/p"), &b));
+        assert_ne!(path(base, &a), path(base, &b));
     }
 
     #[test]
@@ -104,8 +102,8 @@ mod tests {
             }],
         };
         let dir = tempfile::tempdir().unwrap();
-        let p = path(dir.path(), Path::new("/work/my project"), "local dev/1");
-        assert_eq!(p, dir.path().join("cache").join("my_project").join("local_dev_1.json"));
+        let p = path(dir.path(), "local dev/1");
+        assert_eq!(p, dir.path().join("cache").join("local_dev_1.json"));
         assert!(load(&p).is_none());
         save(&p, &schema).unwrap();
         assert_eq!(load(&p), Some(schema.clone()));
@@ -115,7 +113,7 @@ mod tests {
         std::fs::write(&p, "{not json").unwrap();
         assert!(load(&p).is_none());
         // A name cannot climb out of the cache folder.
-        assert!(path(dir.path(), Path::new("/w/x"), "../../evil").starts_with(dir.path().join("cache")));
-        assert_eq!(path(dir.path(), Path::new("/w/x"), "..").file_name().unwrap(), "_...json");
+        assert_eq!(path(dir.path(), "../../evil").parent(), Some(dir.path().join("cache").as_path()));
+        assert_eq!(path(dir.path(), "..").file_name().unwrap(), "_...json");
     }
 }

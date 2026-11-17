@@ -1,10 +1,7 @@
-//! Execution history, per project, in `<base>/history/<project>/` (base is `~/.siesta`): one
-//! `<id>.json` per executed statement — its text, connection, database, time, duration, row count
-//! or error. Result data is never stored (it can be large and sensitive).
+//! Execution history: one folder `<base>/history/` (base is `~/.siesta`) for every workspace, one
+//! `<id>.json` per executed statement — its workspace, text, connection, database, time, duration,
+//! row count or error. Result data is never stored (it can be large and sensitive).
 
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +14,10 @@ pub struct Entry {
     pub time: String,
     /// `gui` / `cli`.
     pub source: String,
-    /// Relative to the workspace root.
+    /// The workspace root (a folder, or the file of a single-file workspace), absolute.
+    #[serde(default)]
+    pub workspace: String,
+    /// Relative to the workspace folder.
     pub file: String,
     /// 1-based line of the statement when it ran.
     pub line: usize,
@@ -60,15 +60,14 @@ impl Entry {
 pub struct Store {
     root: PathBuf,
     dir: PathBuf,
-    /// Entries kept (`history.total`); older ones are deleted on record.
+    /// Entries kept across all workspaces (`history.total`); older ones are deleted on record.
     pub total: usize,
 }
 
 impl Store {
-    /// `base` is `~/.siesta`; `root` is the workspace root (its folder name names the project), or
-    /// the file of a single-file workspace (its file name does).
+    /// `base` is `~/.siesta`; `root` is the workspace root, or the file of a single-file workspace.
     pub fn open(base: &Path, root: &Path) -> io::Result<Self> {
-        let dir = base.join("history").join(project_name(base, root)?);
+        let dir = base.join("history");
         std::fs::create_dir_all(&dir)?;
         Ok(Self { root: root.to_path_buf(), dir, total: 500 })
     }
@@ -91,6 +90,7 @@ impl Store {
         }
         entry.id = id.clone();
         entry.time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        entry.workspace = self.root.to_string_lossy().into_owned();
         // A single-file workspace (`root` is the file) counts from the file's folder.
         let folder = if self.root.is_file() { self.root.parent().unwrap_or(&self.root) } else { &self.root };
         entry.file = file.strip_prefix(folder).unwrap_or(file).to_string_lossy().into_owned();
@@ -114,37 +114,16 @@ impl Store {
         ids
     }
 
-    /// Newest first.
+    /// This workspace's entries, newest first.
     // ponytail: reads every entry (≤ `total` small files) when the window opens; add an index file if it shows up.
     pub fn list(&self) -> Vec<Entry> {
-        self.ids().iter().filter_map(|id| serde_json::from_slice(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok()).collect()
+        let root = self.root.to_string_lossy();
+        self.ids()
+            .iter()
+            .filter_map(|id| serde_json::from_slice::<Entry>(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok())
+            .filter(|e| e.workspace == root)
+            .collect()
     }
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
-}
-
-/// Root folder name, or `name-<4 hex>` if another root already took it; kept in `projects.json`.
-fn project_name(base: &Path, root: &Path) -> io::Result<String> {
-    std::fs::create_dir_all(base)?;
-    let map_path = base.join("projects.json");
-    let mut map: HashMap<String, String> = std::fs::read(&map_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let key = root.to_string_lossy().into_owned();
-    if let Some(name) = map.get(&key) {
-        return Ok(name.clone());
-    }
-    let plain = sanitize(&root.file_name().map_or("root".into(), |n| n.to_string_lossy().into_owned()));
-    let name = if map.values().any(|v| *v == plain) {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        format!("{plain}-{:04x}", h.finish() & 0xffff)
-    } else {
-        plain
-    };
-    map.insert(key, name.clone());
-    std::fs::write(&map_path, serde_json::to_vec_pretty(&map).map_err(io::Error::other)?)?;
-    Ok(name)
 }
 
 #[cfg(test)]
@@ -152,27 +131,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projects_record_list_prune() {
-        let base = std::env::temp_dir().join(format!("siesta-history-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    fn one_folder_per_workspace_list_and_global_prune() {
+        let base = tempfile::tempdir().unwrap();
         let (a, b) = (Path::new("/w1/app"), Path::new("/w2/app"));
-        let sa = Store::open(&base, a).unwrap();
-        let sb = Store::open(&base, b).unwrap();
-        assert!(sa.dir().ends_with("history/app"));
-        assert!(sb.dir().file_name().unwrap().to_string_lossy().starts_with("app-"));
-        assert_eq!(Store::open(&base, b).unwrap().dir(), sb.dir());
-
-        let mut s = Store::open(&base, a).unwrap();
-        s.total = 2;
+        let mut sa = Store::open(base.path(), a).unwrap();
+        let mut sb = Store::open(base.path(), b).unwrap();
+        assert_eq!((sa.dir(), sb.dir()), (base.path().join("history").as_path(), base.path().join("history").as_path()));
+        (sa.total, sb.total) = (3, 3);
         let file = a.join("q/reports.sql");
-        for (sql, rows) in [("SELECT 1", 1), ("SELECT 2", 2), ("SELECT 3", 3)] {
-            s.record(&file, Entry { connection: "dev".into(), sql: sql.into(), rows: Some(rows), ..Default::default() }).unwrap();
+        for (sql, rows) in [("SELECT 1", 1), ("SELECT 2", 2)] {
+            sa.record(&file, Entry { connection: "dev".into(), sql: sql.into(), rows: Some(rows), ..Default::default() }).unwrap();
         }
-        s.record(&file, Entry { connection: "dev".into(), sql: "DELETE".into(), error: Some("42P01 no table\ndetail".into()), ..Default::default() }).unwrap();
-        let list = s.list();
-        assert_eq!(list.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["DELETE", "SELECT 3"]);
-        assert_eq!((list[0].file.as_str(), list[0].outcome(), list[1].outcome()), ("q/reports.sql", "42P01 no table".into(), "3 rows".into()));
+        sb.record(&b.join("x.sql"), Entry { connection: "dev".into(), sql: "SELECT b".into(), ..Default::default() }).unwrap();
+        sa.record(&file, Entry { connection: "dev".into(), sql: "DELETE".into(), error: Some("42P01 no table\ndetail".into()), ..Default::default() }).unwrap();
+        // Same folder name, separate lists; the oldest entry of all went (total is global).
+        let list = sa.list();
+        assert_eq!(list.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["DELETE", "SELECT 2"]);
+        assert_eq!(sb.list().iter().map(|e| (e.sql.as_str(), e.file.as_str())).collect::<Vec<_>>(), [("SELECT b", "x.sql")]);
+        assert_eq!((list[0].workspace.as_str(), list[0].file.as_str()), ("/w1/app", "q/reports.sql"));
+        assert_eq!((list[0].outcome(), list[1].outcome()), ("42P01 no table".into(), "2 rows".into()));
         assert!(list[0].time.ends_with('Z') && !list[0].time_label().is_empty());
-        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.path().join("projects.json").exists());
     }
 }

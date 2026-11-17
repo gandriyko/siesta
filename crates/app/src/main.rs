@@ -163,12 +163,6 @@ pub(crate) struct Siesta {
     _subs: Vec<Subscription>,
 }
 
-/// Global settings with the workspace's `.siesta/settings.json` over them; a single-file
-/// workspace has global settings only.
-fn workspace_settings(root: &Path) -> siesta_settings::Loaded {
-    siesta_settings::Loaded::load(Some(root).filter(|r| r.is_dir()))
-}
-
 /// `path` or `path:line` (1-based). A real file named `a:3` wins over the suffix.
 /// Fills the database picker's menu; re-run on the open menu when the list changes.
 pub(crate) type DbMenuBuild = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
@@ -403,7 +397,7 @@ impl Siesta {
         self.outlines.clear();
         self.collapsed_dirs.clear();
         self.conns_seen = None;
-        self.settings = workspace_settings(&root);
+        self.settings = siesta_settings::Loaded::load_from(self.settings.global_path.clone());
         for e in &self.settings.errors {
             window.push_notification(format!("Settings: {e}"), cx);
         }
@@ -481,7 +475,7 @@ impl Siesta {
     // ponytail: polls mtimes every second (with the open files), as Respite does; `notify` if this ever shows up in a profile.
     fn start_watch(&self, window: &mut Window, cx: &mut Context<Self>) {
         let stamp = |l: &siesta_settings::Loaded| {
-            [&l.global_path, &l.workspace_path, &keymap_path(l)].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
+            [&l.global_path, &keymap_path(l)].map(|p| p.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
         };
         let mut last = stamp(&self.settings);
         cx.spawn_in(window, async move |this, cx| {
@@ -494,7 +488,7 @@ impl Siesta {
                         return;
                     }
                     last = now;
-                    let fresh = siesta_settings::Loaded::load_from(this.settings.global_path.clone(), this.settings.workspace_path.clone());
+                    let fresh = siesta_settings::Loaded::load_from(this.settings.global_path.clone());
                     // A half-written or broken file keeps the current settings.
                     if !fresh.errors.is_empty() {
                         for e in &fresh.errors {
@@ -1590,6 +1584,13 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
 /// `siesta [path[:line]]`: a folder opens as the workspace, a file opens in its repo's workspace;
 /// no argument reopens the last workspace.
 fn main() -> std::process::ExitCode {
+    let (config, base) = (siesta_settings::config_dir(), siesta_settings::data_dir());
+    // Older versions kept the password key among the user's files; it belongs to the data dir.
+    if let (Some(c), Some(d)) = (&config, &base)
+        && let Err(e) = db_conn::crypto::adopt_old_key(c, d)
+    {
+        eprintln!("siesta: password key not moved: {e}");
+    }
     if let Some(code) = siesta_cli::main_if_cli() {
         return code;
     }
@@ -1597,14 +1598,15 @@ fn main() -> std::process::ExitCode {
     // `-psn_…` is a process serial number some macOS launches still pass to app bundles.
     let target = std::env::args().skip(1).rfind(|a| a != "open" && !a.starts_with("-psn_"));
     let cwd = std::env::current_dir().expect("current dir");
-    let base = siesta_workspace::base_dir();
     let (root, open) = match target.map(|t| parse_target(&t)).map(|(p, l)| (std::path::absolute(&p).unwrap_or_else(|_| cwd.join(&p)), l)) {
         Some((p, _)) if p.is_dir() => (p, None),
         // A file opens alone (a single-file workspace), not its repository.
         Some((p, line)) => (p.clone(), Some((p, line))),
-        // No target: the last workspace, else a scratch one (cwd is `/` from Finder, `target/…` from cargo).
+        // No target: the last workspace, else the user's scratch folder `~/.config/siesta/sql`
+        // (cwd is `/` from Finder, `target/…` from cargo). It holds the user's own .sql files, so
+        // it lives with the config, not in the data dir.
         None => {
-            let root = base.as_deref().and_then(siesta_workspace::last_root).or_else(|| base.as_ref().map(|b| b.join("workspace")));
+            let root = base.as_deref().and_then(siesta_workspace::last_root).or_else(|| config.as_ref().map(|c| c.join("sql")));
             let root = root.unwrap_or(cwd);
             if let Err(e) = std::fs::create_dir_all(&root) {
                 eprintln!("siesta: {}: {e}", root.display());
@@ -1625,8 +1627,8 @@ fn main() -> std::process::ExitCode {
         let mut view = None;
         let handle = cx
             .open_window(options, |window, cx| {
-                let settings = workspace_settings(&root);
-                let v = cx.new(|cx| Siesta::new(root, open, base, settings, db_conn::global_dir(), window, cx));
+                let settings = siesta_settings::Loaded::load();
+                let v = cx.new(|cx| Siesta::new(root, open, base, settings, config, window, cx));
                 v.update(cx, |this, cx| this.start_watch(window, cx));
                 view = Some(v.downgrade());
                 cx.new(|cx| Root::new(v, window, cx))
@@ -1702,7 +1704,7 @@ mod tests {
         let mut view = None;
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
-                let settings = siesta_settings::Loaded::load_from(None, None);
+                let settings = siesta_settings::Loaded::load_from(None);
                 let v = cx.new(|cx| Siesta::new(root.to_path_buf(), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, Some(root.join(CONFIG)), window, cx));
                 view = Some(v.clone());
                 cx.new(|cx| Root::new(v, window, cx))
@@ -2188,7 +2190,9 @@ mod tests {
         let mut file = file;
         assert!(file.as_object_mut().unwrap().remove("password_enc").is_some());
         assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "127.0.0.1", "port": 1}));
-        let stored = |d: &Path, n: &str| db_conn::Connections::load(d).connections[n].resolve_password_in(d).unwrap().password;
+        // The key went to the data dir (`base`), not next to the connection files.
+        assert!(db_conn::crypto::key_path(base.path()).is_file() && !db_conn::crypto::key_path(&dir).exists());
+        let stored = |d: &Path, n: &str| db_conn::Connections::load(d).connections[n].resolve_password_in(base.path()).unwrap().password;
         assert_eq!(stored(&dir, "fresh").as_deref(), Some("pw"));
         // Every open file sees the connection; only `a.sql` (the file the form was opened for) picked it.
         let (pa, pb, known) = cx.update(|_, cx| {
@@ -2223,12 +2227,13 @@ mod tests {
             (this.files.clone(), this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>())
         });
         assert_eq!((files, tabs), (vec![b.clone()], vec![b.clone()]));
-        // History: its own project, paths relative to the file's folder.
+        // History: the one history folder, entries tagged with this workspace, paths relative to the file's folder.
         cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&b, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'b'".into(), ..Default::default() }], cx)));
         cx.run_until_parked();
         let store = db_exec::history::Store::open(base.path(), &b).unwrap();
-        assert!(store.dir().ends_with("history/b_sql"));
-        assert_eq!(store.list()[0].file, "b.sql");
+        assert_eq!(store.dir(), base.path().join("history"));
+        assert_eq!((store.list()[0].file.as_str(), store.list()[0].workspace.as_str()), ("b.sql", b.to_str().unwrap()));
+        assert!(db_exec::history::Store::open(base.path(), ws.path()).unwrap().list().is_empty());
         // State is kept under the file's own path, and a plain launch reopens it.
         cx.update(|_, cx| app.read(cx).remember(cx));
         assert_eq!(siesta_workspace::load_state(base.path(), &b).current, Some(b.clone()));
@@ -2426,7 +2431,7 @@ mod tests {
         let mut file = file;
         assert!(file.as_object_mut().unwrap().remove("password_enc").is_some());
         assert_eq!(file, serde_json::json!({"driver": "mysql", "host": "db.local", "port": 3307, "database": "shop", "user": "me", "ssl": {"mode": "require"}}));
-        assert_eq!(db_conn::Connections::load(&dir).connections["viaurl"].resolve_password_in(&dir).unwrap().password.as_deref(), Some("p@ss"));
+        assert_eq!(db_conn::Connections::load(&dir).connections["viaurl"].resolve_password_in(base.path()).unwrap().password.as_deref(), Some("p@ss"));
     }
 
     #[gpui::test]
@@ -2438,7 +2443,7 @@ mod tests {
         std::fs::write(dir.join("connections/gl.json"), r#"{"driver": "postgres", "host": "h", "port": 5, "database": "d"}"#).unwrap();
         std::fs::write(dir.join("connections/other.json"), r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1}"#).unwrap();
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
-        db_conn::set_password(&dir, "gl", "pw").unwrap();
+        db_conn::set_password(&dir, base.path(), "gl", "pw").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.config_dir = Some(dir.clone());
@@ -2474,7 +2479,7 @@ mod tests {
         });
         assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
         assert_eq!(db_conn::read_form(&dir, "gl").unwrap().host, "edited");
-        assert_eq!(db_conn::Connections::load(&dir).connections["gl"].resolve_password_in(&dir).unwrap().password.as_deref(), Some("pw")); // the empty password field kept it
+        assert_eq!(db_conn::Connections::load(&dir).connections["gl"].resolve_password_in(base.path()).unwrap().password.as_deref(), Some("pw")); // the empty password field kept it
         // Delete removes the connection with its password, and leaves the pick.
         cx.update(|window, cx| app.update(cx, |this, cx| this.delete_connection("gl", window, cx)));
         assert!(db_conn::read_form(&dir, "gl").is_none() && !db_conn::has_password(&dir, "gl"));

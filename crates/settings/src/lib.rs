@@ -1,5 +1,5 @@
-//! Settings: `~/.config/siesta/settings.json` (global) overlaid by
-//! `<workspace>/.siesta/settings.json` (per project, can be committed).
+//! Settings: `~/.config/siesta/settings.json`, the only layer. Also the two folders every other
+//! path comes from: [`config_dir`] (what the user writes) and [`data_dir`] (what Siesta writes).
 //!
 //! JSON with `//` and `/* */` comments, nested by group (`results.page_size` is
 //! `{"results": {"page_size": …}}`). Missing keys take defaults, unknown keys are ignored.
@@ -159,43 +159,57 @@ impl Default for History {
     }
 }
 
-/// Both layers as written, plus the merged result.
+/// The settings file as written, plus the result merged over the defaults.
 #[derive(Clone)]
 pub struct Loaded {
     pub global_path: Option<PathBuf>,
-    pub workspace_path: Option<PathBuf>,
     global: Value,
-    workspace: Value,
     pub settings: Settings,
-    /// Unreadable / invalid files (their layer is skipped).
+    /// Unreadable / invalid file (then the defaults apply).
     pub errors: Vec<String>,
 }
 
-/// `~/.config/siesta/settings.json` (`SIESTA_CONFIG_DIR` replaces the folder).
-pub fn global_path() -> Option<PathBuf> {
-    match std::env::var_os("SIESTA_CONFIG_DIR") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d).join("settings.json")),
-        _ => Some(std::env::home_dir()?.join(".config/siesta/settings.json")),
+/// A folder from `var` (non-empty), else `~/<home_rel>`.
+fn dir_from(var: &str, home_rel: &str) -> Option<PathBuf> {
+    match std::env::var_os(var) {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => Some(std::env::home_dir()?.join(home_rel)),
     }
 }
 
+/// `~/.config/siesta` (`SIESTA_CONFIG_DIR` replaces it): only what the user writes — `settings.json`,
+/// `keymap.json`, `connections/`, `sql/`. Safe to keep in a dotfiles repo.
+pub fn config_dir() -> Option<PathBuf> {
+    dir_from("SIESTA_CONFIG_DIR", ".config/siesta")
+}
+
+/// `~/.siesta` (`SIESTA_DATA_DIR` replaces it): only what Siesta writes for itself — `state.json`,
+/// `history/`, `cache/`, the password `key`. Never for a dotfiles repo.
+pub fn data_dir() -> Option<PathBuf> {
+    dir_from("SIESTA_DATA_DIR", ".siesta")
+}
+
+/// `<config_dir>/settings.json`.
+pub fn global_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("settings.json"))
+}
+
 impl Loaded {
-    pub fn load(root: Option<&Path>) -> Self {
-        Self::load_from(global_path(), root.map(|r| r.join(".siesta/settings.json")))
+    pub fn load() -> Self {
+        Self::load_from(global_path())
     }
 
-    pub fn load_from(global_path: Option<PathBuf>, workspace_path: Option<PathBuf>) -> Self {
+    pub fn load_from(global_path: Option<PathBuf>) -> Self {
         let mut errors = vec![];
-        let mut read = |p: &Option<PathBuf>| match p.as_deref().map(read_jsonc) {
+        let global = match global_path.as_deref().map(read_jsonc) {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
-                errors.push(format!("{}: {e}", p.as_ref().unwrap().display()));
+                errors.push(format!("{}: {e}", global_path.as_ref().unwrap().display()));
                 Value::Object(Map::new())
             }
             None => Value::Object(Map::new()),
         };
-        let (global, workspace) = (read(&global_path), read(&workspace_path));
-        let mut loaded = Self { global_path, workspace_path, global, workspace, settings: Settings::default(), errors };
+        let mut loaded = Self { global_path, global, settings: Settings::default(), errors };
         loaded.merge();
         loaded
     }
@@ -203,7 +217,6 @@ impl Loaded {
     fn merge(&mut self) {
         let mut v = serde_json::to_value(Settings::default()).expect("defaults serialize");
         deep_merge(&mut v, &self.global);
-        deep_merge(&mut v, &self.workspace);
         match serde_json::from_value(v) {
             Ok(s) => self.settings = s,
             Err(e) => self.errors.push(format!("settings: {e}")),
@@ -228,11 +241,6 @@ impl Loaded {
         std::fs::write(&path, serde_json::to_string_pretty(&self.global)? + "\n")?;
         self.merge();
         Ok(())
-    }
-
-    /// The workspace file overrides `key`, so editing the global value has no effect.
-    pub fn overridden(&self, key: &str) -> bool {
-        key.split('.').try_fold(&self.workspace, |v, k| v.get(k)).is_some()
     }
 }
 
@@ -270,35 +278,49 @@ mod tests {
         assert_eq!(s.run.connect_timeout_ms, 10_000);
         assert_eq!((s.results.json_preview_lines, s.history.total), (0, 500));
         // an empty layer set yields exactly the defaults
-        assert_eq!(Loaded::load_from(None, None).settings, s);
+        assert_eq!(Loaded::load_from(None).settings, s);
     }
 
     #[test]
-    fn layers_comments_and_set() {
+    fn comments_and_set() {
         let dir = tempfile::tempdir().unwrap();
-        let (g, w) = (dir.path().join("cfg/settings.json"), dir.path().join("ws.json"));
+        let g = dir.path().join("cfg/settings.json");
+        std::fs::create_dir_all(g.parent().unwrap()).unwrap();
         std::fs::write(
-            &w,
-            "{\n // project wants small pages\n \"results\": {\"page_size\": 50}, \"appearance\": \"light\", /* why not */\n \"run\": {\"confirm_destructive\": \"always\", \"statement_timeout_ms\": 5000}\n}",
+            &g,
+            "{\n // small pages\n \"results\": {\"page_size\": 50}, \"appearance\": \"light\", /* why not */\n \"run\": {\"confirm_destructive\": \"always\", \"statement_timeout_ms\": 5000}\n}",
         )
         .unwrap();
 
-        let mut l = Loaded::load_from(Some(g.clone()), Some(w));
+        let mut l = Loaded::load_from(Some(g.clone()));
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!((l.settings.appearance, l.settings.results.page_size), (Appearance::Light, 50));
         assert_eq!((l.settings.run.confirm_destructive, l.settings.run.statement_timeout_ms), (ConfirmDestructive::Always, Some(5000)));
         assert_eq!(l.settings.results.max_rows, 10_000); // default kept beside the override
-        assert!(l.overridden("results.page_size") && !l.overridden("font_size"));
 
         l.set("font_size", 16.into()).unwrap();
         l.set("results.page_size", 200.into()).unwrap();
-        assert_eq!((l.settings.font_size, l.settings.results.page_size), (16., 50)); // workspace still wins
+        assert_eq!((l.settings.font_size, l.settings.results.page_size), (16., 200));
         let written: Value = serde_json::from_str(&std::fs::read_to_string(&g).unwrap()).unwrap();
-        assert_eq!(written, serde_json::json!({"font_size": 16, "results": {"page_size": 200}}));
+        assert_eq!(written["results"], serde_json::json!({"page_size": 200}));
+        assert_eq!(written["font_size"], 16);
 
         std::fs::write(&g, "{ broken").unwrap();
-        let l = Loaded::load_from(Some(g), None);
+        let l = Loaded::load_from(Some(g));
         assert_eq!((l.errors.len(), l.settings.font_size), (1, 14.));
+    }
+
+    #[test]
+    fn dirs_come_from_their_variables() {
+        // ponytail: one test touches these variables, so no lock is needed.
+        unsafe { std::env::set_var("SIESTA_CONFIG_DIR", "/c") };
+        unsafe { std::env::set_var("SIESTA_DATA_DIR", "/d") };
+        assert_eq!((config_dir(), data_dir(), global_path()), (Some("/c".into()), Some("/d".into()), Some("/c/settings.json".into())));
+        unsafe { std::env::set_var("SIESTA_DATA_DIR", "") };
+        let home = std::env::home_dir().unwrap();
+        assert_eq!(data_dir(), Some(home.join(".siesta")));
+        unsafe { std::env::remove_var("SIESTA_CONFIG_DIR") };
+        assert_eq!(config_dir(), Some(home.join(".config/siesta")));
     }
 
     #[test]
@@ -306,7 +328,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let w = dir.path().join("s.json");
         std::fs::write(&w, r#"{"mystery": 1, "run": {"confirm_destructive": "sometimes"}}"#).unwrap();
-        let l = Loaded::load_from(None, Some(w));
+        let l = Loaded::load_from(Some(w));
         assert_eq!(l.errors.len(), 1);
         assert_eq!(l.settings, Settings::default());
     }

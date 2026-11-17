@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-/// Tests share the process environment (`SIESTA_CONFIG_DIR`), so a fixture holds this for its lifetime.
+/// Tests share the process environment (`SIESTA_CONFIG_DIR`, `SIESTA_DATA_DIR`), so a fixture holds this for its lifetime.
 static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
@@ -19,6 +19,7 @@ impl Fixture {
         let cfg = dir.path().join("config");
         std::fs::create_dir_all(cfg.join("connections")).unwrap();
         unsafe { std::env::set_var("SIESTA_CONFIG_DIR", &cfg) };
+        unsafe { std::env::set_var("SIESTA_DATA_DIR", dir.path().join("data")) };
         assert!(std::env::var(url_var).is_ok(), "{url_var} is not set; run scripts/test-db.sh");
         let url = format!("${{env:{url_var}}}");
         for (name, ro, prod) in [("c", false, false), ("prod-c", false, true), ("ro", true, false)] {

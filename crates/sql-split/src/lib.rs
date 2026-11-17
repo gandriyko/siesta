@@ -498,6 +498,24 @@ pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
     })
 }
 
+/// Why an agent (MCP) must not run `text` on a `prod` connection (`None`: allowed). Only reads
+/// (`Query` / `Read`) and `UPDATE` with a top-level `WHERE` pass; DELETE, INSERT, DROP, TRUNCATE,
+/// ALTER, `WITH … UPDATE`, session statements and everything else are refused.
+// ponytail: token check like `read_only_violation`; `WHERE 1=1` passes, a parser couldn't stop that either.
+pub fn prod_agent_violation(text: &str, dialect: Dialect) -> Option<String> {
+    split_words(text, dialect, true).1.iter().find_map(|w| {
+        let &(_, first) = w.first()?;
+        if classify(w) != Kind::Other {
+            return None;
+        }
+        if is(first, &["update"]) {
+            let has_where = w.iter().any(|&(d, s)| d == 0 && is(s, &["where"]));
+            return (!has_where).then(|| "Production connection: UPDATE without WHERE is not allowed.".to_string());
+        }
+        Some(format!("Production connection: {} is not allowed; only reads and UPDATE … WHERE.", first.to_ascii_uppercase()))
+    })
+}
+
 /// What the top level of a SELECT-like statement has, for the page wrapper.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopLevel {
@@ -943,6 +961,33 @@ mod tests {
         assert_eq!(destructive_reason("alter table t add c int", PG), Some("ALTER"));
         assert_eq!(destructive_reason("update t set a = 1", PG), Some("UPDATE without WHERE"));
         assert_eq!(destructive_reason("DELETE FROM t", PG), Some("DELETE without WHERE"));
+    }
+
+    #[test]
+    fn prod_agent_allows_reads_and_update_where_only() {
+        for (sql, d, ok) in [
+            ("SELECT * FROM t", PG, true),
+            ("EXPLAIN SELECT 1", PG, true),
+            ("SHOW TABLES", MY, true),
+            ("UPDATE t SET a = 1 WHERE id = 1", PG, true),
+            ("update t set a = 'where' where id = 1 returning *", PG, true),
+            ("UPDATE t SET a = 1", PG, false),
+            ("UPDATE t SET a = (SELECT 1 FROM u WHERE u.id = 1)", PG, false), // the WHERE is a subquery's
+            ("UPDATE t SET a = 1 -- WHERE id = 1", PG, false),
+            ("DELETE FROM t WHERE id = 1", PG, false),
+            ("INSERT INTO t VALUES (1)", PG, false),
+            ("DROP TABLE t", PG, false),
+            ("TRUNCATE t", MY, false),
+            ("ALTER TABLE t ADD c int", PG, false),
+            ("WITH x AS (SELECT 1) UPDATE t SET a = 1 WHERE id = 1", PG, false),
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1", PG, false),
+            ("SELECT 1 INTO x", PG, false),
+            ("SET search_path = x", PG, false),
+            ("SELECT 1; DROP TABLE t", PG, false),
+        ] {
+            assert_eq!(prod_agent_violation(sql, d).is_none(), ok, "{sql}");
+        }
+        assert!(prod_agent_violation("DROP TABLE t", PG).unwrap().contains("DROP"));
     }
 
     #[test]

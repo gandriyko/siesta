@@ -66,22 +66,20 @@ pub struct ExecArgs {
     pub opts: ExecOpts,
 }
 
-/// Settings and connections as seen from a file (or from the working directory).
+/// Settings and connections (both from the config dir).
 pub(crate) struct Env {
     pub settings: Settings,
     pub conns: Connections,
 }
 
 impl Env {
-    /// `probe` only decides which workspace settings apply: the real `.sql` file, or `<cwd>/_.sql`.
-    pub fn load(probe: &Path) -> Env {
-        Self::load_in(probe, db_conn::global_dir().as_deref())
+    pub fn load() -> Env {
+        Self::load_in(siesta_settings::config_dir().as_deref())
     }
 
     /// Like `load`, with the connections read from the config dir `config`.
-    pub fn load_in(probe: &Path, config: Option<&Path>) -> Env {
-        let root = db_conn::workspace_root(probe);
-        let loaded = siesta_settings::Loaded::load(Some(&root));
+    pub fn load_in(config: Option<&Path>) -> Env {
+        let loaded = siesta_settings::Loaded::load();
         for e in &loaded.errors {
             eprintln!("{} {e}", paint("warning:", YELLOW, true));
         }
@@ -206,13 +204,13 @@ fn ask(question: &str) -> bool {
 
 /// Refuses (exit 4) or, in a terminal, asks, for every statement that needs confirmation.
 /// Runs before anything executes, so a refusal never leaves a half-run batch.
-fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes: bool) -> Result<(), CliError> {
+fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes: bool, agent_on_prod: bool) -> Result<(), CliError> {
     let policy = env.settings.run.confirm_destructive;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     for j in jobs {
         // `prod` connections confirm every non-read statement; the policy only matters elsewhere
         // (`prod` in the policy means that same flag, so it adds nothing for the others).
-        let reason = if conn.prod && j.kind.needs_prod_confirm() {
+        let reason = if conn.prod && !agent_on_prod && j.kind.needs_prod_confirm() {
             Some("production connection")
         } else if j.confirm {
             Some("marked -- @confirm")
@@ -272,7 +270,21 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
             }
         }
     }
-    confirm(env, &conn, &jobs, file, o.yes)?;
+    // An agent (MCP) on prod: reads and `UPDATE … WHERE` only, checked up front like `read_only`;
+    // those then need no prod confirmation (nobody could give it), `-- @confirm` still refuses.
+    let agent_on_prod = conn.prod && std::env::var_os(crate::mcp::AGENT_ENV).is_some();
+    if agent_on_prod {
+        for j in &jobs {
+            if let Some(m) = sql_split::prod_agent_violation(&j.text, dialect_of(conn.driver)) {
+                let err = CliError::new("prod_refused", m, 4).hint("ask the user to run it");
+                return Err(match file {
+                    Some(p) => err.at(p, Some(j.line)),
+                    None => err.at_line(j.line),
+                });
+            }
+        }
+    }
+    confirm(env, &conn, &jobs, file, o.yes, agent_on_prod)?;
     let cap = row_limit(o.max_rows, env.settings.results.max_rows);
     let rt = runtime();
     let mut session = rt.block_on(Session::open_with(&conn, Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{}': {e}", conn.name), 2))?;
@@ -319,8 +331,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
 pub(crate) fn run(a: RunArgs, out: &mut dyn Write) -> Result<u8, CliError> {
     let format = Format::resolve(a.opts.output);
     let src = std::fs::read_to_string(&a.file).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&a.file, None))?;
-    let path = std::path::absolute(&a.file).unwrap_or_else(|_| a.file.clone());
-    let env = Env::load(&path);
+    let env = Env::load();
     // The directive is the same in both dialects; the real dialect needs the connection.
     let top = sql_split::split(&src, Dialect::Postgres);
     let conn = env.resolve(a.opts.conn.connection.as_deref(), top.connection.as_deref()).map_err(|e| e.at(&a.file, None))?;
@@ -357,8 +368,7 @@ pub(crate) fn exec(a: ExecArgs, out: &mut dyn Write) -> Result<u8, CliError> {
             s
         }
     };
-    let probe = std::env::current_dir().unwrap_or_default().join("_.sql");
-    let env = Env::load(&probe);
+    let env = Env::load();
     let conn = env.resolve(a.opts.conn.connection.as_deref(), None)?.with_database(a.opts.conn.database.as_deref());
     let file = sql_split::split(&sql, dialect_of(conn.driver));
     check_parse(&sql, &file, None)?;
@@ -431,7 +441,7 @@ mod tests {
     #[test]
     fn confirmation_rules() {
         // Not a terminal in tests: confirmation means refusal (exit 4) unless --yes.
-        let refused = |e: &Env, c: &Connection, j: Job, yes| confirm(e, c, &[j], None, yes).err().map(|e| e.exit);
+        let refused = |e: &Env, c: &Connection, j: Job, yes| confirm(e, c, &[j], None, yes, false).err().map(|e| e.exit);
         let e = env();
         let prod = conn("prod-db", false, true);
         let dev = conn("dev-db", false, false);

@@ -19,7 +19,7 @@ From an agent, use the CLI only; never launch the GUI.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
   the statement and the connection, and run it with `--yes` only after they agree.
 - Never write passwords into a connection file; they live only encrypted (`password_enc`, local key in
-  `~/.config/siesta/key`; `siesta connections set-password NAME`, done by the user). Never read or print the key. `siesta connections` shows connections
+  `~/.siesta/key`; `siesta connections set-password NAME`, done by the user). Never read or print the key. `siesta connections` shows connections
   with secrets masked and whether a password is set.
 - Results are capped at 100 rows by default; check `rows_truncated`. Narrow the query
   (`WHERE`, `LIMIT`, `count(*)`, aggregates) instead of raising `--max-rows` for a big table.
@@ -39,6 +39,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 | `siesta connections databases NAME` | Databases on the server of a connection that its credentials can access (`name`); with `-d` / `-- @database` you can run in any of them |
 | `siesta connections set-password NAME` | Store the password of a connection, encrypted, in its file (hidden prompt, or one line from stdin); the user does this, not you |
 | `siesta schema [TABLE]` | Every table and view, or one table (`table` or `schema.table`) with columns and indexes |
+| `siesta mcp` | MCP server on stdio (see below) |
 
 `list`, `run`, `exec`, `connections` and `schema` take `--output table|json|jsonl|csv`
 (`table` in a terminal, `json` in a pipe).
@@ -74,6 +75,24 @@ Exit codes:
 With several statements the first failure stops the run (setting `run.stop_on_error`); the exit code is
 that of the failure. With `run.stop_on_error` off the run goes on and the exit code is the first
 failure's code.
+
+### MCP server
+
+`siesta mcp` serves the commands as MCP tools over stdio, for clients without a shell:
+`connections`, `schema` (`table`, `connection`, `database`, `ddl`), `list_statements` (`path`) and
+`run_sql` — `sql` (as `exec`) or `file` with `statements` (as `run`), plus `connection`, `database`,
+`max_rows`. Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
+appended to the text. `run_sql` never passes `--yes` and cannot answer a prompt. Refused with `4`
+before anything runs — ask the user to run these:
+
+- writes on a `read_only` connection (`read_only_refused`);
+- on a `prod` connection, everything except reads and `UPDATE` with a top-level `WHERE`
+  (`prod_refused`: `DELETE`, `INSERT`, `DROP`, `TRUNCATE`, `ALTER`, `WITH … UPDATE`, `SET`…);
+  `UPDATE … WHERE` runs there without confirmation;
+- statements that need confirmation (`confirmation_required`: `-- @confirm`, and destructive ones
+  under `run.confirm_destructive = always`, see Safety). Relative paths resolve against the
+directory the client starts the server in. Register it, for example in Claude Code:
+`claude mcp add siesta -- siesta mcp`.
 
 ## JSON output
 
@@ -161,13 +180,20 @@ project-level connection files.
   There is no `password` key.
 - `${env:NAME}` reads the environment.
 - The password lives only as `password_enc` in the connection file, encrypted with the key in
-  `~/.config/siesta/key` and decrypted when a session opens; the user sets it in the connection form or
+  `~/.siesta/key` and decrypted when a session opens; the user sets it in the connection form or
   with `siesta connections set-password NAME`. Without `password_enc` Siesta connects without a password;
   if the server then rejects the login, the error says to set one (exit `2`): ask the user to run
   `set-password`; never type a password yourself. "Can't decrypt the password of `X`" (exit `2`) means the
   key is missing or different: the user sets the password again.
-- Check with `siesta connections`, then `siesta connections test NAME`. The environment variable
-  `SIESTA_CONFIG_DIR` replaces `~/.config/siesta`.
+- Check with `siesta connections`, then `siesta connections test NAME`.
+
+### Folders
+
+- `~/.config/siesta/` — only what the user writes: `settings.json`, `keymap.json`, `connections/`,
+  `sql/` (scratch workspace). Fine for a dotfiles repo. Edit connection files here (never a password).
+- `~/.siesta/` — only what Siesta writes: `state.json`, `history/`, `cache/`, the password `key`.
+  Never read the key, never edit these files, and keep this folder out of dotfiles.
+- `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace them.
 
 ## Safety
 

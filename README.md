@@ -121,10 +121,21 @@ Each connection is one JSON file in `~/.config/siesta/connections/`, named after
 
 ### Passwords
 
-A password is never written in clear. Type it in the connection form, or run `siesta connections set-password NAME`. It is stored as `"password_enc": "v1:…"`, encrypted with XChaCha20-Poly1305 and bound to the connection name. The key is random and lives in `~/.config/siesta/key` (mode 0600, created on first use).
+A password is never written in clear. Type it in the connection form, or run `siesta connections set-password NAME`. It is stored as `"password_enc": "v1:…"`, encrypted with XChaCha20-Poly1305 and bound to the connection name. The key is random and lives in `~/.siesta/key` (mode 0600, created on first use), away from the connection files.
 
-- **The key is the secret.** Keep it out of backups and sync that carry the connection files. If it is lost, set the passwords again.
+- **The key is the secret.** It stays in the data folder, so the connection files can go to a dotfiles repo without it. If it is lost, set the passwords again.
 - **What this protects against.** Passwords stay out of screenshots, `grep`, backups and synced files that don't include the key. It does not protect against malware running as your user, which can read the key too.
+
+## Where Siesta keeps its files
+
+Two folders, each with one job. Nothing is written to both.
+
+| Folder | What is in it | Who writes it |
+|---|---|---|
+| `~/.config/siesta/` | `settings.json`, `keymap.json`, `connections/`, `sql/` (the scratch workspace opened when there is no last one) | you (and the settings page / connection form on your behalf) |
+| `~/.siesta/` | `state.json` (open tabs, last and recent workspaces), `history/`, `cache/` (database schemas), `key` (password key) | Siesta itself |
+
+Put `~/.config/siesta` in a dotfiles repo if you like. Keep `~/.siesta` out of it: it holds the password key, the SQL you ran and your database structure. `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace the two folders (tests, sandboxes).
 
 ## CLI
 
@@ -158,6 +169,12 @@ siesta schema -c dev-pg users                             # look at the columns 
 ## AI agents
 
 [`skills/siesta/SKILL.md`](skills/siesta/SKILL.md) teaches a coding agent (Claude Code, Codex and others that read Agent Skills) to explore a schema and run queries through the CLI. Copy the folder into the agent's skills directory, for example `~/.claude/skills/siesta`.
+
+For clients that talk MCP instead of running commands, `siesta mcp` is a stdio MCP server with the tools `connections`, `schema`, `list_statements` and `run_sql`. Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same. `run_sql` never skips a confirmation: writes on a `read_only` connection and anything that would ask (`-- @confirm`) are refused, and on a `prod` connection it runs only reads and `UPDATE … WHERE` (no `DELETE`, `INSERT`, `DROP`, `TRUNCATE`, `ALTER`). Nothing opens on screen.
+
+```sh
+claude mcp add siesta -- siesta mcp
+```
 
 ## Development
 

@@ -37,12 +37,12 @@ pub async fn rejected_login_names_the_fix(driver: Driver) {
     assert!(e.message.contains("No password is stored for `test-no-password`") && e.message.contains("set-password"), "{e}");
 }
 
-/// A password stored as `password_enc` (key in a temp config dir) is decrypted when the session opens.
+/// A password stored as `password_enc` (key in a temp data dir) is decrypted when the session opens.
 pub async fn encrypted_password_connects(driver: Driver) {
     let dir = std::env::temp_dir().join(format!("siesta-enc-test-{}-{}", std::process::id(), driver == Driver::Postgres));
     let enc = db_conn::crypto::encrypt(&dir, "test-enc", "siesta").unwrap();
-    // The test config dir is process-wide, but only connections with `password_enc` ever read it.
-    unsafe { std::env::set_var("SIESTA_CONFIG_DIR", &dir) };
+    // The test data dir is process-wide, but only connections with `password_enc` ever read it.
+    unsafe { std::env::set_var("SIESTA_DATA_DIR", &dir) };
     let mut c = connection(driver);
     c.name = "test-enc".into();
     c.url = c.url.map(|u| u.replacen(":siesta@", "@", 1));

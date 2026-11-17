@@ -3,8 +3,11 @@
 //!
 //! A file holds driver, url | host / port / database / user, ssl, read_only, prod, schema, init_sql, color.
 //! Values may use `${env:NAME}`. The password lives only as `password_enc` (encrypted with the local
-//! key `<config dir>/key`, see [`crypto`]), decrypted when a session opens.
+//! key `<data dir>/key`, see [`crypto`]), decrypted when a session opens.
 //! A broken connection lands in `errors`, a suspicious key in `warnings`; the rest loads.
+//!
+//! The folders come from `siesta_settings::{config_dir, data_dir}`; functions here take them as
+//! arguments (`config`: where the files are, `keys`: where `key` is), so tests use temp dirs.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,24 +15,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 mod global;
-mod legacy;
 pub mod crypto;
 pub use global::{ConnectionForm, delete, has_password, names, read_form, save, set_password};
-pub use legacy::migrate;
 mod urlparse;
 pub use urlparse::{ParsedUrl, parse_url};
 
 const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color", "password_enc"];
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
-
-/// `~/.config/siesta`, where connections (and the settings) live; `SIESTA_CONFIG_DIR` overrides it
-/// (tests, sandboxes).
-pub fn global_dir() -> Option<PathBuf> {
-    match std::env::var_os("SIESTA_CONFIG_DIR") {
-        Some(d) if !d.is_empty() => Some(d.into()),
-        _ => Some(std::env::home_dir()?.join(".config/siesta")),
-    }
-}
 
 /// The folder of the per-connection files inside the config dir.
 pub fn connections_dir(config: &Path) -> PathBuf {
@@ -103,24 +95,24 @@ impl Connection {
         self.password.is_some() || self.password_enc.is_some() || self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
     }
 
-    /// A copy with `password_enc` decrypted (key of the global config dir) when no password is
+    /// A copy with `password_enc` decrypted (the key in the data dir) when no password is
     /// given explicitly or in the url. No `password_enc` means no password: some local databases need none.
     /// Call right before connecting; loading never decrypts.
     pub fn resolve_password(&self) -> Result<Connection, String> {
-        match global_dir() {
+        match siesta_settings::data_dir() {
             Some(d) => self.resolve_password_in(&d),
             None if self.password_enc.is_some() => Err("no home directory: can't find the password key".into()),
             None => Ok(self.clone()),
         }
     }
 
-    /// [`resolve_password`](Self::resolve_password) with an explicit config dir (where `key` lives).
-    pub fn resolve_password_in(&self, config: &Path) -> Result<Connection, String> {
+    /// [`resolve_password`](Self::resolve_password) with an explicit folder of the `key`.
+    pub fn resolve_password_in(&self, keys: &Path) -> Result<Connection, String> {
         let mut c = self.clone();
         if self.password.is_none() && !self.url.as_deref().is_some_and(|u| !url_passwords(u).is_empty())
             && let Some(enc) = &self.password_enc
         {
-            c.password = Some(crypto::decrypt(config, &self.name, enc)?);
+            c.password = Some(crypto::decrypt(keys, &self.name, enc)?);
         }
         Ok(c)
     }
@@ -169,14 +161,14 @@ pub struct Connections {
     pub connections: BTreeMap<String, Connection>,
     /// Connections that could not be built (unresolved variable, no driver, bad value).
     pub errors: BTreeMap<String, String>,
-    /// Non-fatal: invalid JSON (file skipped), unknown keys, migration notes.
+    /// Non-fatal: invalid JSON (file skipped), unknown keys.
     pub warnings: Vec<String>,
 }
 
 impl Connections {
-    /// Reads `<config>/connections/*.json` (after the one-time migration of an old `connections.json`).
+    /// Reads `<config>/connections/*.json`.
     pub fn load(config: &Path) -> Self {
-        let mut out = Self { warnings: migrate(config), ..Default::default() };
+        let mut out = Self::default();
         let dir = connections_dir(config);
         for name in names(config) {
             let path = dir.join(format!("{name}.json"));
@@ -207,12 +199,6 @@ impl Connections {
     pub fn names(&self) -> Vec<&str> {
         self.connections.keys().map(String::as_str).collect()
     }
-}
-
-/// Nearest ancestor of `file` with `.git` or `.siesta`; else the file's folder.
-pub fn workspace_root(file: &Path) -> PathBuf {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    dir.ancestors().find(|d| d.join(".git").exists() || d.join(".siesta").exists()).unwrap_or(dir).to_path_buf()
 }
 
 /// The connection as JSON for CLI output: the password inside `url` becomes `***`.
@@ -556,18 +542,5 @@ mod tests {
         let (mut x, mut y) = (a.clone(), a.clone());
         (x.host, x.database, y.host, y.database) = (Some("ab".into()), None, None, Some("ab".into()));
         assert_ne!(x.fingerprint(), y.fingerprint());
-    }
-
-    #[test]
-    fn root_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path();
-        fs::create_dir_all(t.join("repo/.git")).unwrap();
-        fs::create_dir_all(t.join("repo/api/v1")).unwrap();
-        fs::create_dir_all(t.join("other/.siesta")).unwrap();
-        fs::create_dir_all(t.join("plain/sub")).unwrap();
-        assert_eq!(workspace_root(&t.join("repo/api/v1/a.sql")), t.join("repo"));
-        assert_eq!(workspace_root(&t.join("other/a.sql")), t.join("other"));
-        assert_eq!(workspace_root(&t.join("plain/sub/a.sql")), t.join("plain/sub"));
     }
 }

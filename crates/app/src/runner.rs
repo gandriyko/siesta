@@ -643,7 +643,7 @@ impl Siesta {
         if cache.schemas.contains_key(key) || !cache.disk_tried.insert(key.to_string()) {
             return;
         }
-        if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, &self.root, key)) {
+        if let Some(s) = crate::schema_cache::load(&crate::schema_cache::path(base, key)) {
             cache.schemas.insert(key.to_string(), Arc::new(s));
         }
     }
@@ -734,7 +734,7 @@ impl Siesta {
             c.errors.remove(&key);
         }
         let handles = self.slots.entry((path, name, conn.database.clone())).or_insert_with(Slot::new).handles.clone();
-        let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &self.root, &key));
+        let file = self.base.as_deref().map(|b| crate::schema_cache::path(b, &key));
         let token = handles.token();
         let handle = RT.spawn(schema_job(handles, conn, self.opts(), file, token));
         cx.spawn_in(window, async move |this, cx| {

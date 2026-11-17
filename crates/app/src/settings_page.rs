@@ -11,7 +11,7 @@ use gpui_component::{
     tab::{Tab, TabBar},
 };
 use serde_json::json;
-use siesta_settings::{Appearance, Keymap, Loaded, Split};
+use siesta_settings::{Appearance, Keymap, Split};
 
 use crate::{CloseTab, Siesta, themes::FAMILIES};
 
@@ -102,17 +102,9 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    /// Label, control, and a note when the workspace file overrides the key.
-    fn row(l: &Loaded, label: &str, key: &str, control: AnyElement, cx: &App) -> Div {
-        let note = l.overridden(key).then(|| div().text_xs().text_color(cx.theme().warning).child("overridden by .siesta/settings.json"));
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .py_1p5()
-            .child(div().flex().flex_col().child(label.to_string()).children(note))
-            .child(control)
+    /// Label and control.
+    fn row(label: &str, control: AnyElement) -> Div {
+        div().flex().items_center().justify_between().gap_4().py_1p5().child(div().child(label.to_string())).child(control)
     }
 
     fn switch(key: &'static str, checked: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -191,31 +183,25 @@ impl Render for SettingsWindow {
             .flex()
             .flex_col()
             .child(section("Appearance"))
-            .child(Self::row(&l, "Theme", "theme", families.into_any_element(), cx))
-            .child(Self::row(&l, "Appearance", "appearance", mode, cx))
-            .child(Self::row(&l, "Interface font size", "ui_font_size", Self::stepper("ui_font_size", s.ui_font_size as f64, 1., 10., 24., cx), cx))
-            .child(Self::row(&l, "Editor font", "font_family", Input::new(&self.font_input).w(px(260.)).into_any_element(), cx))
-            .child(Self::row(&l, "Editor font size", "font_size", Self::stepper("font_size", s.font_size as f64, 1., 9., 32., cx), cx))
+            .child(Self::row("Theme", families.into_any_element()))
+            .child(Self::row("Appearance", mode))
+            .child(Self::row("Interface font size", Self::stepper("ui_font_size", s.ui_font_size as f64, 1., 10., 24., cx)))
+            .child(Self::row("Editor font", Input::new(&self.font_input).w(px(260.)).into_any_element()))
+            .child(Self::row("Editor font size", Self::stepper("font_size", s.font_size as f64, 1., 9., 32., cx)))
             .child(section("Editor"))
-            .child(Self::row(&l, "Line numbers", "editor.line_numbers", switch("editor.line_numbers", s.editor.line_numbers, cx), cx))
-            .child(Self::row(&l, "Soft wrap", "editor.soft_wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx), cx))
-            .child(Self::row(
-                &l,
-                "Highlight the current line",
-                "editor.highlight_current_line",
-                switch("editor.highlight_current_line", s.editor.highlight_current_line, cx),
-                cx,
-            ))
+            .child(Self::row("Line numbers", switch("editor.line_numbers", s.editor.line_numbers, cx)))
+            .child(Self::row("Soft wrap", switch("editor.soft_wrap", s.editor.soft_wrap, cx)))
+            .child(Self::row("Highlight the current line", switch("editor.highlight_current_line", s.editor.highlight_current_line, cx)))
             .child(section("Result panel"))
-            .child(Self::row(&l, "Layout", "split", split, cx))
-            .child(Self::row(&l, "JSON preview lines", "results.json_preview_lines", Self::stepper("results.json_preview_lines", s.results.json_preview_lines as f64, 1., 0., 20., cx), cx))
+            .child(Self::row("Layout", split))
+            .child(Self::row("JSON preview lines", Self::stepper("results.json_preview_lines", s.results.json_preview_lines as f64, 1., 0., 20., cx)))
             .child(div().text_xs().text_color(muted).child("Lines of a JSON cell shown in the table (rows get taller); 0 = off. The result header has a toggle."))
             .child(section("Connections"))
             .child(div().text_xs().text_color(muted).child("Mark a connection \"prod\": true (or tick Production in its form) for a red banner and a confirmation on every run."))
             .child(section("Keyboard"))
-            .child(Self::row(&l, "Extra shortcuts", "keymap", keymap, cx))
+            .child(Self::row("Extra shortcuts", keymap))
             .child(div().text_xs().text_color(muted).child("Your own: keymap.json next to the settings file (Zed's format)."))
-            .child(div().mt_8().text_xs().text_color(muted).child(format!("Saved to {path}. A workspace's .siesta/settings.json overrides these values.")));
+            .child(div().mt_8().text_xs().text_color(muted).child(format!("Saved to {path}.")));
 
         div()
             .id("settings")

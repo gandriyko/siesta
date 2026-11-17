@@ -1,4 +1,5 @@
-//! Connection passwords are encrypted with a local key (`<config dir>/key`, 32 random bytes, mode 0600)
+//! Connection passwords are encrypted with a local key (`<keys>/key`, i.e. `~/.siesta/key`: the app
+//! writes it, so it lives in the data dir, never next to the connection files; 32 random bytes, mode 0600)
 //! using XChaCha20-Poly1305; the connection name is the AAD, so a ciphertext copied to another
 //! connection does not decrypt. Stored as `"v1:<base64(nonce || ciphertext)>"` in the connection file.
 //!
@@ -15,13 +16,24 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 const PREFIX: &str = "v1:";
 const NONCE: usize = 24;
 
-pub fn key_path(config: &Path) -> PathBuf {
-    config.join("key")
+pub fn key_path(keys: &Path) -> PathBuf {
+    keys.join("key")
+}
+
+/// Moves a key that an older Siesta kept in the config dir to `keys`, unless `keys` already has one.
+/// Runs at startup (GUI and CLI). An error leaves the old key where it is.
+// ponytail: one-time move; drop it once no machine has `~/.config/siesta/key` any more.
+pub fn adopt_old_key(config: &Path, keys: &Path) -> Result<(), String> {
+    let (old, new) = (key_path(config), key_path(keys));
+    if !old.is_file() || new.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(keys).and_then(|()| std::fs::rename(&old, &new)).map_err(|e| format!("{} → {}: {e}", old.display(), new.display()))
 }
 
 /// The key; `create` makes it when missing (encrypting), otherwise a missing key is an error.
-fn key(config: &Path, create: bool) -> Result<[u8; 32], String> {
-    let path = key_path(config);
+fn key(keys: &Path, create: bool) -> Result<[u8; 32], String> {
+    let path = key_path(keys);
     match std::fs::read(&path) {
         Ok(b) => return b.try_into().map_err(|_| format!("{}: the key file must be exactly 32 bytes", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {}
@@ -30,11 +42,11 @@ fn key(config: &Path, create: bool) -> Result<[u8; 32], String> {
     let mut k = [0u8; 32];
     getrandom::fill(&mut k).map_err(|e| format!("random numbers unavailable: {e}"))?;
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
-    std::fs::create_dir_all(config).map_err(err)?;
+    std::fs::create_dir_all(keys).map_err(err)?;
     // Unique per attempt (a second draw, not the key).
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).map_err(|e| format!("random numbers unavailable: {e}"))?;
-    let tmp = config.join(format!(".key.{}.tmp", u64::from_le_bytes(id)));
+    let tmp = keys.join(format!(".key.{}.tmp", u64::from_le_bytes(id)));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -45,27 +57,27 @@ fn key(config: &Path, create: bool) -> Result<[u8; 32], String> {
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => Ok(k),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => key(config, false),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => key(keys, false),
         Err(e) => Err(err(e)),
     }
 }
 
-fn cipher(config: &Path, create: bool) -> Result<XChaCha20Poly1305, String> {
-    XChaCha20Poly1305::new_from_slice(&key(config, create)?).map_err(|e| e.to_string())
+fn cipher(keys: &Path, create: bool) -> Result<XChaCha20Poly1305, String> {
+    XChaCha20Poly1305::new_from_slice(&key(keys, create)?).map_err(|e| e.to_string())
 }
 
-pub fn encrypt(config: &Path, name: &str, password: &str) -> Result<String, String> {
+pub fn encrypt(keys: &Path, name: &str, password: &str) -> Result<String, String> {
     let mut nonce = [0u8; NONCE];
     getrandom::fill(&mut nonce).map_err(|e| format!("random numbers unavailable: {e}"))?;
-    let ct = cipher(config, true)?
+    let ct = cipher(keys, true)?
         .encrypt(&XNonce::from(nonce), Payload { msg: password.as_bytes(), aad: name.as_bytes() })
         .map_err(|e| e.to_string())?;
     Ok(format!("{PREFIX}{}", STANDARD.encode([&nonce[..], &ct].concat())))
 }
 
-pub fn decrypt(config: &Path, name: &str, enc: &str) -> Result<String, String> {
-    let fail = || format!("Can't decrypt the password of `{name}` (the key in {} is missing or different). Set the password again in the connection form.", key_path(config).display());
-    let cipher = cipher(config, false).map_err(|e| if key_path(config).exists() { format!("Can't decrypt the password of `{name}`: {e}") } else { fail() })?;
+pub fn decrypt(keys: &Path, name: &str, enc: &str) -> Result<String, String> {
+    let fail = || format!("Can't decrypt the password of `{name}` (the key in {} is missing or different). Set the password again in the connection form.", key_path(keys).display());
+    let cipher = cipher(keys, false).map_err(|e| if key_path(keys).exists() { format!("Can't decrypt the password of `{name}`: {e}") } else { fail() })?;
     let raw = enc.strip_prefix(PREFIX).and_then(|b| STANDARD.decode(b).ok()).filter(|b| b.len() > NONCE).ok_or_else(fail)?;
     let (nonce, ct) = raw.split_at(NONCE);
     let nonce: [u8; NONCE] = nonce.try_into().map_err(|_| fail())?;
@@ -126,5 +138,22 @@ mod tests {
         assert!(encrypt(d, "dev", "x").unwrap_err().contains("32 bytes"));
         std::fs::remove_file(key_path(d)).unwrap();
         assert!(decrypt(d, "dev", &e).unwrap_err().contains("missing or different"));
+    }
+
+    #[test]
+    fn old_key_moves_from_config_to_data_once() {
+        let t = tempfile::tempdir().unwrap();
+        let (config, data) = (t.path().join("config"), t.path().join("data"));
+        adopt_old_key(&config, &data).unwrap(); // nothing to move
+        assert!(!data.exists());
+        let e = encrypt(&config, "dev", "pw").unwrap(); // a key made where older versions kept it
+        adopt_old_key(&config, &data).unwrap();
+        assert!(!key_path(&config).exists());
+        assert_eq!(decrypt(&data, "dev", &e).unwrap(), "pw");
+        // A key already in the data dir wins; the stray one is left alone.
+        std::fs::write(key_path(&config), [1u8; 32]).unwrap();
+        adopt_old_key(&config, &data).unwrap();
+        assert!(key_path(&config).exists());
+        assert_eq!(decrypt(&data, "dev", &e).unwrap(), "pw");
     }
 }

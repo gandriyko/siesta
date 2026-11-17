@@ -1,0 +1,200 @@
+//! `siesta mcp`: a Model Context Protocol server on stdio (newline-delimited JSON-RPC).
+//! Each tool runs this binary's CLI command with `--output json` and returns what it printed,
+//! so tools behave exactly like the commands the skill documents.
+//! SQL never runs with `--yes` and stdin is closed: `read_only` connections refuse writes, and
+//! whatever needs confirmation (`prod`, `-- @confirm`, `run.confirm_destructive`) is refused too.
+
+use std::io::{BufRead, Write};
+use std::process::{Command, Stdio};
+
+use serde_json::{Value, json};
+
+/// Set for the child commands: on a `prod` connection only reads and `UPDATE … WHERE` run
+/// (`sql_split::prod_agent_violation`), the latter without confirmation.
+pub(crate) const AGENT_ENV: &str = "SIESTA_MCP";
+
+pub(crate) fn serve() -> u8 {
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => handle(&msg),
+            Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
+        };
+        if let Some(r) = reply
+            && (writeln!(out, "{r}").is_err() || out.flush().is_err())
+        {
+            break;
+        }
+    }
+    0
+}
+
+/// The reply to one message; `None` for notifications.
+fn handle(msg: &Value) -> Option<Value> {
+    let id = msg.get("id")?.clone();
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let result = match msg["method"].as_str().unwrap_or("") {
+        "initialize" => Ok(json!({
+            "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "siesta", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": "Query Postgres / MySQL databases through Siesta connections. Start with `connections`, \
+                then `schema` to see tables and columns before writing SQL. `run_sql` can write, except on `read_only` \
+                connections; on a `prod` connection only reads and `UPDATE … WHERE` run. Anything refused (exit 4) is \
+                for the user to run.",
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/call" => call(params["name"].as_str().unwrap_or(""), &params["arguments"]),
+        m => Err((-32601, format!("unknown method '{m}'"))),
+    };
+    Some(match result {
+        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+        Err((code, message)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+    })
+}
+
+fn call(name: &str, args: &Value) -> Result<Value, (i64, String)> {
+    let (argv, input) = argv(name, args).map_err(|e| (-32602, e))?;
+    let mut child = Command::new(std::env::current_exe().map_err(|e| (-32603, e.to_string()))?)
+        .args(&argv)
+        .env(AGENT_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| (-32603, e.to_string()))?;
+    // Always close stdin: no command may wait for input (and no prompt can be answered).
+    if let Some(mut s) = child.stdin.take() {
+        let _ = s.write_all(input.unwrap_or_default().as_bytes());
+    }
+    let o = child.wait_with_output().map_err(|e| (-32603, e.to_string()))?;
+    let code = o.status.code().unwrap_or(-1);
+    let mut text = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
+    let err = String::from_utf8_lossy(&o.stderr);
+    if !err.trim().is_empty() {
+        text += &format!("\n\nstderr:\n{}", err.trim_end());
+    }
+    if code != 0 {
+        text += &format!("\n\nexit code {code} (2 connection error · 3 bad input · 4 refused: read-only connection or needs confirmation, ask the user · 5 SQL error)");
+    }
+    Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0}))
+}
+
+/// CLI arguments for a tool call, plus stdin for the child.
+fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> {
+    let str_of = |k: &str| a.get(k).and_then(Value::as_str).map(String::from);
+    let mut v: Vec<String> = vec![];
+    let opt = |v: &mut Vec<String>, k: &str, flag: &str| {
+        if let Some(x) = a.get(k).filter(|x| !x.is_null()) {
+            v.push(flag.into());
+            v.push(x.as_str().map_or_else(|| x.to_string(), String::from));
+        }
+    };
+    let conn = |v: &mut Vec<String>| {
+        opt(v, "connection", "--connection");
+        opt(v, "database", "--database");
+    };
+    let json = ["--output".to_string(), "json".into()];
+    let mut input = None;
+    match name {
+        "connections" => {
+            v.push("connections".into());
+            v.extend(json);
+        }
+        "list_statements" => {
+            v.push("list".into());
+            v.extend(str_of("path"));
+            v.extend(json);
+        }
+        "schema" => {
+            v.push("schema".into());
+            v.extend(str_of("table"));
+            conn(&mut v);
+            if a.get("ddl").and_then(Value::as_bool) == Some(true) {
+                v.push("--ddl".into());
+            }
+            v.extend(json);
+        }
+        "run_sql" => {
+            match (str_of("sql"), str_of("file")) {
+                // SQL via stdin: text starting with `--` would otherwise parse as a flag.
+                (Some(sql), None) => {
+                    input = Some(sql);
+                    v.extend(["exec".into(), "-".into()]);
+                }
+                (None, Some(file)) => {
+                    v.extend(["run".into(), file]);
+                    let sts = a.get("statements").and_then(Value::as_array);
+                    v.extend(sts.into_iter().flatten().filter_map(|s| s.as_str().map(String::from)));
+                }
+                _ => return Err("give exactly one of 'sql' or 'file'".into()),
+            }
+            conn(&mut v);
+            opt(&mut v, "max_rows", "--max-rows");
+            v.extend(json);
+        }
+        _ => return Err(format!("unknown tool '{name}'")),
+    }
+    Ok((v, input))
+}
+
+fn tools() -> Value {
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let connection = s("Connection name (see `connections`); for a file, overrides its `-- @connection`");
+    let database = s("Database on that server (overrides `-- @database` and the connection's default)");
+    let tool = |name: &str, d: &str, props: Value, required: &[&str], read_only: bool| {
+        json!({"name": name, "description": d, "inputSchema": {"type": "object", "properties": props, "required": required},
+               "annotations": {"readOnlyHint": read_only}})
+    };
+    json!([
+        tool("connections", "Every connection: name, driver, host, database, user, read_only, prod; secrets masked.", json!({}), &[], true),
+        tool("list_statements", "Statements of a .sql file or every .sql file under a directory: file, line, name, first line, kind.",
+            json!({"path": s("File or directory (default: current directory)")}), &[], true),
+        tool("schema", "Tables and views with columns and indexes of a connection; one table with `table`, its CREATE statement with `ddl`.",
+            json!({"table": s("`table` or `schema.table`; none = every table and view"), "connection": connection, "database": database,
+                   "ddl": json!({"type": "boolean", "description": "Return the table's CREATE statement"})}), &[], true),
+        tool("run_sql", "Run SQL and return siesta.run/v1 JSON per statement (columns, rows, rows_truncated, rows_affected, duration_ms). \
+            Give `sql` (with `connection`) or a `file` (with optional `statements`). Refused with exit 4 before anything runs: \
+            writes on a `read_only` connection; on a `prod` connection everything but reads and `UPDATE` with a `WHERE` \
+            (DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
+            destructive ones when `run.confirm_destructive` is `always`) — ask the user to run those.",
+            json!({"sql": s("SQL text, one or several statements"), "file": s("A .sql file to run instead of `sql`"),
+                   "statements": json!({"type": "array", "items": {"type": "string"}, "description": "Statements of `file`: `@name`, `:LINE` or `#N`; none = all"}),
+                   "connection": connection, "database": database,
+                   "max_rows": json!({"type": "integer", "description": "Rows per statement (default 100; 0 = the results.max_rows cap)"})}),
+            &[], false),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_and_arguments() {
+        let init = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+        assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
+        assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "nope"})).unwrap()["error"]["code"], -32601);
+
+        for t in tools().as_array().unwrap() {
+            let n = t["name"].as_str().unwrap();
+            assert!(argv(n, &json!({"sql": "SELECT 1"})).is_ok(), "{n}");
+        }
+        let (v, input) = argv("run_sql", &json!({"sql": "-- x\nSELECT 1", "connection": "dev", "max_rows": 5})).unwrap();
+        assert_eq!(v.join(" "), "exec - --connection dev --max-rows 5 --output json");
+        assert_eq!(input.as_deref(), Some("-- x\nSELECT 1"));
+        let (v, _) = argv("run_sql", &json!({"file": "a.sql", "statements": ["@users", ":3"]})).unwrap();
+        assert_eq!(v.join(" "), "run a.sql @users :3 --output json");
+        assert!(!v.contains(&"--yes".to_string()));
+        assert!(argv("run_sql", &json!({})).is_err());
+        assert!(argv("run_sql", &json!({"sql": "x", "file": "a.sql"})).is_err());
+        assert_eq!(argv("schema", &json!({"table": "t", "ddl": true})).unwrap().0.join(" "), "schema t --ddl --output json");
+    }
+}

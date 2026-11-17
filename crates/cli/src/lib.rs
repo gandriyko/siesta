@@ -2,6 +2,7 @@
 //! Exit codes: 0 ok · 2 connection error · 3 parse error / unknown connection or statement /
 //! bad input · 4 refused (confirmation needed) · 5 SQL error.
 
+mod mcp;
 mod output;
 mod run;
 
@@ -46,6 +47,8 @@ enum Cmd {
     },
     /// Tables, columns and indexes of a connection (for writing correct SQL)
     Schema(SchemaArgs),
+    /// MCP server on stdio for AI agents (tools: connections, schema, list_statements, run_sql; SQL read-only)
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -89,11 +92,12 @@ impl Cli {
             Cmd::Run(a) => a.opts.output,
             Cmd::Exec(a) => a.opts.output,
             Cmd::Schema(a) => a.output,
+            Cmd::Mcp => None,
         })
     }
 }
 
-const COMMANDS: &[&str] = &["list", "run", "exec", "connections", "schema", "help", "--help", "-h", "--version", "-V"];
+const COMMANDS: &[&str] = &["list", "run", "exec", "connections", "schema", "mcp", "help", "--help", "-h", "--version", "-V"];
 
 /// Whether these arguments (without the program name) are a CLI call; otherwise they mean
 /// "open the GUI": nothing, `open`, a path.
@@ -142,16 +146,18 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<u8, CliError> {
         Cmd::Connections { cmd: Some(ConnCmd::SetPassword { name }), .. } => {
             let stdin = std::io::stdin();
             let tty = stdin.is_terminal();
-            set_password(&name, db_conn::global_dir().as_deref(), tty, &mut stdin.lock(), format, out)
+            let (config, data) = (siesta_settings::config_dir(), siesta_settings::data_dir());
+            set_password(&name, config.as_deref(), data.as_deref(), tty, &mut stdin.lock(), format, out)
         }
         Cmd::Schema(a) => schema(a, format, out),
+        Cmd::Mcp => Ok(mcp::serve()),
     }
 }
 
 /// `connections set-password`: the password is read from a prompt without echo (`tty`) or from `input`
-/// (one line), and stored encrypted (`password_enc`) in the connection's file.
-fn set_password(name: &str, config: Option<&Path>, tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    Env::load_in(&cwd_probe(), config).pick(name)?;
+/// (one line), and stored encrypted (`password_enc`) in the connection's file; the key is in `keys`.
+fn set_password(name: &str, config: Option<&Path>, keys: Option<&Path>, tty: bool, input: &mut dyn BufRead, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
+    Env::load_in(config).pick(name)?;
     let password = if tty {
         rpassword::prompt_password(format!("Password for '{name}': ")).map_err(|e| CliError::new("io_error", e.to_string(), 3))?
     } else {
@@ -162,8 +168,8 @@ fn set_password(name: &str, config: Option<&Path>, tty: bool, input: &mut dyn Bu
     if password.is_empty() {
         return Err(CliError::new("no_password", "empty password", 3));
     }
-    let dir = config.ok_or_else(|| CliError::new("io_error", "no home directory", 3))?;
-    db_conn::set_password(dir, name, &password).map_err(|e| CliError::new("encryption_error", e, 2))?;
+    let (Some(dir), Some(keys)) = (config, keys) else { return Err(CliError::new("io_error", "no home directory", 3)) };
+    db_conn::set_password(dir, keys, name, &password).map_err(|e| CliError::new("encryption_error", e, 2))?;
     if format.human() {
         put(out, format!("Stored the encrypted password of '{name}' in {}", db_conn::connections_dir(dir).join(format!("{name}.json")).display()));
     } else {
@@ -238,10 +244,6 @@ pub(crate) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime")
 }
 
-fn cwd_probe() -> PathBuf {
-    std::env::current_dir().unwrap_or_default().join("_.sql")
-}
-
 fn open_session(env: &Env, name: &str, database: Option<&str>) -> Result<(tokio::runtime::Runtime, Session, db_conn::Connection), CliError> {
     let conn = env.pick(name)?.with_database(database);
     let rt = runtime();
@@ -263,8 +265,7 @@ fn list(path: &Path, format: Format, out: &mut dyn Write) -> Result<u8, CliError
     if !path.exists() {
         return Err(CliError::new("file_not_found", "no such file or directory", 3).at(path, None));
     }
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let env = Env::load(&if path.is_file() { abs.clone() } else { abs.join("_.sql") });
+    let env = Env::load();
     let mut rows = vec![];
     for f in sql_files(path) {
         let src = std::fs::read_to_string(&f).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&f, None))?;
@@ -283,7 +284,7 @@ fn list(path: &Path, format: Format, out: &mut dyn Write) -> Result<u8, CliError
 }
 
 fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let env = Env::load(&cwd_probe());
+    let env = Env::load();
     let mut rows: Vec<Value> = env
         .conns
         .connections
@@ -301,7 +302,7 @@ fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
 }
 
 fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let env = Env::load(&cwd_probe());
+    let env = Env::load();
     let started = std::time::Instant::now();
     let (rt, mut s, _) = open_session(&env, name, None)?;
     let version = rt.block_on(s.run("SELECT version()", Kind::Query, &Page::default())).map_err(|e| db_error(&e))?;
@@ -317,7 +318,7 @@ fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8
 }
 
 fn databases(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
-    let env = Env::load(&cwd_probe());
+    let env = Env::load();
     let (rt, mut s, _) = open_session(&env, name, None)?;
     let names = rt.block_on(s.databases()).map_err(|e| db_error(&e));
     rt.block_on(s.close());
@@ -336,7 +337,7 @@ fn schema(a: SchemaArgs, format: Format, out: &mut dyn Write) -> Result<u8, CliE
     if a.ddl && a.table.is_none() {
         return Err(CliError::new("bad_argument", "--ddl needs a table", 3));
     }
-    let env = Env::load(&cwd_probe());
+    let env = Env::load();
     let name = env.resolve(a.conn.connection.as_deref(), None)?.name;
     let (rt, mut s, _) = open_session(&env, &name, a.conn.database.as_deref())?;
     let schema = rt.block_on(s.schema()).map_err(|e| db_error(&e))?;
@@ -451,9 +452,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("connections")).unwrap();
         std::fs::write(dir.path().join("connections/kc-cli-a.json"), r#"{"driver": "postgres", "host": "h"}"#).unwrap();
-        let set = |name: &str, input: &str| set_password(name, Some(dir.path()), false, &mut input.as_bytes(), Format::Json, &mut vec![]);
+        let keys = dir.path().join("data");
+        let set = |name: &str, input: &str| set_password(name, Some(dir.path()), Some(&keys), false, &mut input.as_bytes(), Format::Json, &mut vec![]);
         assert_eq!(set("kc-cli-a", "hunter2\r\nignored\n").unwrap(), 0);
-        let resolved = || db_conn::Connections::load(dir.path()).connections["kc-cli-a"].resolve_password_in(dir.path()).unwrap().password;
+        assert!(db_conn::crypto::key_path(&keys).is_file() && !db_conn::crypto::key_path(dir.path()).exists());
+        let resolved = || db_conn::Connections::load(dir.path()).connections["kc-cli-a"].resolve_password_in(&keys).unwrap().password;
         assert_eq!(resolved().as_deref(), Some("hunter2"));
         assert!(!std::fs::read_to_string(dir.path().join("connections/kc-cli-a.json")).unwrap().contains("hunter2"));
         assert_eq!(set("nope", "x\n").unwrap_err().code, "unknown_connection");

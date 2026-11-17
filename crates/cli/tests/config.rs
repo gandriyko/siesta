@@ -1,5 +1,6 @@
-//! CLI behaviour that needs a config dir but no database. Every test points `SIESTA_CONFIG_DIR` at its
-//! own temp dir (never the real `~/.config/siesta`) and holds `ENV` meanwhile; its encryption key lives in that dir too.
+//! CLI behaviour that needs a config dir but no database. Every test points `SIESTA_CONFIG_DIR` and
+//! `SIESTA_DATA_DIR` (where the encryption key lives) at its own temp dir (never the real
+//! `~/.config/siesta` / `~/.siesta`) and holds `ENV` meanwhile.
 
 use serde_json::Value;
 
@@ -20,6 +21,7 @@ impl Env {
             std::fs::write(dir.path().join(format!("config/connections/{n}.json")), j).unwrap();
         }
         unsafe { std::env::set_var("SIESTA_CONFIG_DIR", dir.path().join("config")) };
+        unsafe { std::env::set_var("SIESTA_DATA_DIR", dir.path().join("data")) };
         Env { dir, _guard: guard }
     }
 
@@ -57,6 +59,27 @@ fn errors_map_to_exit_codes_and_json() {
 }
 
 #[test]
+fn agent_on_prod_runs_only_reads_and_update_where() {
+    let e = Env::new(&[("live", r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1, "database": "x", "user": "u", "prod": true}"#)]);
+    unsafe { std::env::set_var("SIESTA_MCP", "1") };
+    let code_of = |sql: &str| {
+        let (code, v, _) = e.go(&["exec", "-c", "live", "--output", "json", "--", sql]);
+        (code, v["error"]["code"].as_str().map(String::from))
+    };
+    // Refused before connecting (4); allowed ones get as far as the dead server (2), without --yes.
+    for sql in ["DROP TABLE t", "TRUNCATE t", "DELETE FROM t WHERE id = 1", "UPDATE t SET a = 1", "INSERT INTO t VALUES (1)"] {
+        assert_eq!(code_of(sql), (4, Some("prod_refused".into())), "{sql}");
+    }
+    for sql in ["SELECT 1", "UPDATE t SET a = 1 WHERE id = 1"] {
+        assert_eq!(code_of(sql), (2, Some("connection_failed".into())), "{sql}");
+    }
+    assert_eq!(code_of("-- @confirm\nUPDATE t SET a = 1 WHERE id = 1"), (4, Some("confirmation_required".into())));
+    unsafe { std::env::remove_var("SIESTA_MCP") };
+    // Without MCP the CLI's own rule is unchanged: prod writes need --yes.
+    assert_eq!(code_of("UPDATE t SET a = 1 WHERE id = 1"), (4, Some("confirmation_required".into())));
+}
+
+#[test]
 fn list_prints_statements() {
     let e = Env::new(&[]);
     std::fs::write(e.dir.path().join("a.sql"), "-- @name one\nSELECT 1;\nDELETE FROM t;\n").unwrap();
@@ -77,7 +100,7 @@ fn connections_list_is_masked_and_shows_password_state() {
         ("cfg-none", r#"{"driver": "postgres", "host": "h"}"#),
         ("cfg-bad", r#"{"driver": "oracle"}"#),
     ]);
-    db_conn::set_password(&e.dir.path().join("config"), "cfg-kc", "hunter2").unwrap();
+    db_conn::set_password(&e.dir.path().join("config"), &e.dir.path().join("data"), "cfg-kc", "hunter2").unwrap();
     let (code, v, text) = e.go(&["connections", "--output", "json"]);
     assert_eq!(code, 0);
     assert!(!text.contains("s3cret") && !text.contains("hunter2") && !text.contains("leaked"), "{text}");
@@ -92,16 +115,4 @@ fn undecryptable_password_exits_2_with_a_clear_message() {
     let (code, _, text) = e.go(&["connections", "test", "cfg-enc", "--output", "json"]);
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("Can't decrypt the password of `cfg-enc`") && text.contains("Set the password again"), "{text}");
-}
-
-#[test]
-fn old_connections_json_is_migrated_on_first_use() {
-    let e = Env::new(&[]);
-    let cfg = e.dir.path().join("config");
-    std::fs::write(cfg.join("connections.json"), r#"{"cfg-mig": {"driver": "postgres", "host": "h"}}"#).unwrap();
-    std::fs::write(cfg.join("connections.private.json"), r#"{"cfg-mig": {"password": "old-pw"}}"#).unwrap();
-    let (code, v, text) = e.go(&["connections", "--output", "json"]);
-    assert_eq!(code, 0, "{text}");
-    assert_eq!((v[0]["name"].as_str(), v[0]["password"].as_str()), (Some("cfg-mig"), Some("set")));
-    assert!(cfg.join("connections.json.migrated").is_file() && !text.contains("old-pw"));
 }

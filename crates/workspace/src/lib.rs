@@ -8,12 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// `~/.siesta`: what Siesta writes itself (state, history, schema cache), apart from the
-/// user-edited config in `~/.config/siesta`.
-pub fn base_dir() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".siesta"))
-}
-
 pub fn is_sql(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql"))
 }
@@ -87,6 +81,10 @@ pub fn save_state(base: &Path, root: &Path, state: &WorkspaceState) {
     let mut recent: Vec<String> = all["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).filter(|r| *r != key).map(str::to_string).collect();
     recent.insert(0, key);
     recent.truncate(RECENT);
+    // Only the workspaces the list still offers keep their state.
+    if let Some(ws) = all["workspaces"].as_object_mut() {
+        ws.retain(|k, _| recent.contains(k));
+    }
     all["recent"] = recent.into();
     let write = std::fs::create_dir_all(base).and_then(|()| {
         let tmp = base.join("state.json.tmp");
@@ -101,13 +99,9 @@ pub fn save_state(base: &Path, root: &Path, state: &WorkspaceState) {
 /// How many workspaces `recent` keeps.
 const RECENT: usize = 10;
 
-/// Workspaces (folders and single files) opened before, newest first, that still exist. A state
-/// written before the list existed gives its known workspaces instead.
+/// Workspaces (folders and single files) opened before, newest first, that still exist.
 pub fn recent(base: &Path) -> Vec<PathBuf> {
-    let all = read(base);
-    let listed: Vec<PathBuf> = all["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(PathBuf::from).collect();
-    let paths = if listed.is_empty() { all["workspaces"].as_object().into_iter().flat_map(|m| m.keys()).map(PathBuf::from).collect() } else { listed };
-    paths.into_iter().filter(|p| p.exists()).collect()
+    read(base)["recent"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(PathBuf::from).filter(|p| p.exists()).collect()
 }
 
 /// The workspace used last (a folder, or a single file), if it still exists: a plain launch reopens it.
@@ -167,10 +161,15 @@ mod tests {
     }
 
     #[test]
-    fn recent_falls_back_to_known_workspaces() {
-        let (base, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let key = root.path().to_string_lossy().into_owned();
-        std::fs::write(base.path().join("state.json"), serde_json::json!({"workspaces": {key: {}}}).to_string()).unwrap();
-        assert_eq!(recent(base.path()), [root.path()]);
+    fn state_keeps_only_recent_workspaces() {
+        let base = tempfile::tempdir().unwrap();
+        let roots: Vec<PathBuf> = (0..=RECENT).map(|i| PathBuf::from(format!("/w/{i}"))).collect();
+        for r in &roots {
+            save_state(base.path(), r, &WorkspaceState { current: Some(r.join("a.sql")), ..Default::default() });
+        }
+        let all = read(base.path());
+        assert_eq!(all["workspaces"].as_object().unwrap().len(), RECENT);
+        assert_eq!(load_state(base.path(), &roots[0]), WorkspaceState::default()); // the oldest is gone
+        assert_eq!(load_state(base.path(), &roots[RECENT]).current, Some(roots[RECENT].join("a.sql")));
     }
 }

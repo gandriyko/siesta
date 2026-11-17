@@ -58,6 +58,8 @@ pub(crate) struct ConnForm {
     app: WeakEntity<Siesta>,
     /// The config dir the files live in.
     dir: PathBuf,
+    /// The data dir the password `key` lives in.
+    keys: PathBuf,
     /// The file the form was opened for: the saved connection is picked there, and only there.
     /// `None` (opened from the Connections page): no file's pick changes.
     target: Option<PathBuf>,
@@ -90,7 +92,8 @@ pub(crate) struct ConnForm {
 }
 
 impl ConnForm {
-    fn new(app: WeakEntity<Siesta>, dir: PathBuf, target: Option<PathBuf>, original: Option<String>, f: ConnectionForm, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(app: WeakEntity<Siesta>, dir: PathBuf, keys: PathBuf, target: Option<PathBuf>, original: Option<String>, f: ConnectionForm, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |placeholder: &str, value: &str, window: &mut Window, cx: &mut Context<Self>| {
             let (placeholder, value) = (placeholder.to_string(), value.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
@@ -112,6 +115,7 @@ impl ConnForm {
             has_password: f.has_password,
             app,
             dir,
+            keys,
             target,
             original,
             name: input("local", &f.name, window, cx),
@@ -191,7 +195,7 @@ impl ConnForm {
         let form = self.collect(cx);
         let name = form.name.trim().to_string();
         let renamed = self.original.clone().filter(|o| *o != name);
-        let password_error = match db_conn::save(&self.dir, &form, self.original.as_deref()) {
+        let password_error = match db_conn::save(&self.dir, &self.keys, &form, self.original.as_deref()) {
             Ok(e) => e,
             Err(e) => {
                 self.error = Some(e);
@@ -220,7 +224,7 @@ impl ConnForm {
 
     /// A throwaway session with the form's values; the result is shown in the form, nothing is saved.
     pub fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let conn = match self.collect(cx).to_connection(&self.dir, self.original.as_deref()) {
+        let conn = match self.collect(cx).to_connection(&self.dir, &self.keys, self.original.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 self.test = Test::Failed(e);
@@ -342,7 +346,7 @@ impl Render for ConnForm {
         let testing = matches!(self.test, Test::Running);
         let status = self.status(cx);
         let editing = self.original.is_some();
-        let location = format!("Saved to {}; the password is kept only encrypted (key: {}).",db_conn::connections_dir(&self.dir).display(), db_conn::crypto::key_path(&self.dir).display());
+        let location = format!("Saved to {}; the password is kept only encrypted (key: {}).", db_conn::connections_dir(&self.dir).display(), db_conn::crypto::key_path(&self.keys).display());
         v_flex()
             .gap_2()
             .child(field("Name", &self.name))
@@ -389,7 +393,7 @@ impl Siesta {
     /// connection prefilled from `edit` (`<name>-copy`, no password). `pick`: the current file
     /// picks the saved connection (the picker and DB tab); the Connections page never changes picks.
     pub(crate) fn open_conn_form_for(&mut self, edit: Option<String>, duplicate: bool, pick: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.config_dir.clone() else { return window.push_notification("No config folder (is HOME set?): connections cannot be saved", cx) };
+        let (Some(dir), Some(keys)) = (self.config_dir.clone(), self.base.clone()) else { return window.push_notification("No home folder (is HOME set?): connections cannot be saved", cx) };
         let target = if pick {
             let Some(d) = self.doc().filter(|d| d.sql) else { return };
             Some((*d.path).clone())
@@ -413,7 +417,7 @@ impl Siesta {
             Some(n) => format!("Edit connection {n}"),
         };
         let app = cx.entity().downgrade();
-        let form = cx.new(|cx| ConnForm::new(app, dir, target, original, data, window, cx));
+        let form = cx.new(|cx| ConnForm::new(app, dir, keys, target, original, data, window, cx));
         self.conn_form = Some(form.downgrade());
         let name_input = form.read(cx).name.clone();
         window.open_dialog(cx, move |dialog, _, _| dialog.w(px(560.)).title(title.clone()).child(form.clone()));
