@@ -29,15 +29,23 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parses `postgres://` / `postgresql://` / `mysql://` / `mariadb://` URLs. `Err` is a short reason.
+/// Parses `postgres://` / `postgresql://` / `mysql://` / `mariadb://` URLs, also as app configs
+/// write them: SQLAlchemy's `mysql+pymysql://`, a bare driver name (`pymysql://`, `asyncpg://`)
+/// and `jdbc:`. `Err` is a short reason.
 pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://").ok_or("Unsupported scheme")?;
-    let driver = match scheme.to_ascii_lowercase().as_str() {
-        "postgres" | "postgresql" => Driver::Postgres,
-        "mysql" | "mariadb" => Driver::MySql,
-        _ => return Err("Unsupported scheme".into()),
-    };
+    let scheme = scheme.to_ascii_lowercase();
+    let scheme = scheme.strip_prefix("jdbc:").unwrap_or(&scheme);
+    // `dialect+driver`: either part names the database.
+    let driver = scheme
+        .split('+')
+        .find_map(|part| match part {
+            "postgres" | "postgresql" | "psycopg" | "psycopg2" | "asyncpg" | "pg8000" => Some(Driver::Postgres),
+            "mysql" | "mariadb" | "pymysql" | "mysqldb" | "mysqlconnector" | "aiomysql" | "asyncmy" => Some(Driver::MySql),
+            _ => None,
+        })
+        .ok_or("Unsupported scheme")?;
     let rest = rest.split('#').next().unwrap_or_default();
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
@@ -123,6 +131,10 @@ mod tests {
             ("postgres://h/db?sslmode=verify-full", (Some(Postgres), "", "", "h", None, "db", Some(SslMode::VerifyFull), none.clone())),
             ("mysql://h/db?ssl-mode=VERIFY_IDENTITY", (Some(MySql), "", "", "h", None, "db", Some(SslMode::VerifyFull), none.clone())),
             ("mysql://h/db?ssl-mode=DISABLED&x=1", (Some(MySql), "", "", "h", None, "db", Some(SslMode::Disable), vec!["x".into()])),
+            ("pymysql://u:p@h:3306/db?ssl_ca=config/ca.pem", (Some(MySql), "u", "p", "h", Some(3306), "db", None, vec!["ssl_ca".into()])),
+            ("mysql+pymysql://u@h/db", (Some(MySql), "u", "", "h", None, "db", None, none.clone())),
+            ("postgresql+asyncpg://u@h/db", (Some(Postgres), "u", "", "h", None, "db", None, none.clone())),
+            ("jdbc:mysql://h/db", (Some(MySql), "", "", "h", None, "db", None, none.clone())),
             ("postgres://h/db?application_name=a&sslmode=require", (Some(Postgres), "", "", "h", None, "db", Some(SslMode::Require), vec!["application_name".into()])),
         ] {
             assert_eq!(ok(url), own(want), "{url}");
