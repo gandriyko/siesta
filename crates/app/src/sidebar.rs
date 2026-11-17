@@ -487,9 +487,10 @@ impl Siesta {
     }
 
     fn move_to_trash(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        // Unsaved edits aren't in the Trash copy, and an open transaction needs an answer: first.
-        if let Some(d) = self.docs.iter().find(|d| d.path.starts_with(path) && (d.dirty || self.in_tx(&d.path))) {
-            window.push_notification(format!("Save {} and end its transaction first.", d.name()), cx);
+        // The user already confirmed the Trash, so unsaved edits go with the file; an open
+        // transaction still needs a commit or rollback first.
+        if let Some(d) = self.docs.iter().find(|d| d.path.starts_with(path) && self.in_tx(&d.path)) {
+            window.push_notification(format!("End the transaction in {} first.", d.name()), cx);
             return;
         }
         if let Err(e) = trash::delete(path) {
