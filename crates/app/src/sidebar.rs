@@ -6,7 +6,6 @@
 
 use std::{
     collections::BTreeMap,
-    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -20,9 +19,13 @@ use gpui_component::{
     v_flex,
 };
 
+use siesta_workspace::Workspace;
+
 use crate::{Siesta, SideTab};
 
 pub(crate) const ROW_H: f32 = 24.;
+/// Statements of one file shown at once; more scroll inside the file's own block.
+pub(crate) const FILE_STATEMENTS: usize = 20;
 pub(crate) const INDENT: f32 = 14.;
 /// Left padding before the first chevron.
 pub(crate) const PAD: f32 = 6.;
@@ -34,6 +37,38 @@ pub(crate) enum Row {
     File { path: PathBuf, name: String, depth: usize, statements: usize },
     Statement { path: PathBuf, line: usize, label: String, depth: usize },
     Note { text: &'static str, depth: usize },
+}
+
+/// `rows` cut into spans in order: a file's statements longer than [`FILE_STATEMENTS`] with that
+/// file's path (they scroll in their own block), everything else with `None`.
+fn long_statement_runs(rows: &[Row]) -> Vec<(std::ops::Range<usize>, Option<&Path>)> {
+    let mut out: Vec<(std::ops::Range<usize>, Option<&Path>)> = vec![];
+    let mut ix = 0;
+    while ix < rows.len() {
+        let Row::Statement { path, .. } = &rows[ix] else {
+            ix += 1;
+            continue;
+        };
+        let end = ix + rows[ix..].iter().take_while(|r| matches!(r, Row::Statement { path: p, .. } if p == path)).count();
+        if end - ix > FILE_STATEMENTS {
+            out.push((ix..end, Some(path)));
+        }
+        ix = end;
+    }
+    // Fill the gaps between the long runs with plain spans.
+    let mut all = vec![];
+    let mut at = 0;
+    for (span, path) in out {
+        if at < span.start {
+            all.push((at..span.start, None));
+        }
+        at = span.end;
+        all.push((span, path));
+    }
+    if at < rows.len() {
+        all.push((at..rows.len(), None));
+    }
+    all
 }
 
 impl Row {
@@ -141,11 +176,14 @@ impl Siesta {
     fn empty_files(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let (muted, hover) = (t.muted_foreground, t.list_hover);
-        let recent = self.recent.iter().enumerate().map(|(i, p)| {
-            let file = p.is_file();
-            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
-            let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
-            let path = p.clone();
+        let recent = self.recent.iter().enumerate().map(|(i, w)| {
+            let (file, name) = (matches!(w, Workspace::Files(_)), w.name());
+            // Where it is: the folder's parent, or the folder holding the chosen files.
+            let dir = match w {
+                Workspace::Folder(p) => p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
+                Workspace::Files(_) => w.folder().display().to_string(),
+            };
+            let ws = w.clone();
             div()
                 .id(("recent", i))
                 .px_2()
@@ -158,7 +196,7 @@ impl Siesta {
                 .gap_2()
                 .child(Icon::new(if file { IconName::File } else { IconName::Folder }).size_3p5().flex_none().text_color(muted))
                 .child(v_flex().min_w_0().child(div().text_sm().truncate().child(name)).child(div().text_xs().text_color(muted).truncate().child(dir)))
-                .on_click(cx.listener(move |this, _, window, cx| this.set_root(path.clone(), window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.set_workspace(ws.clone(), window, cx)))
         });
         v_flex()
             .flex_1()
@@ -170,8 +208,8 @@ impl Siesta {
                 h_flex()
                     .px_1()
                     .gap_2()
-                    .child(Button::new("empty-open-folder").label("Open Folder…").small().on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))))
-                    .child(Button::new("empty-open-file").label("Open File…").small().on_click(cx.listener(|this, _, window, cx| this.open_single_file(window, cx)))),
+                    .child(Button::new("empty-open-folder").label("Open Folder…").small().on_click(cx.listener(|this, _, window, cx| this.open_dialog(false, true, window, cx))))
+                    .child(Button::new("empty-open-file").label("Open Files…").small().on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, false, window, cx)))),
             )
             .when(!self.recent.is_empty(), |el| {
                 el.child(div().px_1().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("RECENT"))
@@ -181,7 +219,7 @@ impl Siesta {
     }
 
     pub(crate) fn build_rows(&mut self, query: &str, cx: &App) -> Vec<Row> {
-        let (root, files) = (self.root.clone(), self.files.clone());
+        let (root, files) = (self.folder(), self.files.clone());
         let mut rows = vec![];
         if files.is_empty() {
             rows.push(Row::Note { text: "No .sql files", depth: 0 });
@@ -232,6 +270,26 @@ impl Siesta {
                 rows.extend(outline.into_iter().map(|(line, label)| Row::Statement { path: f.clone(), line, label, depth: depth + 1 }));
             }
         }
+    }
+
+    /// Every row; a file's statements beyond [`FILE_STATEMENTS`] go into a block of that height
+    /// that scrolls on its own, so one long file doesn't push the rest of the tree away.
+    // ponytail: not virtualized (uniform_list can't hold a block of another height); fine for
+    // hundreds of rows, a variable-height `list` if a workspace ever has thousands.
+    fn render_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = vec![];
+        for (span, path) in long_statement_runs(&self.rows) {
+            let items = span.map(|i| self.render_row(i, cx));
+            match path {
+                // Keyed by the file, so its scroll position survives the tree changing around it.
+                Some(p) => {
+                    let id = ElementId::Name(format!("statements:{}", p.display()).into());
+                    out.push(div().id(id).flex_none().h(px(FILE_STATEMENTS as f32 * ROW_H)).overflow_y_scroll().children(items).into_any_element());
+                }
+                None => out.extend(items),
+            }
+        }
+        out
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -381,16 +439,14 @@ impl Siesta {
             .gap_2()
             .child(tabs)
             .child(div().flex().items_center().when(self.side_tab == SideTab::Files, |el| {
-                el.child(icon_button("open-folder", IconName::FolderOpen).on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))))
+                el.child(icon_button("open-folder", IconName::FolderOpen).on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, true, window, cx))))
             }));
         let body = match self.side_tab {
             SideTab::Files => {
                 let query = self.sidebar_filter.read(cx).value().trim().to_lowercase();
                 self.rows = self.build_rows(&query, cx);
-                let list = uniform_list("sidebar", self.rows.len(), cx.processor(|this, range: Range<usize>, _, cx| {
-                    range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
-                }));
-                let root_name = self.root.file_name().map_or_else(|| self.root.display().to_string(), |n| n.to_string_lossy().into_owned());
+                let list = div().id("sidebar").overflow_y_scroll().children(self.render_rows(cx));
+                let root_name = self.workspace.name();
                 let search = div()
                     .flex_none()
                     .px_2()
@@ -482,8 +538,27 @@ pub(crate) fn chevron(open: bool, color: Hsla) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's glob import brings its own `test` macro.
-    use super::Tree;
+    use super::{FILE_STATEMENTS, Row, Tree, long_statement_runs};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn only_long_statement_lists_get_their_own_block() {
+        let (a, b) = (PathBuf::from("/w/a.sql"), PathBuf::from("/w/b.sql"));
+        let file = |p: &PathBuf| Row::File { path: p.clone(), name: String::new(), depth: 0, statements: 0 };
+        let st = |p: &PathBuf, n: usize| (0..n).map(|line| Row::Statement { path: p.clone(), line, label: String::new(), depth: 1 }).collect::<Vec<_>>();
+        let long = FILE_STATEMENTS + 1;
+        // a: over the limit (own block), b: exactly the limit (inline).
+        let mut rows = vec![file(&a)];
+        rows.extend(st(&a, long));
+        rows.push(file(&b));
+        rows.extend(st(&b, FILE_STATEMENTS));
+        let runs = long_statement_runs(&rows);
+        let n = rows.len();
+        assert_eq!(runs, [(0..1, None), (1..1 + long, Some(a.as_path())), (1 + long..n, None)]);
+        // Nothing long: one plain span; nothing at all: no spans.
+        assert_eq!(long_statement_runs(&rows[1 + long..]), [(0..n - 1 - long, None)]);
+        assert!(long_statement_runs(&[]).is_empty());
+    }
 
     #[test]
     fn tree_groups_by_folder() {

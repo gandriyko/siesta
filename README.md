@@ -80,7 +80,7 @@ You need a recent stable Rust toolchain (edition 2024).
 
 ## Desktop app
 
-Run `siesta path/to/dir` (or <kbd>⌘</kbd> <kbd>O</kbd>) to open a folder of `.sql` files. `siesta report.sql:12` (or **File → Open File…**) opens just that one file, at a line, with its own state and history. A plain `siesta` reopens whatever was open last.
+Run `siesta path/to/dir` (or <kbd>⌘</kbd> <kbd>O</kbd>) to open a folder of `.sql` files. `siesta report.sql:12` opens just that one file, at a line, with its own state and history. **File → Open File…** and the folder button above the file tree pick several `.sql` files at once (from any folders): together they become the workspace, with their own state, history and place in the recent list. The button also takes a folder. A plain `siesta` reopens whatever was open last.
 
 | Shortcut | Action |
 |---|---|

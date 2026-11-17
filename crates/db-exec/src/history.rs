@@ -14,7 +14,7 @@ pub struct Entry {
     pub time: String,
     /// `gui` / `cli`.
     pub source: String,
-    /// The workspace root (a folder, or the file of a single-file workspace), absolute.
+    /// The workspace's key: its folder, or its chosen files one per line (absolute).
     #[serde(default)]
     pub workspace: String,
     /// Relative to the workspace folder.
@@ -58,26 +58,25 @@ impl Entry {
 }
 
 pub struct Store {
-    root: PathBuf,
+    /// The workspace's key (`siesta_workspace::Workspace::key`).
+    workspace: String,
+    /// What `file` is relative to.
+    folder: PathBuf,
     dir: PathBuf,
     /// Entries kept across all workspaces (`history.total`); older ones are deleted on record.
     pub total: usize,
 }
 
 impl Store {
-    /// `base` is `~/.siesta`; `root` is the workspace root, or the file of a single-file workspace.
-    pub fn open(base: &Path, root: &Path) -> io::Result<Self> {
+    /// `base` is `~/.siesta`; `workspace` tags the entries, `folder` is what their files are relative to.
+    pub fn open(base: &Path, workspace: &str, folder: &Path) -> io::Result<Self> {
         let dir = base.join("history");
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { root: root.to_path_buf(), dir, total: 500 })
+        Ok(Self { workspace: workspace.to_string(), folder: folder.to_path_buf(), dir, total: 500 })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Saves `entry` (its `id`, `time` and relative `file` are filled in from `file`); returns the id.
@@ -90,10 +89,8 @@ impl Store {
         }
         entry.id = id.clone();
         entry.time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        entry.workspace = self.root.to_string_lossy().into_owned();
-        // A single-file workspace (`root` is the file) counts from the file's folder.
-        let folder = if self.root.is_file() { self.root.parent().unwrap_or(&self.root) } else { &self.root };
-        entry.file = file.strip_prefix(folder).unwrap_or(file).to_string_lossy().into_owned();
+        entry.workspace = self.workspace.clone();
+        entry.file = file.strip_prefix(&self.folder).unwrap_or(file).to_string_lossy().into_owned();
         std::fs::write(self.dir.join(format!("{id}.json")), serde_json::to_vec_pretty(&entry).map_err(io::Error::other)?)?;
         // Prune by file name: no entry needs reading.
         for old in self.ids().into_iter().skip(self.total.max(1)) {
@@ -117,11 +114,10 @@ impl Store {
     /// This workspace's entries, newest first.
     // ponytail: reads every entry (≤ `total` small files) when the window opens; add an index file if it shows up.
     pub fn list(&self) -> Vec<Entry> {
-        let root = self.root.to_string_lossy();
         self.ids()
             .iter()
             .filter_map(|id| serde_json::from_slice::<Entry>(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok())
-            .filter(|e| e.workspace == root)
+            .filter(|e| e.workspace == self.workspace)
             .collect()
     }
 }
@@ -134,8 +130,8 @@ mod tests {
     fn one_folder_per_workspace_list_and_global_prune() {
         let base = tempfile::tempdir().unwrap();
         let (a, b) = (Path::new("/w1/app"), Path::new("/w2/app"));
-        let mut sa = Store::open(base.path(), a).unwrap();
-        let mut sb = Store::open(base.path(), b).unwrap();
+        let mut sa = Store::open(base.path(), "/w1/app", a).unwrap();
+        let mut sb = Store::open(base.path(), "/w2/app", b).unwrap();
         assert_eq!((sa.dir(), sb.dir()), (base.path().join("history").as_path(), base.path().join("history").as_path()));
         (sa.total, sb.total) = (3, 3);
         let file = a.join("q/reports.sql");

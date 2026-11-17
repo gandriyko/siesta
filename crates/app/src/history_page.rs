@@ -23,7 +23,7 @@ const ACTIONS_W: f32 = 56.;
 
 impl Siesta {
     fn history_store(&self) -> Option<Store> {
-        let mut s = Store::open(self.base.as_deref()?, &self.root).inspect_err(|e| eprintln!("siesta: history disabled: {e}")).ok()?;
+        let mut s = Store::open(self.base.as_deref()?, &self.workspace.key(), &self.folder()).inspect_err(|e| eprintln!("siesta: history disabled: {e}")).ok()?;
         s.total = self.settings.settings.history.total;
         Some(s)
     }
