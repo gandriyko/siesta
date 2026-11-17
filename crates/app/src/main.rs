@@ -1004,8 +1004,7 @@ impl Siesta {
 
     /// The current file's connection colour (its own, or red for prod), in the theme's shade.
     fn connection_color(&self, cx: &App) -> Option<Hsla> {
-        let d = self.doc().filter(|d| d.sql)?;
-        format::parse_color(d.conns.connections.get(d.connection()?)?.display_color()?, cx.theme().is_dark())
+        doc_color(self.doc()?, cx.theme().is_dark())
     }
 
     /// Top-right connection picker: the connections, "No connection", and the form / page entries. The dot is grey until sessions exist (green / red later).
@@ -1148,8 +1147,11 @@ impl Siesta {
         let (muted, fg, hover_bg, raised, border) = (t.muted_foreground, t.foreground, t.list_hover, t.secondary, t.border);
         // Sized from the interface font, so the tabs keep up with the label.
         let fs = t.font_size;
+        let dark = t.is_dark();
         let tabs = self.docs.iter().enumerate().map(|(i, d)| {
             let current = self.current == Some(i);
+            // A file with a coloured connection: its tab is tinted with that colour (stronger when current).
+            let tint = doc_color(d, dark);
             let group: SharedString = format!("doc-tab-{i}").into();
             // An icon, not a `×` glyph: the glyph sits small and low next to the label.
             let close = div()
@@ -1182,9 +1184,11 @@ impl Siesta {
                 .gap_1()
                 .rounded_lg()
                 .border_1()
-                .map(|el| match current {
-                    true => el.bg(raised).border_color(border).text_color(fg),
-                    false => el.border_color(gpui::transparent_black()).text_color(muted).hover(move |s| s.bg(hover_bg).text_color(fg)),
+                .map(|el| match (current, tint) {
+                    (true, None) => el.bg(raised).border_color(border).text_color(fg),
+                    (false, None) => el.border_color(gpui::transparent_black()).text_color(muted).hover(move |s| s.bg(hover_bg).text_color(fg)),
+                    (true, Some(c)) => el.bg(c.opacity(0.45)).border_color(c).text_color(fg),
+                    (false, Some(c)) => el.bg(c.opacity(0.25)).border_color(gpui::transparent_black()).text_color(fg.opacity(0.75)).hover(move |s| s.bg(c.opacity(0.35)).text_color(fg)),
                 })
                 .on_click(cx.listener(move |this, _, window, cx| this.select(i, window, cx)))
                 .child(d.name())
@@ -1233,6 +1237,14 @@ impl Siesta {
         div().size_full().flex().flex_col().children(tabs).child(card).into_any_element()
     }
 
+}
+
+/// A file's connection colour (its own, or red for prod) in the shade for a `dark` or light theme.
+fn doc_color(d: &doc::Doc, dark: bool) -> Option<Hsla> {
+    if !d.sql {
+        return None;
+    }
+    format::parse_color(d.conns.connections.get(d.connection()?)?.display_color()?, dark)
 }
 
 /// A panel on the window background: rounded, hairline border, ring colour while it has focus.
