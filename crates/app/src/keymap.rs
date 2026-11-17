@@ -62,7 +62,7 @@ fn defaults() -> Vec<Spec> {
         spec(key("b"), ToggleSidebar, Both),
         spec("ctrl-tab", NextTab, Both),
         spec(key(","), OpenSettings, Both),
-        spec(key("o"), OpenFolder, Both),
+        spec(key("o"), AddFiles, Both),
         spec(key("alt-e"), PickConnection, Both),
         spec(key("p"), GoToFile, Both),
         spec(key("shift-o"), GoToStatement, Both),

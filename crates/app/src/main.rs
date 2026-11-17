@@ -25,7 +25,7 @@ mod value_popup;
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -41,12 +41,12 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
     resizable_panel,
 };
-use siesta_workspace::{OpenFile, Workspace, WorkspaceState};
+use siesta_workspace::{OpenFile, WorkspaceState};
 
 actions!(
     siesta,
     [
-        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, OpenFolder, OpenSingleFile, Quit,
+        RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, AddFiles, Import, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
         NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
@@ -83,18 +83,20 @@ pub(crate) enum SideTab {
 type Stamp = Vec<(PathBuf, Option<std::time::SystemTime>)>;
 
 pub(crate) struct Siesta {
-    /// A folder or chosen files: what the file tree shows and what state and history are kept under.
-    workspace: Workspace,
     /// The connections of the config dir, shared by every open file.
     conns: Arc<Connections>,
     /// Where `state.json`, history and the schema cache live (`~/.siesta`); `None` = nothing is saved.
     base: Option<PathBuf>,
     docs: Vec<Doc>,
     current: Option<usize>,
-    /// The workspace's `.sql` files (nothing else is shown).
+    /// Folders and `.sql` files of the central folder (`<config dir>/collections`), as in Respite.
+    central: Vec<PathBuf>,
+    /// `.sql` files added from elsewhere (`~/.siesta/files.json`).
+    added: Vec<PathBuf>,
+    /// Every `.sql` file the sidebar lists: the central folder's, then the added ones.
     files: Vec<PathBuf>,
-    /// Workspaces opened before (newest first), offered when this one has no `.sql` files.
-    recent: Vec<Workspace>,
+    /// Files being dragged in from Finder; taken on mouse up (see `file_drop`).
+    dragged: Option<Vec<PathBuf>>,
     side_tab: SideTab,
     /// Expanded files in the sidebar.
     expanded: HashSet<PathBuf>,
@@ -113,10 +115,6 @@ pub(crate) struct Siesta {
     sidebar: bool,
     /// Cmd+J hides the result panel.
     result_open: bool,
-    /// The connection picked per file (`None` = "No connection" chosen); persisted.
-    picks: BTreeMap<PathBuf, Option<String>>,
-    /// The database picked per file (absent = the connection's default); persisted.
-    db_picks: BTreeMap<PathBuf, String>,
     /// The databases each connection's server offers (`schema_cache::key` of the connection as
     /// saved), read in the background when a picker opens; kept until "Refresh".
     db_lists: HashMap<String, runner::DbList>,
@@ -143,7 +141,8 @@ pub(crate) struct Siesta {
     settings: siesta_settings::Loaded,
     settings_window: Option<WindowHandle<Root>>,
     connections_window: Option<WindowHandle<Root>>,
-    /// `~/.config/siesta`: `connections/<name>.json` live here; `None` = no connections.
+    /// `~/.config/siesta`: `collections/` (the central folder of `.sql` files) and
+    /// `connections/<name>.json`; `None` = no home (nothing listed, no connections).
     config_dir: Option<PathBuf>,
     /// The open New / Edit connection form. Weak: the dialog owns it, so closing the dialog any way
     /// (Esc, ×, Close) drops the form and with it a running Test.
@@ -205,7 +204,6 @@ fn parse_target(arg: &str) -> (PathBuf, Option<u32>) {
 impl Siesta {
     /// `open`: a file (and 1-based line) that is brought to the front after the saved tabs.
     fn new(
-        workspace: Workspace,
         open: Option<(PathBuf, Option<u32>)>,
         base: Option<PathBuf>,
         settings: siesta_settings::Loaded,
@@ -264,13 +262,14 @@ impl Siesta {
         ];
         let conns = Arc::new(config_dir.as_deref().map(Connections::load).unwrap_or_default());
         let mut this = Self {
-            workspace,
             conns,
             base,
             docs: vec![],
             current: None,
+            central: vec![],
+            added: vec![],
             files: vec![],
-            recent: vec![],
+            dragged: None,
             side_tab: SideTab::Files,
             expanded: HashSet::new(),
             outlines: HashMap::new(),
@@ -283,8 +282,6 @@ impl Siesta {
             collapsed_dirs: HashSet::new(),
             sidebar: true,
             result_open: true,
-            picks: BTreeMap::new(),
-            db_picks: BTreeMap::new(),
             db_lists: HashMap::new(),
             db_menu: Default::default(),
             conns_seen: None,
@@ -316,15 +313,13 @@ impl Siesta {
         this
     }
 
-    /// List the workspace's files and bring back the saved tabs; `open` (a launch argument) ends up in front.
-    /// Without any file, a sample is offered (and written only on save).
+    /// List the files and bring back the saved tabs; `open` (a launch argument) ends up in front.
+    /// Without any file, a sample is offered in the central folder (and written only on save).
     fn load_workspace(&mut self, open: Option<(PathBuf, Option<u32>)>, window: &mut Window, cx: &mut Context<Self>) {
         self.expanded = HashSet::new();
+        self.added = self.base.as_deref().map(siesta_workspace::load_files).unwrap_or_default();
         self.rescan();
-        self.recent = self.base.as_deref().map(siesta_workspace::recent).unwrap_or_default().into_iter().filter(|w| *w != self.workspace).collect();
-        let state = self.base.as_deref().map(|b| siesta_workspace::load_state(b, &self.workspace)).unwrap_or_default();
-        self.picks = state.connections;
-        self.db_picks = state.databases;
+        let state = self.base.as_deref().map(siesta_workspace::load_state).unwrap_or_default();
         for f in state.open.iter().filter(|f| f.path.is_file()) {
             if let Some(ix) = self.open(f.path.clone(), None, window, cx) {
                 self.docs[ix].editor.update(cx, |s, cx| s.set_cursor_position(Position::new(f.line, f.column), window, cx));
@@ -335,6 +330,8 @@ impl Siesta {
         }
         match open {
             Some((path, line)) => {
+                // A file from elsewhere joins the added ones, as the Files `+` does.
+                self.add_file(path.clone());
                 self.open(path.clone(), None, window, cx);
                 if let Some(line) = line {
                     self.go_to(path, line as usize, false, window, cx);
@@ -351,53 +348,17 @@ impl Siesta {
         }
     }
 
-    fn rescan(&mut self) {
-        self.files = self.workspace.files();
+    /// Re-read the central folder and drop added files that are gone.
+    pub(crate) fn rescan(&mut self) {
+        self.central = if self.config_dir.is_some() { siesta_workspace::scan(&self.folder()) } else { vec![] };
+        self.added.retain(|p| p.is_file());
+        self.files = self.central.iter().filter(|p| siesta_workspace::is_sql(p)).chain(&self.added).cloned().collect();
     }
 
-    /// The folder relative paths count from: the workspace folder, or the one holding the chosen files.
+    /// The central folder `<config dir>/collections` (as in Respite): where new files go, and what
+    /// relative paths count from. Settings, keymap and `connections/` sit next to it.
     pub(crate) fn folder(&self) -> PathBuf {
-        self.workspace.folder()
-    }
-
-    /// The open dialog, then what was picked becomes the workspace: the `.sql` files (several at
-    /// once), else a folder. Cmd+O picks a folder, File → Open File… files, the button above the file
-    /// tree either. Refused while there are unsaved files.
-    pub(crate) fn open_dialog(&mut self, files: bool, folders: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = if !files { "Open Folder" } else { "Open" };
-        let picked = cx.prompt_for_paths(PathPromptOptions { files, directories: folders, multiple: files, prompt: Some(prompt.into()) });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else { return };
-            this.update_in(cx, |this, window, cx| match Workspace::from_paths(paths) {
-                Some(ws) => this.set_workspace(ws, window, cx),
-                None => window.push_notification("Pick .sql files or a folder", cx),
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Switch to another workspace.
-    fn set_workspace(&mut self, workspace: Workspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.docs.iter().any(|d| d.dirty) {
-            window.push_notification("Save or close the unsaved files before opening another workspace", cx);
-            return;
-        }
-        self.remember(cx);
-        self.docs.clear();
-        self.current = None;
-        self.mru.clear();
-        self.outlines.clear();
-        self.collapsed_dirs.clear();
-        self.conns_seen = None;
-        self.settings = siesta_settings::Loaded::load_from(self.settings.global_path.clone());
-        for e in &self.settings.errors {
-            window.push_notification(format!("Settings: {e}"), cx);
-        }
-        self.workspace = workspace;
-        self.load_workspace(None, window, cx);
-        self.apply_settings(window, cx);
-        cx.notify();
+        self.config_dir.as_ref().map(|c| siesta_settings::collections_dir_in(c)).unwrap_or_default()
     }
 
     /// Open files changed on disk: an unedited tab takes the new text (as an undoable edit), an
@@ -573,18 +534,13 @@ impl Siesta {
                             return;
                         }
                         let d = &mut this.docs[ix];
-                        let before = d.connection().map(str::to_string);
+                        let before = (d.connection().map(str::to_string), d.database().map(str::to_string));
                         d.dirty = true;
                         d.reparse(cx);
-                        // A typed `-- @connection` that names another connection acts like the picker:
-                        // the database pick resets and the schema loads.
-                        if d.connection() != before.as_deref() {
+                        // Another `-- @connection` / `-- @database` (typed or written by a picker):
+                        // the schema of that one loads.
+                        if (d.connection(), d.database()) != (before.0.as_deref(), before.1.as_deref()) {
                             let path = (*d.path).clone();
-                            if d.picked_db.take().is_some() {
-                                this.db_picks.remove(&path);
-                                this.docs[ix].reparse(cx);
-                                this.remember(cx);
-                            }
                             this.autoload_schema(&path, window, cx);
                         }
                         if let Some(key) = this.docs[ix].schema_key() {
@@ -599,14 +555,12 @@ impl Siesta {
                         cx.notify();
                     }),
                 ];
-                let picked = self.picks.get(&path).cloned().flatten();
-                let picked_db = self.db_picks.get(&path).cloned();
-                self.docs.push(Doc::new(path.clone(), editor, self.conns.clone(), picked, picked_db, self.schemas.clone(), subs, cx));
+                self.docs.push(Doc::new(path.clone(), editor, self.conns.clone(), self.schemas.clone(), subs, cx));
                 let ix = self.docs.len() - 1;
                 if let Some(key) = self.docs[ix].schema_key() {
                     self.load_cached_schema(&key);
                 }
-                // A restored pick loads the schema like a fresh one.
+                // The file's `-- @connection` loads the schema like a fresh pick.
                 self.autoload_schema(&path, window, cx);
                 ix
             }
@@ -733,42 +687,8 @@ impl Siesta {
                 OpenFile { path: (*d.path).clone(), line: pos.line, column: pos.character }
             })
             .collect();
-        let state = WorkspaceState { open, current: self.doc().map(|d| (*d.path).clone()), connections: self.picks.clone(), databases: self.db_picks.clone() };
-        siesta_workspace::save_state(base, &self.workspace, &state);
-    }
-
-    /// Chosen files only: the workspace becomes `files`. Its key changes with the set, so the tabs
-    /// and picks are saved under the new set and the old set leaves RECENT.
-    pub(crate) fn set_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let Some(new) = Workspace::from_paths(files).filter(|w| matches!(w, Workspace::Files(_))) else { return };
-        let old = std::mem::replace(&mut self.workspace, new);
-        self.rescan();
-        self.remember(cx);
-        if let Some(base) = &self.base {
-            siesta_workspace::forget(base, &old);
-        }
-        if self.show_history {
-            self.reload_history();
-        }
-        cx.notify();
-    }
-
-    /// × on a chosen file: it leaves the workspace (and its tab closes); the file stays on disk.
-    /// The last file can't go, and an unsaved or mid-transaction tab has to be dealt with first.
-    pub(crate) fn remove_from_workspace(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let Workspace::Files(files) = &self.workspace else { return };
-        let rest: Vec<PathBuf> = files.iter().filter(|f| *f != path).cloned().collect();
-        if rest.is_empty() {
-            return;
-        }
-        if let Some(ix) = self.docs.iter().position(|d| *d.path == *path) {
-            if self.docs[ix].dirty || self.in_tx(path) {
-                return window.push_notification(format!("Save {} and end its transaction before removing it", self.docs[ix].name()), cx);
-            }
-            self.close_now(ix, window, cx);
-        }
-        self.expanded.remove(path);
-        self.set_files(rest, cx);
+        let state = WorkspaceState { open, current: self.doc().map(|d| (*d.path).clone()) };
+        siesta_workspace::save_state(base, &state);
     }
 
     /// A dirty tab needs a second close (or a save) — no silent data loss.
@@ -846,54 +766,29 @@ impl Siesta {
 
     // ---- connection ----
 
-    /// The picker's choice for the current file (`None` = no connection): remembered per file.
-    /// With `-- @connection` in the text the stored pick is left alone: the choice rewrites the
-    /// directive instead, after a confirmation.
+    /// The picker's choice for the current file (`None` = no connection).
     pub(crate) fn select_connection(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.doc() else { return };
-        let Some(old) = d.locked().map(str::to_string) else {
-            let path = (*d.path).clone();
-            return self.pick_for(&path, name, window, cx);
-        };
-        if name.as_deref() == Some(old.as_str()) {
-            return;
-        }
-        let prod = name.as_deref().and_then(|n| d.conns.connections.get(n)).is_some_and(|c| c.prod);
-        let action = match &name {
-            Some(n) => format!("Switch to `{n}`{} and rewrite that line in the file?", if prod { " (PRODUCTION)" } else { "" }),
-            None => "Remove that line from the file?".to_string(),
-        };
-        let detail = format!("This file sets its connection with `-- @connection {old}`. {action}");
-        let answer = window.prompt(PromptLevel::Warning, "Change connection in file?", Some(&detail), &["Rewrite", "Cancel"], cx);
-        let path = (*d.path).clone();
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            this.update_in(cx, |this, window, cx| this.rewrite_directive(&path, "connection", name.as_deref(), window, cx)).ok();
-        })
-        .detach();
+        let Some(path) = self.doc().map(|d| (*d.path).clone()) else { return };
+        self.pick_for(&path, name, window, cx);
     }
 
-    /// Replaces (or removes) the `-- @connection` / `-- @database` line (`word`) as an ordinary
-    /// undoable edit; the editor's change handling then re-splits the text and the choice follows.
-    fn rewrite_directive(&mut self, path: &Path, word: &str, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Writes `name` into `path`'s open tab as its `-- @connection` line (inserted first, replaced,
+    /// or removed for `None`), as Respite writes `# @env`: an ordinary undoable edit, saved with the
+    /// file, so the choice travels with it and the CLI sees the same. Another connection drops
+    /// `-- @database` too (it belonged to the old server). The schema of the new one loads.
+    pub(crate) fn pick_for(&mut self, path: &Path, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
         let d = &self.docs[ix];
-        let before = d.connection().map(str::to_string);
         let old = d.editor.read(cx).value().to_string();
-        let rewritten = match word {
-            "database" => sql_split::rewrite_database(&old, d.dialect, name),
-            _ => sql_split::rewrite_connection(&old, d.dialect, name),
-        };
-        let Some(new) = rewritten else { return };
-        self.replace_text(ix, &old, &new, window, cx);
-        // Another connection starts from its default database.
-        if self.docs[ix].connection().map(str::to_string) != before {
-            self.db_picks.remove(path);
-            self.docs[ix].picked_db = None;
-            self.docs[ix].reparse(cx);
-            self.remember(cx);
+        let new = sql_split::set_connection(&old, d.dialect, name.as_deref());
+        if new != old {
+            self.replace_text(ix, &old, &new, window, cx);
+        }
+        if let Some(key) = self.docs[ix].schema_key() {
+            self.load_cached_schema(&key);
+        }
+        if name.is_some() {
+            self.autoload_schema(path, window, cx);
         }
         cx.notify();
     }
@@ -909,20 +804,12 @@ impl Siesta {
         self.docs[ix].reparse(cx);
     }
 
-    /// Connection `old` was renamed to `new`: stored picks follow silently; files whose
-    /// `-- @connection old` line would now name an unknown connection are offered a rewrite
-    /// (open tabs as an undoable edit, other workspace files on disk).
+    /// Connection `old` was renamed to `new`: files whose `-- @connection old` line would now name
+    /// an unknown connection are offered a rewrite (open tabs as an undoable edit, other listed
+    /// files on disk).
     pub(crate) fn rename_references(&mut self, old: &str, new: &str, window: &mut Window, cx: &mut Context<Self>) {
-        for pick in self.picks.values_mut().filter(|p| p.as_deref() == Some(old)) {
-            *pick = Some(new.to_string());
-        }
-        for d in self.docs.iter_mut().filter(|d| d.picked.as_deref() == Some(old)) {
-            d.picked = Some(new.to_string());
-            d.reparse(cx);
-        }
-        self.remember(cx);
         let names = |f: &Path| f.strip_prefix(self.folder()).unwrap_or(f).display().to_string();
-        let open: Vec<PathBuf> = self.docs.iter().filter(|d| d.locked() == Some(old)).map(|d| (*d.path).clone()).collect();
+        let open: Vec<PathBuf> = self.docs.iter().filter(|d| d.connection() == Some(old)).map(|d| (*d.path).clone()).collect();
         let closed: Vec<PathBuf> = self
             .files
             .iter()
@@ -943,7 +830,7 @@ impl Siesta {
             }
             this.update_in(cx, |this, window, cx| {
                 for p in open {
-                    let Some(ix) = this.docs.iter().position(|d| *d.path == p && d.locked() == Some(old.as_str())) else { continue };
+                    let Some(ix) = this.docs.iter().position(|d| *d.path == p && d.connection() == Some(old.as_str())) else { continue };
                     let text = this.docs[ix].editor.read(cx).value().to_string();
                     if let Some(t) = sql_split::rewrite_connection(&text, this.docs[ix].dialect, Some(&new)) {
                         this.replace_text(ix, &text, &t, window, cx);
@@ -968,56 +855,27 @@ impl Siesta {
         .detach();
     }
 
-    /// The database picker's choice for the current file (`None` = the connection's default).
-    /// With `-- @database` in the text the choice rewrites the directive instead, after a
-    /// confirmation; otherwise it is remembered per file. Either way the file moves to a new
-    /// session (an open transaction in the old one is asked about first).
+    /// The database picker's choice for the current file (`None` = the connection's default):
+    /// written as its `-- @database` line (right after `-- @connection`), an undoable edit. The file
+    /// moves to a new session; a transaction open in the old one is asked about first.
     pub(crate) fn select_database(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.doc().filter(|d| d.sql && d.connection().is_some()) else { return };
         let path = (*d.path).clone();
-        let Some(old) = d.locked_db().map(str::to_string) else {
-            return self.change_database(path, name, false, window, cx);
-        };
-        if name.as_deref() == Some(old.as_str()) {
-            return;
-        }
-        let action = match &name {
-            Some(n) => format!("Switch to `{n}` and rewrite that line in the file?"),
-            None => "Remove that line from the file?".to_string(),
-        };
-        let detail = format!("This file sets its database with `-- @database {old}`. {action}");
-        let answer = window.prompt(PromptLevel::Warning, "Change database in file?", Some(&detail), &["Rewrite", "Cancel"], cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
-                this.update_in(cx, |this, window, cx| this.change_database(path, name, true, window, cx)).ok();
-            }
-        })
-        .detach();
-    }
-
-    /// Moves `path` to database `name` (`rewrite`: through its `-- @database` line, else as a pick).
-    /// A transaction open in a session that this leaves behind is asked about first.
-    fn change_database(&mut self, path: PathBuf, name: Option<String>, rewrite: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.docs.iter().find(|d| *d.path == path) else { return };
         let Some(base) = d.connection().and_then(|n| d.conns.connections.get(n)) else { return };
-        let target = if rewrite { name.clone().or(d.picked_db.clone()) } else { name.clone() }.or(base.database.clone());
+        let target = name.clone().or(base.database.clone());
         if self.in_tx_elsewhere(&path, &base.name, &target) {
-            return self.ask_transaction(path.clone(), move |this, window, cx| this.apply_database(path, name, rewrite, window, cx), window, cx);
+            return self.ask_transaction(path.clone(), move |this, window, cx| this.apply_database(path, name, window, cx), window, cx);
         }
-        self.apply_database(path, name, rewrite, window, cx);
+        self.apply_database(path, name, window, cx);
     }
 
-    fn apply_database(&mut self, path: PathBuf, name: Option<String>, rewrite: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_database(&mut self, path: PathBuf, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
-        if rewrite {
-            self.rewrite_directive(&path, "database", name.as_deref(), window, cx);
-        } else {
-            match &name {
-                Some(n) => self.db_picks.insert(path.clone(), n.clone()),
-                None => self.db_picks.remove(&path),
-            };
-            self.docs[ix].picked_db = name;
-            self.docs[ix].reparse(cx);
+        let d = &self.docs[ix];
+        let old = d.editor.read(cx).value().to_string();
+        let new = sql_split::set_database(&old, d.dialect, name.as_deref());
+        if new != old {
+            self.replace_text(ix, &old, &new, window, cx);
         }
         let d = &self.docs[ix];
         let (conn, keep, key) = (d.connection().map(str::to_string), d.shown_database(), d.schema_key());
@@ -1036,7 +894,6 @@ impl Siesta {
     /// access, read from the server in the background when the picker opens (and kept until Refresh).
     fn database_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
-        let forced = d.locked_db().is_some();
         let label = d.shown_database().unwrap_or_else(|| "(default)".into());
         let build = self.db_menu_builder(cx.entity().downgrade())?;
         let view = cx.entity().downgrade();
@@ -1047,7 +904,7 @@ impl Siesta {
                 .dropdown_caret(true)
                 .small()
                 .ghost()
-                .when(forced, |b| b.tooltip("Set by `-- @database` in this file"))
+                .tooltip("Writes `-- @database` in this file")
                 .dropdown_menu(move |menu, window, cx| build(menu, window, cx))
                 .on_open_change(move |open, window, cx| {
                     if *open {
@@ -1110,27 +967,6 @@ impl Siesta {
         }))
     }
 
-    /// Remembers `name` as the pick of `path` (only that file) and loads its schema in the background.
-    pub(crate) fn pick_for(&mut self, path: &Path, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.docs.iter().position(|d| *d.path == path) else { return };
-        // The database belongs to a connection: another connection starts from its default.
-        if self.docs[ix].picked != name {
-            self.db_picks.remove(path);
-            self.docs[ix].picked_db = None;
-        }
-        self.picks.insert(path.to_path_buf(), name.clone());
-        self.docs[ix].picked = name.clone();
-        self.docs[ix].reparse(cx);
-        if let Some(key) = self.docs[ix].schema_key() {
-            self.load_cached_schema(&key);
-        }
-        if name.is_some() {
-            self.autoload_schema(path, window, cx);
-        }
-        self.remember(cx);
-        cx.notify();
-    }
-
     /// Above the editor: a red "Production" banner for a `prod` connection; a read-only one alone
     /// only gets a neutral badge.
     fn banner(&self, cx: &App) -> Option<AnyElement> {
@@ -1150,12 +986,11 @@ impl Siesta {
     fn connection_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.doc().filter(|d| d.sql)?;
         let current = d.connection().map(str::to_string);
-        let forced = d.locked().is_some();
         // A directive naming a connection that does not exist: shown in red.
-        let unknown = d.locked().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
+        let unknown = d.connection().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
         let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
         // Nothing to pick yet: the picker becomes the way to make the first connection.
-        if names.is_empty() && !forced {
+        if names.is_empty() && unknown.is_none() {
             return Some(
                 Button::new("connection-add")
                     .icon(IconName::Plus)
@@ -1192,11 +1027,9 @@ impl Siesta {
                 .small()
                 .when(prod || unknown.is_some(), |b| b.danger())
                 .when(!(prod || unknown.is_some()), |b| b.ghost())
-                .when(forced, |b| {
-                    b.tooltip(match &unknown {
-                        Some(n) => format!("Unknown connection `{n}` (from `-- @connection`)"),
-                        None => "Set by `-- @connection` in this file".to_string(),
-                    })
+                .tooltip(match &unknown {
+                    Some(n) => format!("Unknown connection `{n}` (from `-- @connection`)"),
+                    None => "Writes `-- @connection` in this file".to_string(),
                 })
                 .dropdown_menu(move |menu, _, cx| {
                     let pick = |name: Option<String>| {
@@ -1249,9 +1082,6 @@ impl Siesta {
                         }));
                     }
                     menu = names.iter().fold(menu, |menu, n| menu.item(row(n.clone(), Some(n.clone()))));
-                    if forced {
-                        menu = menu.separator().label("Set by `-- @connection` in this file");
-                    }
                     // Connections are made in a form (edited with the pencil on each row); Test needs a connection,
                     // Disconnect a live session.
                     let new = {
@@ -1439,6 +1269,43 @@ impl Siesta {
     }
 }
 
+impl Siesta {
+    /// `.sql` dragged in from Finder: listed and opened, like the Files `+` (as in Respite).
+    ///
+    /// Not `on_drop`: gpui drops it when the last input was a key (a Finder drag doesn't switch
+    /// the window to mouse input, so nothing counts as hovered). `on_drag_move` has no hover
+    /// check and keeps the paths; a window-wide mouse-up listener takes them.
+    fn file_drop(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let this = this.clone();
+                // A real mouse down starts some other gesture: a drag that left the window is over.
+                window.on_mouse_event({
+                    let this = this.clone();
+                    move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            this.update(cx, |this, _| this.dragged = None).ok();
+                        }
+                    }
+                });
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture || !cx.has_active_drag() {
+                        return;
+                    }
+                    let Some(this) = this.upgrade() else { return };
+                    let Some(paths) = this.update(cx, |this, _| this.dragged.take()) else { return };
+                    cx.stop_active_drag(window);
+                    this.update(cx, |this, cx| this.add_paths(paths, window, cx));
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+}
+
 impl Render for Siesta {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
@@ -1455,6 +1322,8 @@ impl Render for Siesta {
             // The sidebar, the editor and the result float on it as cards.
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| this.dragged = Some(e.drag(cx).paths().to_vec())))
+            .child(self.file_drop(cx))
             .on_action(cx.listener(|this, _: &RunStatement, window, cx| this.run_current(window, cx)))
             .on_action(cx.listener(|this, _: &RunAll, window, cx| this.run_all(window, cx)))
             .on_action(cx.listener(|this, _: &RepeatLast, window, cx| this.repeat_last(window, cx)))
@@ -1489,8 +1358,8 @@ impl Render for Siesta {
                     this.close(ix, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_dialog(false, true, window, cx)))
-            .on_action(cx.listener(|this, _: &OpenSingleFile, window, cx| this.open_dialog(true, false, window, cx)))
+            .on_action(cx.listener(|this, _: &AddFiles, window, cx| this.add_files(window, cx)))
+            .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &OpenConnections, window, cx| this.open_connections(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
@@ -1529,8 +1398,8 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Quit Siesta", Quit),
         ]),
         Menu::new("File").items([
-            MenuItem::action("Open Folder…", OpenFolder),
-            MenuItem::action("Open File…", OpenSingleFile),
+            MenuItem::action("Add Files…", AddFiles),
+            MenuItem::action("Import…", Import),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Close Tab", CloseTab),
@@ -1600,8 +1469,8 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Next Tab", Box::new(NextTab)),
         ("Save", Box::new(SaveFile)),
         ("Close Tab", Box::new(CloseTab)),
-        ("Open Folder…", Box::new(OpenFolder)),
-        ("Open File…", Box::new(OpenSingleFile)),
+        ("Add Files…", Box::new(AddFiles)),
+        ("Import…", Box::new(Import)),
         ("Settings…", Box::new(OpenSettings)),
         ("Connections", Box::new(OpenConnections)),
         ("Quit Siesta", Box::new(Quit)),
@@ -1625,24 +1494,20 @@ fn main() -> std::process::ExitCode {
     // `-psn_…` is a process serial number some macOS launches still pass to app bundles.
     let target = std::env::args().skip(1).rfind(|a| a != "open" && !a.starts_with("-psn_"));
     let cwd = std::env::current_dir().expect("current dir");
-    let (workspace, open) = match target.map(|t| parse_target(&t)).map(|(p, l)| (std::path::absolute(&p).unwrap_or_else(|_| cwd.join(&p)), l)) {
-        Some((p, _)) if p.is_dir() => (Workspace::Folder(p), None),
-        // A file opens alone (a workspace of that file), not its repository.
-        Some((p, line)) => (Workspace::Files(vec![p.clone()]), Some((p, line))),
-        // No target: the last workspace, else the user's scratch folder `~/.config/siesta/sql`
-        // (cwd is `/` from Finder, `target/…` from cargo). It holds the user's own .sql files, so
-        // it lives with the config, not in the data dir.
-        None => match base.as_deref().and_then(siesta_workspace::last_workspace) {
-            Some(w) => (w, None),
-            None => {
-                let dir = config.as_ref().map(|c| c.join("sql")).unwrap_or(cwd);
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    eprintln!("siesta: {}: {e}", dir.display());
-                }
-                (Workspace::Folder(dir), None)
-            }
-        },
+    // As in Respite: a file argument opens (and joins the added files); there are no project folders.
+    let open = match target.map(|t| parse_target(&t)).map(|(p, l)| (std::path::absolute(&p).unwrap_or_else(|_| cwd.join(&p)), l)) {
+        Some((p, _)) if p.is_dir() => {
+            eprintln!("siesta: {} is a folder; open a .sql file, or add files from the sidebar", p.display());
+            None
+        }
+        other => other,
     };
+    // The central folder is there from the start (New File / Import put files in it).
+    if let Some(dir) = config.as_deref().map(siesta_settings::collections_dir_in)
+        && let Err(e) = std::fs::create_dir_all(&dir)
+    {
+        eprintln!("siesta: {}: {e}", dir.display());
+    }
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx); // theme and fonts come from settings (Siesta::apply_settings)
         themes::register(cx);
@@ -1657,7 +1522,7 @@ fn main() -> std::process::ExitCode {
         let handle = cx
             .open_window(options, |window, cx| {
                 let settings = siesta_settings::Loaded::load();
-                let v = cx.new(|cx| Siesta::new(workspace, open, base, settings, config, window, cx));
+                let v = cx.new(|cx| Siesta::new(open, base, settings, config, window, cx));
                 v.update(cx, |this, cx| this.start_watch(window, cx));
                 view = Some(v.downgrade());
                 cx.new(|cx| Root::new(v, window, cx))
@@ -1688,7 +1553,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{Siesta, Workspace, parse_target};
+    use super::{Siesta, parse_target};
     use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
     use gpui_component::Root;
     use std::path::{Path, PathBuf};
@@ -1700,30 +1565,26 @@ mod tests {
         assert_eq!(parse_target("/no/such/q.sql:x"), (PathBuf::from("/no/such/q.sql:x"), None));
     }
 
-    /// The config dir inside a test workspace (hidden, so the file tree skips it).
-    const CONFIG: &str = ".cfg";
-
-    /// A workspace with three connections in its config dir (`dev` Postgres, `my` MySQL, `live` prod) and a few files.
+    /// A config dir as the real one: three connections in `connections/` (`dev` Postgres, `my`
+    /// MySQL, `live` prod) and a few files in `collections/` (the central folder).
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         // Nothing listens on port 1: a picked connection tries to load its schema and fails at once.
-        std::fs::create_dir_all(r.join(CONFIG).join("connections")).unwrap();
+        std::fs::create_dir_all(r.join("connections")).unwrap();
         for (name, json) in [
             ("dev", r#"{"driver": "postgres", "url": "postgres://nobody@127.0.0.1:1/d"}"#),
             ("my", r#"{"driver": "mysql", "read_only": true, "url": "mysql://nobody@127.0.0.1:1/d"}"#),
             ("live", r#"{"driver": "postgres", "prod": true, "url": "postgres://nobody@127.0.0.1:1/p"}"#),
         ] {
-            std::fs::write(r.join(CONFIG).join(format!("connections/{name}.json")), json).unwrap();
+            std::fs::write(r.join(format!("connections/{name}.json")), json).unwrap();
         }
-        std::fs::write(r.join("a.sql"), "SELECT 1;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n").unwrap();
-        std::fs::write(r.join("b.sql"), "SELECT 'b';\n").unwrap();
-        std::fs::write(r.join("c.sql"), "-- @connection my\nSELECT 'c';\n").unwrap();
+        let c = r.join("collections");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("a.sql"), "SELECT 1;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n").unwrap();
+        std::fs::write(c.join("b.sql"), "SELECT 'b';\n").unwrap();
+        std::fs::write(c.join("c.sql"), "-- @connection my\nSELECT 'c';\n").unwrap();
         dir
-    }
-
-    fn folder_ws(p: &Path) -> Workspace {
-        Workspace::Folder(p.to_path_buf())
     }
 
     fn open_app(cx: &mut TestAppContext, root: &Path, base: &Path, open: Option<PathBuf>) -> (Entity<Siesta>, VisualTestContext) {
@@ -1738,7 +1599,7 @@ mod tests {
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 let settings = siesta_settings::Loaded::load_from(None);
-                let v = cx.new(|cx| Siesta::new(folder_ws(root), open.map(|p| (p, None)), Some(base.to_path_buf()), settings, Some(root.join(CONFIG)), window, cx));
+                let v = cx.new(|cx| Siesta::new(open.map(|p| (p, None)), Some(base.to_path_buf()), settings, Some(root.to_path_buf()), window, cx));
                 view = Some(v.clone());
                 cx.new(|cx| Root::new(v, window, cx))
             })
@@ -1754,7 +1615,7 @@ mod tests {
     #[gpui::test]
     fn active_statement_follows_the_cursor(cx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
         let active = |app: &Entity<Siesta>, cx: &mut VisualTestContext| {
             cx.update(|_, cx| app.read(cx).doc().unwrap().active_statement().map(|s| s.line))
         };
@@ -1818,7 +1679,7 @@ mod tests {
     fn result_follows_the_cursor(cx: &mut TestAppContext) {
         use db_exec::Value::Int;
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
         cx.update(|_, cx| {
             app.update(cx, |this, _| {
@@ -1846,7 +1707,7 @@ mod tests {
     fn popup_shows_formatted_json_and_the_row_as_json(cx: &mut TestAppContext) {
         use db_exec::Value::{Int, Json, Text};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
         let doc = serde_json::json!({"tags": ["x", "y"], "n": {"k": null}});
         let rows = vec![vec![Int(1), Json(doc.clone()), Text("{\"t\":1}".into())], vec![Int(2), Json(serde_json::json!([1])), Text("plain".into())]];
@@ -1879,7 +1740,7 @@ mod tests {
     fn sort_clicks_and_filters_become_the_page(cx: &mut TestAppContext) {
         use db_exec::Value::Int;
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let key = (a.clone(), "SELECT 1".to_string());
         let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
         cx.update(|_, cx| app.update(cx, |this, _| this.store.put(key.clone(), done("SELECT 1", &[("a", "int4"), ("b", "int4")], vec![vec![Int(1), Int(2)]; 3], true))));
@@ -1921,7 +1782,7 @@ mod tests {
     #[gpui::test]
     fn alt_down_and_up_step_between_statements(cx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
         assert_eq!(cursor_line(&app, &mut cx), 0);
         for want in [2, 5] {
             cx.update(|window, cx| app.update(cx, |this, cx| this.step_statement(true, window, cx)));
@@ -1937,8 +1798,8 @@ mod tests {
     #[gpui::test]
     fn clicking_a_statement_in_the_tree_moves_the_cursor(cx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("b.sql")));
-        let a = ws.path().join("a.sql");
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(ws.path().join("collections/b.sql")));
+        let a = ws.path().join("collections/a.sql");
         // The file expands into its statements: `@name` or the first line.
         let rows = cx.update(|_, cx| {
             app.update(cx, |this, cx| {
@@ -1963,40 +1824,50 @@ mod tests {
     }
 
     #[gpui::test]
-    fn picker_is_remembered_per_file_and_at_connection_wins(tcx: &mut TestAppContext) {
+    fn picking_writes_the_connection_into_the_file(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (a, b, c) = (ws.path().join("a.sql"), ws.path().join("b.sql"), ws.path().join("c.sql"));
+        let (a, b, c) = (ws.path().join("collections/a.sql"), ws.path().join("collections/b.sql"), ws.path().join("collections/c.sql"));
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
-        let conn = |app: &Entity<Siesta>, cx: &mut VisualTestContext, p: &Path| -> (Option<String>, sql_split::Dialect) {
+        let conn = |app: &Entity<Siesta>, cx: &mut VisualTestContext, p: &Path| -> (Option<String>, sql_split::Dialect, String, bool) {
             cx.update(|_, cx| {
                 let d = app.read(cx).docs.iter().find(|d| *d.path == p).unwrap();
-                (d.connection().map(str::to_string), d.dialect)
+                (d.connection().map(str::to_string), d.dialect, d.editor.read(cx).value().to_string(), d.dirty)
             })
         };
         // Nothing picked: no connection, default dialect.
-        assert_eq!(conn(&app, &mut cx, &a), (None, sql_split::Dialect::Postgres));
+        assert_eq!(conn(&app, &mut cx, &a).0, None);
         cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.open(b.clone(), None, window, cx);
                 this.select_connection(Some("my".into()), window, cx);
                 this.open(c.clone(), None, window, cx);
-                // c.sql names its own connection: `my` from the file, whatever was picked before.
+                // c.sql names `my` already: the pick rewrites its line, no question asked.
                 this.select_connection(Some("dev".into()), window, cx);
             })
         });
-        assert_eq!(conn(&app, &mut cx, &a), (Some("dev".into()), sql_split::Dialect::Postgres));
-        assert_eq!(conn(&app, &mut cx, &b), (Some("my".into()), sql_split::Dialect::MySql)); // the dialect follows the driver
-        assert_eq!(conn(&app, &mut cx, &c), (Some("my".into()), sql_split::Dialect::MySql));
-        // The picks survive a restart (same state dir), tabs included.
-        let state = siesta_workspace::load_state(base.path(), &folder_ws(ws.path()));
-        assert_eq!(state.connections[&a].as_deref(), Some("dev"));
-        assert_eq!(state.connections[&b].as_deref(), Some("my"));
-        assert_eq!(state.open.len(), 3);
+        // The pick is the file's first line, an unsaved edit, as Respite writes `# @env`.
+        let (name, dialect, text, dirty) = conn(&app, &mut cx, &a);
+        assert_eq!((name.as_deref(), dialect, dirty), (Some("dev"), sql_split::Dialect::Postgres, true));
+        assert!(text.starts_with("-- @connection dev\nSELECT 1;"), "{text}");
+        assert_eq!(conn(&app, &mut cx, &b).1, sql_split::Dialect::MySql); // the dialect follows the driver
+        assert_eq!(conn(&app, &mut cx, &c).2, "-- @connection dev\nSELECT 'c';\n");
+        // Saved, it travels with the file: a restart (nothing about connections in state.json) has it.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                for ix in 0..this.docs.len() {
+                    assert!(this.save_doc(ix, window, cx));
+                }
+                this.remember(cx);
+            })
+        });
+        assert!(std::fs::read_to_string(&b).unwrap().starts_with("-- @connection my\n"));
+        assert_eq!(siesta_workspace::load_state(base.path()).open.len(), 3);
+        assert!(!std::fs::read_to_string(base.path().join("state.json")).unwrap().contains("connections"));
         let (again, mut cx2) = open_app(tcx, ws.path(), base.path(), None);
-        assert_eq!(conn(&again, &mut cx2, &a), (Some("dev".into()), sql_split::Dialect::Postgres));
-        assert_eq!(conn(&again, &mut cx2, &b), (Some("my".into()), sql_split::Dialect::MySql));
-        // A restored pick reads its schema in the background right away (nothing was run).
+        assert_eq!(conn(&again, &mut cx2, &a).0.as_deref(), Some("dev"));
+        assert_eq!(conn(&again, &mut cx2, &b).0.as_deref(), Some("my"));
+        // A file's connection reads its schema in the background right away (nothing was run).
         let loading = cx2.update(|_, cx| {
             let this = again.read(cx);
             let key = this.docs.iter().find(|d| *d.path == a).unwrap().schema_key().unwrap();
@@ -2009,7 +1880,7 @@ mod tests {
     fn database_precedence_session_key_schema_key_and_directive_rewrite(tcx: &mut TestAppContext) {
         use crate::runner::Slot;
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         // (database(), shown database, session key's database, schema key)
         let st = |app: &Entity<Siesta>, cx: &mut VisualTestContext| {
@@ -2021,17 +1892,18 @@ mod tests {
         };
         let select = |cx: &mut VisualTestContext, db: Option<&str>| cx.update(|window, cx| app.update(cx, |this, cx| this.select_database(db.map(Into::into), window, cx)));
         let connect = |cx: &mut VisualTestContext, n: &str| cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some(n.into()), window, cx)));
+        let text = |cx: &mut VisualTestContext| text_of(&app, cx);
         connect(&mut cx, "dev");
         let (_, default_db, _, default_key) = st(&app, &mut cx);
         // No choice: the connection's default.
         assert_eq!(st(&app, &mut cx).0, None);
 
-        // A pick (no directive in the text): remembered, and it changes the session key and the schema cache key.
+        // A pick writes `-- @database` right after `-- @connection`; it changes the session key and the schema cache key.
         select(&mut cx, Some("app"));
         let (pick, shown, session_db, key_app) = st(&app, &mut cx);
         assert_eq!((pick.as_deref(), shown.as_deref(), session_db.as_deref()), (Some("app"), Some("app"), Some("app")));
         assert_ne!(key_app, default_key);
-        assert_eq!(siesta_workspace::load_state(base.path(), &folder_ws(ws.path())).databases[&a], "app");
+        assert!(text(&mut cx).starts_with("-- @connection dev\n-- @database app\nSELECT 1;"));
         // Switching closes the session of the old database (nothing in a transaction: no question).
         cx.update(|_, cx| app.update(cx, |this, _| _ = this.slots.insert((a.clone(), "dev".into(), Some("app".into())), Slot::new())));
         select(&mut cx, Some("other"));
@@ -2052,102 +1924,53 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert_eq!(st(&app, &mut cx).0.as_deref(), Some("other"));
-        // "Default" forgets the pick.
+        // "Default" removes the line.
         cx.update(|_, cx| app.update(cx, |this, _| _ = this.slots.remove(&(a.clone(), "dev".into(), Some("other".into())))));
         select(&mut cx, None);
         let (pick, shown, _, key) = st(&app, &mut cx);
         assert_eq!((pick, shown, key), (None, default_db, default_key));
-        assert!(siesta_workspace::load_state(base.path(), &folder_ws(ws.path())).databases.is_empty());
+        assert!(text(&mut cx).starts_with("-- @connection dev\nSELECT 1;"));
 
-        // `-- @database` wins over the pick.
-        select(&mut cx, Some("app"));
+        // A typed `-- @database` is the choice too.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("-- @database fromfile\nSELECT 1;\n", window, cx));
+                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("-- @connection dev\n-- @database fromfile\nSELECT 1;\n", window, cx));
                 this.docs[0].reparse(cx);
             })
         });
         assert_eq!(st(&app, &mut cx).2.as_deref(), Some("fromfile"));
-        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().locked_db().map(str::to_string)).as_deref(), Some("fromfile"));
-        // Choosing another one asks, and rewrites the line (the pick stays); Cancel changes nothing.
-        let text = |cx: &mut VisualTestContext| text_of(&app, cx);
-        select(&mut cx, Some("x"));
-        assert!(cx.pending_prompt().unwrap().1.contains("-- @database fromfile"));
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-        assert_eq!(text(&mut cx), "-- @database fromfile\nSELECT 1;\n");
-        select(&mut cx, Some("x"));
-        cx.simulate_prompt_answer("Rewrite");
-        cx.run_until_parked();
-        assert_eq!(text(&mut cx), "-- @database x\nSELECT 1;\n");
-        assert_eq!(st(&app, &mut cx).2.as_deref(), Some("x"));
-        assert_eq!(siesta_workspace::load_state(base.path(), &folder_ws(ws.path())).databases[&a], "app");
-        // "Default" removes the line; the pick applies again.
-        select(&mut cx, None);
-        cx.simulate_prompt_answer("Rewrite");
-        cx.run_until_parked();
-        assert_eq!(text(&mut cx), "SELECT 1;\n");
-        assert_eq!(st(&app, &mut cx).2.as_deref(), Some("app"));
-
-        // Another connection starts from its own default again.
+        // Another connection drops the database line: it starts from its own default.
         connect(&mut cx, "my");
-        let (pick, ..) = st(&app, &mut cx);
-        assert_eq!(pick, None);
-        assert!(siesta_workspace::load_state(base.path(), &folder_ws(ws.path())).databases.is_empty());
+        assert_eq!((st(&app, &mut cx).0, text(&mut cx)), (None, "-- @connection my\nSELECT 1;\n".to_string()));
+        // "No connection" removes the connection line; undo brings the last edit back.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(None, window, cx)));
+        assert_eq!(text(&mut cx), "SELECT 1;\n");
+        assert!(cx.update(|_, cx| app.read(cx).doc().unwrap().connection().is_none()));
     }
 
     #[gpui::test]
-    fn at_connection_locks_the_picker_and_keeps_the_stored_pick(tcx: &mut TestAppContext) {
+    fn the_picker_follows_a_typed_connection_line(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
-        let state = |app: &Entity<Siesta>, cx: &mut VisualTestContext| {
-            cx.update(|_, cx| {
-                let d = app.read(cx).doc().unwrap();
-                (d.connection().map(str::to_string), d.locked().map(str::to_string), d.picked.clone())
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
+        let name = |cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).doc().unwrap().connection().map(str::to_string));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("-- @connection my\nSELECT 1;\n", window, cx));
+                this.docs[0].reparse(cx);
             })
-        };
-        let set_text = |cx: &mut VisualTestContext, text: &'static str| {
-            cx.update(|window, cx| {
-                app.update(cx, |this, cx| {
-                    this.doc().unwrap().editor.update(cx, |s, cx| s.set_value(text, window, cx));
-                    this.docs[0].reparse(cx);
-                })
-            })
-        };
-        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
-        assert_eq!(state(&app, &mut cx), (Some("dev".into()), None, Some("dev".into())));
-        set_text(&mut cx, "-- @connection my\nSELECT 1;\n");
-        let pick = |cx: &mut VisualTestContext, n: Option<&str>| {
-            cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(n.map(Into::into), window, cx)));
-        };
-        let text = |cx: &mut VisualTestContext| text_of(&app, cx);
-        // Cancel: a question (naming the prod target), nothing changes.
-        pick(&mut cx, Some("live"));
-        assert!(cx.pending_prompt().unwrap().1.contains("PRODUCTION"));
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-        assert_eq!(state(&app, &mut cx), (Some("my".into()), Some("my".into()), Some("dev".into())));
-        assert_eq!(text(&mut cx), "-- @connection my\nSELECT 1;\n");
-        // Rewrite: the line changes in the buffer (undoable edit), the connection follows, the pick stays.
-        pick(&mut cx, Some("live"));
-        cx.simulate_prompt_answer("Rewrite");
-        cx.run_until_parked();
-        assert_eq!(text(&mut cx), "-- @connection live\nSELECT 1;\n");
-        assert_eq!(state(&app, &mut cx), (Some("live".into()), Some("live".into()), Some("dev".into())));
-        assert!(cx.update(|_, cx| app.read(cx).doc().unwrap().dirty));
-        // "No connection" removes the directive; the stored pick applies again.
-        pick(&mut cx, None);
-        cx.simulate_prompt_answer("Rewrite");
-        cx.run_until_parked();
-        assert_eq!(text(&mut cx), "SELECT 1;\n");
-        assert_eq!(state(&app, &mut cx), (Some("dev".into()), None, Some("dev".into())));
+        });
+        assert_eq!(name(&mut cx).as_deref(), Some("my"));
+        // Picking the prod one asks nothing here: the run asks (see the prod test); the line just changes.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("live".into()), window, cx)));
+        assert!(cx.pending_prompt().is_none());
+        assert_eq!((name(&mut cx).as_deref(), text_of(&app, &mut cx).as_str()), (Some("live"), "-- @connection live\nSELECT 1;\n"));
     }
 
     #[gpui::test]
     fn prod_run_asks_once_and_paging_does_not(tcx: &mut TestAppContext) {
         use db_exec::Value::Int;
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         let run = |cx: &mut VisualTestContext| cx.update(|window, cx| app.update(cx, |this, cx| this.run_current(window, cx)));
         let ran = |cx: &mut VisualTestContext| cx.update(|_, cx| app.read(cx).store.last.is_some());
@@ -2164,7 +1987,8 @@ mod tests {
         cx.update(|_, cx| app.update(cx, |this, _| this.store.last = None));
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("UPDATE t SET a = 1", window, cx));
+                // The pick is the file's first line, so the new text keeps it.
+                this.doc().unwrap().editor.update(cx, |s, cx| s.set_value("-- @connection live\nUPDATE t SET a = 1", window, cx));
                 this.docs[0].reparse(cx);
             })
         });
@@ -2197,7 +2021,7 @@ mod tests {
     fn form_saves_into_the_config_dir_and_picks_for_its_own_file_only(tcx: &mut TestAppContext) {
         use db_conn::Driver;
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (a, b) = (ws.path().join("a.sql"), ws.path().join("b.sql"));
+        let (a, b) = (ws.path().join("collections/a.sql"), ws.path().join("collections/b.sql"));
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         let dir = cfg.path().join("siesta");
         cx.update(|window, cx| {
@@ -2231,12 +2055,11 @@ mod tests {
         let (pa, pb, known) = cx.update(|_, cx| {
             let this = app.read(cx);
             let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
-            (doc(&a).picked.clone(), doc(&b).picked.clone(), doc(&b).conns.connections.contains_key("fresh"))
+            (doc(&a).connection().map(str::to_string), doc(&b).connection().map(str::to_string), doc(&b).conns.connections.contains_key("fresh"))
         });
         assert_eq!((pa.as_deref(), pb, known), (Some("fresh"), None, true));
-        let state = siesta_workspace::load_state(base.path(), &folder_ws(ws.path()));
-        assert_eq!((state.connections[&a].as_deref(), state.connections.get(&b)), (Some("fresh"), None));
-        // Edit: the same dialog on the saved connection, then Delete clears the pick.
+        assert!(cx.update(|_, cx| app.read(cx).docs.iter().find(|d| *d.path == a).unwrap().editor.read(cx).value().starts_with("-- @connection fresh\n")));
+        // Edit: the same dialog on the saved connection, then Delete: the line stays and reads as unknown.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.open(a.clone(), None, window, cx);
@@ -2245,87 +2068,86 @@ mod tests {
         });
         let form = cx.update(|_, cx| app.read(cx).conn_form.as_ref().and_then(|f| f.upgrade()).unwrap());
         assert_eq!(cx.update(|_, cx| form.read(cx).collect(cx).host), "127.0.0.1");
+        std::fs::remove_file(dir.join("connections/fresh.json")).unwrap();
         cx.update(|window, cx| app.update(cx, |this, cx| this.connection_deleted("fresh", window, cx)));
-        cx.update(|_, cx| assert!(app.read(cx).docs.iter().all(|d| d.picked.is_none())));
-    }
-
-    #[gpui::test]
-    fn a_single_file_is_a_workspace_of_its_own(tcx: &mut TestAppContext) {
-        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let b = ws.path().join("b.sql");
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), None);
-        let one = Workspace::Files(vec![b.clone()]);
-        cx.update(|window, cx| app.update(cx, |this, cx| this.set_workspace(one.clone(), window, cx)));
-        let (files, tabs) = cx.update(|_, cx| {
-            let this = app.read(cx);
-            (this.files.clone(), this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>())
+        cx.update(|_, cx| {
+            let d = app.read(cx).docs.iter().find(|d| *d.path == a).unwrap();
+            assert_eq!(d.connection(), Some("fresh"));
+            assert!(d.effective_connection().is_none());
         });
-        assert_eq!((files, tabs), (vec![b.clone()], vec![b.clone()]));
-        // History: the one history folder, entries tagged with this workspace, paths relative to the file's folder.
-        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&b, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'b'".into(), ..Default::default() }], cx)));
-        cx.run_until_parked();
-        let store = db_exec::history::Store::open(base.path(), &one.key(), ws.path()).unwrap();
-        assert_eq!(store.dir(), base.path().join("history"));
-        assert_eq!((store.list()[0].file.as_str(), store.list()[0].workspace.as_str()), ("b.sql", b.to_str().unwrap()));
-        assert!(db_exec::history::Store::open(base.path(), &folder_ws(ws.path()).key(), ws.path()).unwrap().list().is_empty());
-        // State is kept under the file's own path, and a plain launch reopens it.
-        cx.update(|_, cx| app.read(cx).remember(cx));
-        assert_eq!(siesta_workspace::load_state(base.path(), &one).current, Some(b.clone()));
-        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(one));
     }
 
     #[gpui::test]
-    fn chosen_files_are_a_workspace(tcx: &mut TestAppContext) {
+    fn the_tree_is_the_central_folder_then_the_added_files(tcx: &mut TestAppContext) {
         let (ws, base, other) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (a, z) = (ws.path().join("a.sql"), other.path().join("z.sql"));
+        let (a, z) = (ws.path().join("collections/a.sql"), other.path().join("z.sql"));
         std::fs::write(&z, "SELECT 'z';\n").unwrap();
+        let col = ws.path().join("collections");
+        std::fs::create_dir_all(col.join("empty")).unwrap();
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), None);
-        // As the open dialog returns them: files from two folders, a non-.sql file, any order.
-        let picked = Workspace::from_paths([z.clone(), ws.path().join("notes.txt"), a.clone()]).unwrap();
-        cx.update(|window, cx| app.update(cx, |this, cx| this.set_workspace(picked.clone(), window, cx)));
-        let (files, name, recent) = cx.update(|_, cx| {
-            let this = app.read(cx);
-            (this.files.clone(), this.workspace.name(), this.recent.clone())
-        });
-        // Sorted by full path; the header names the first and counts the rest.
-        let mut want = vec![a.clone(), z.clone()];
-        want.sort();
-        let first = want[0].file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!((files, name), (want, format!("{first} +1")));
-        // The folder it left is offered in RECENT; switching back and forth keeps each one's state.
-        assert_eq!(recent, [folder_ws(ws.path())]);
-        cx.update(|_, cx| app.read(cx).remember(cx));
-        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(picked.clone()));
-
-        // A run of a.sql under this set, then z.sql (open in a tab) is dropped from the workspace.
-        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&a, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'a'".into(), ..Default::default() }], cx)));
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            app.update(cx, |this, cx| {
-                this.open(z.clone(), None, window, cx);
-                this.remove_from_workspace(&z, window, cx);
-                this.reload_history();
+        let read = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let this = app.read(cx);
+                (this.files.clone(), this.added.clone(), this.central.clone())
             })
-        });
-        let (files, tabs, history) = cx.update(|_, cx| {
+        };
+        // The central folder `collections/`: its .sql files and folders (an empty one too);
+        // `connections/` next to it isn't in the tree.
+        let (files, added, central) = read(&mut cx);
+        let names: Vec<String> = central.iter().map(|p| p.strip_prefix(&col).unwrap().display().to_string()).collect();
+        assert_eq!((names, added.len(), files.len()), (vec!["a.sql".to_string(), "b.sql".into(), "c.sql".into(), "empty".into()], 0, 3));
+        // `+`: files from anywhere join the list (a non-.sql one and a central file don't).
+        cx.update(|window, cx| app.update(cx, |this, cx| this.add_paths([z.clone(), other.path().join("notes.txt"), a.clone()], window, cx)));
+        let (files, added, _) = read(&mut cx);
+        assert_eq!((added, files.contains(&z)), (vec![z.clone()], true));
+        assert_eq!(siesta_workspace::load_files(base.path()), std::slice::from_ref(&z));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().map(|d| (*d.path).clone())), Some(z.clone()));
+        // ×: off the list only; the file, its tab and its history stay.
+        cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&z, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'z'".into(), ..Default::default() }], cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| app.update(cx, |this, cx| this.remove_file(&z, window, cx)));
+        let (_, added, _) = read(&mut cx);
+        assert!(added.is_empty() && z.is_file() && siesta_workspace::load_files(base.path()).is_empty());
+        let history = db_exec::history::Store::open(base.path()).unwrap().list();
+        assert_eq!((history[0].file.as_str(), history[0].sql.as_str()), (z.to_str().unwrap(), "SELECT 'z'"));
+    }
+
+    #[gpui::test]
+    fn import_and_new_file_land_in_the_central_folder(tcx: &mut TestAppContext) {
+        let (ws, base, other) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (z, txt) = (other.path().join("z.sql"), other.path().join("notes.txt"));
+        std::fs::write(&z, "SELECT 'z';\n").unwrap();
+        std::fs::write(&txt, "").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), None);
+        let col = ws.path().join("collections");
+        // File → Import… goes into the central folder `collections/`.
+        assert_eq!(cx.update(|_, cx| app.read(cx).folder()), col);
+        // Import copies .sql files into the folder (others refused) and opens the first.
+        let copied = cx.update(|window, cx| app.update(cx, |this, cx| this.import_paths(vec![z.clone(), txt.clone()], &col, window, cx)));
+        let dest = col.join("z.sql");
+        assert_eq!((copied, std::fs::read_to_string(&dest).unwrap().as_str()), (vec![dest.clone()], "SELECT 'z';\n"));
+        assert!(!col.join("notes.txt").exists());
+        // Importing the same name again never overwrites.
+        std::fs::write(&z, "changed").unwrap();
+        let again = cx.update(|window, cx| app.update(cx, |this, cx| this.import_paths(vec![z.clone()], &col, window, cx)));
+        assert!(again.is_empty() && std::fs::read_to_string(&dest).unwrap() == "SELECT 'z';\n");
+        // A new file in a subfolder (`.sql` added), listed and opened; an existing one isn't truncated.
+        let made = cx.update(|window, cx| app.update(cx, |this, cx| this.create_file(&col.join("reports"), "daily", window, cx)));
+        let daily = col.join("reports/daily.sql");
+        assert_eq!(made.as_ref(), Some(&daily));
+        let (files, front) = cx.update(|_, cx| {
             let this = app.read(cx);
-            (this.files.clone(), this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>(), this.history.iter().map(|e| e.sql.clone()).collect::<Vec<_>>())
+            (this.files.clone(), this.doc().map(|d| (*d.path).clone()))
         });
-        assert_eq!((files, tabs.contains(&z), z.is_file()), (vec![a.clone()], false, true));
-        // The run made under the old set still shows; the old set left RECENT, the new one is last.
-        assert_eq!(history, ["SELECT 'a'"]);
-        let now = Workspace::Files(vec![a.clone()]);
-        assert_eq!(siesta_workspace::last_workspace(base.path()), Some(now.clone()));
-        assert!(!siesta_workspace::recent(base.path()).contains(&picked));
-        // The last file can't be dropped.
-        cx.update(|window, cx| app.update(cx, |this, cx| this.remove_from_workspace(&a, window, cx)));
-        assert_eq!(cx.update(|_, cx| app.read(cx).workspace.clone()), now);
+        assert_eq!((files.contains(&daily), front), (true, Some(daily.clone())));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.create_file(&col, "a.sql", window, cx)));
+        assert!(std::fs::read_to_string(ws.path().join("collections/a.sql")).unwrap().starts_with("SELECT 1;"));
     }
 
     #[gpui::test]
     fn clicking_a_column_adds_it_to_the_select_under_the_cursor(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("b.sql")));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("collections/b.sql")));
         let set = |cx: &mut VisualTestContext, text: &'static str| {
             cx.update(|window, cx| {
                 app.update(cx, |this, cx| {
@@ -2355,7 +2177,7 @@ mod tests {
     #[gpui::test]
     fn history_records_filters_and_inserts(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let b = ws.path().join("b.sql");
+        let b = ws.path().join("collections/b.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(b.clone()));
         let entry = |sql: &str, error: Option<&str>| db_exec::history::Entry { connection: "dev".into(), sql: sql.into(), error: error.map(Into::into), rows: Some(1), ..Default::default() };
         cx.update(|_, cx| app.update(cx, |this, cx| this.record_history(&b, vec![entry("SELECT 42", None), entry("SELECT nope", Some("42703 column does not exist"))], cx)));
@@ -2363,7 +2185,8 @@ mod tests {
         cx.update(|window, cx| app.update(cx, |this, cx| this.toggle_history(window, cx)));
         let shown = |cx: &mut VisualTestContext| cx.update(|_, cx| {
             let this = app.read(cx);
-            (this.show_history, this.history.iter().map(|e| (e.sql.clone(), e.file.clone(), e.outcome())).collect::<Vec<_>>())
+            // The page shows the file relative to the central folder; the entry keeps it absolute.
+            (this.show_history, this.history.iter().map(|e| (e.sql.clone(), this.short_path(Path::new(&e.file)), e.outcome())).collect::<Vec<_>>())
         });
         assert_eq!(shown(&mut cx), (true, vec![("SELECT nope".into(), "b.sql".into(), "42703 column does not exist".into()), ("SELECT 42".into(), "b.sql".into(), "1 row".into())]));
         // The filter matches errors too; rows are computed when the page renders.
@@ -2374,7 +2197,7 @@ mod tests {
         // line, with a `;`; the page closes.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.open(ws.path().join("a.sql"), None, window, cx);
+                this.open(ws.path().join("collections/a.sql"), None, window, cx);
                 this.show_history = true;
                 _ = this.history_insert(1, window, cx);
             })
@@ -2388,7 +2211,7 @@ mod tests {
     fn a_finished_run_lands_in_history_but_a_page_change_does_not(tcx: &mut TestAppContext) {
         use crate::runner::{Report, Stmt};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         // `finish` with a ready report: a real run would wake the test scheduler from the tokio thread.
         let finish = |cx: &mut VisualTestContext, fresh: bool| {
@@ -2401,52 +2224,19 @@ mod tests {
                 })
             });
             cx.run_until_parked();
-            db_exec::history::Store::open(base.path(), &folder_ws(ws.path()).key(), ws.path()).unwrap().list()
+            db_exec::history::Store::open(base.path()).unwrap().list()
         };
         assert!(finish(&mut cx, false).is_empty());
         let list = finish(&mut cx, true);
         let e = &list[0];
-        assert_eq!((e.sql.as_str(), e.connection.as_str(), e.file.as_str(), e.line, e.source.as_str()), ("SELECT 2", "dev", "a.sql", 3, "gui"));
+        assert_eq!((e.sql.as_str(), e.connection.as_str(), e.file.as_str(), e.line, e.source.as_str()), ("SELECT 2", "dev", a.to_str().unwrap(), 3, "gui"));
         assert_eq!((e.error.as_deref(), e.rows), (Some("connection refused"), None));
     }
 
     #[gpui::test]
-    fn typed_at_connection_resets_the_database_pick(tcx: &mut TestAppContext) {
+    fn rename_offers_to_rewrite_directives_and_closing_drops_the_form(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
-        let type_text = |cx: &mut VisualTestContext, text: &'static str| {
-            cx.update(|window, cx| {
-                let editor = app.read(cx).doc().unwrap().editor.clone();
-                editor.update(cx, |s, cx| {
-                    s.set_value(text, window, cx);
-                    cx.emit(gpui_component::input::InputEvent::Change); // what typing sends
-                });
-            });
-            cx.run_until_parked();
-        };
-        let state = |cx: &mut VisualTestContext| cx.update(|_, cx| {
-            let this = app.read(cx);
-            (this.doc().unwrap().connection().map(str::to_string), this.doc().unwrap().picked_db.clone(), this.db_picks.get(&a).cloned())
-        });
-        cx.update(|window, cx| {
-            app.update(cx, |this, cx| {
-                this.select_connection(Some("dev".into()), window, cx);
-                this.select_database(Some("other".into()), window, cx);
-            })
-        });
-        assert_eq!(state(&mut cx), (Some("dev".into()), Some("other".into()), Some("other".into())));
-        // Same connection typed: the pick stays.
-        type_text(&mut cx, "-- @connection dev\nSELECT 1;\n");
-        assert_eq!(state(&mut cx).1.as_deref(), Some("other"));
-        type_text(&mut cx, "-- @connection my\nSELECT 1;\n");
-        assert_eq!(state(&mut cx), (Some("my".into()), None, None));
-    }
-
-    #[gpui::test]
-    fn rename_moves_picks_and_offers_to_rewrite_directives_and_closing_drops_the_form(tcx: &mut TestAppContext) {
-        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (a, c, d) = (ws.path().join("a.sql"), ws.path().join("c.sql"), ws.path().join("d.sql"));
+        let (a, c, d) = (ws.path().join("collections/a.sql"), ws.path().join("collections/c.sql"), ws.path().join("collections/d.sql"));
         std::fs::write(&d, "-- @connection my\nSELECT 'd';\n").unwrap();
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         cx.update(|window, cx| {
@@ -2467,10 +2257,11 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_prompt_answer("Rewrite");
         cx.run_until_parked();
+        // a.sql's line came from the picker, c.sql's and d.sql's were typed: all follow the rename.
         let (picked, c_text) = cx.update(|_, cx| {
             let this = app.read(cx);
             let doc = |p: &Path| this.docs.iter().find(|d| *d.path == p).unwrap();
-            (doc(&a).picked.clone(), doc(&c).editor.read(cx).value().to_string())
+            (doc(&a).connection().map(str::to_string), doc(&c).editor.read(cx).value().to_string())
         });
         assert_eq!(picked.as_deref(), Some("mine"));
         assert_eq!(c_text, "-- @connection mine\nSELECT 'c';\n");
@@ -2485,7 +2276,7 @@ mod tests {
     #[gpui::test]
     fn typing_a_url_fills_the_fields_and_saving_writes_no_url(tcx: &mut TestAppContext) {
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
         let dir = cfg.path().join("siesta");
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
@@ -2520,7 +2311,7 @@ mod tests {
     fn connections_page_lists_edits_and_deletes_without_touching_picks(tcx: &mut TestAppContext) {
         use crate::connections_page::{ConnectionsPage, build_rows};
         let (ws, base, cfg) = (workspace(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (a, dir) = (ws.path().join("a.sql"), cfg.path().to_path_buf());
+        let (a, dir) = (ws.path().join("collections/a.sql"), cfg.path().to_path_buf());
         std::fs::create_dir_all(dir.join("connections")).unwrap();
         std::fs::write(dir.join("connections/gl.json"), r#"{"driver": "postgres", "host": "h", "port": 5, "database": "d"}"#).unwrap();
         std::fs::write(dir.join("connections/other.json"), r#"{"driver": "postgres", "host": "127.0.0.1", "port": 1}"#).unwrap();
@@ -2559,20 +2350,20 @@ mod tests {
                 f.save(window, cx);
             })
         });
-        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().connection().map(str::to_string)).as_deref(), Some("other"));
         assert_eq!(db_conn::read_form(&dir, "gl").unwrap().host, "edited");
         assert_eq!(db_conn::Connections::load(&dir).connections["gl"].resolve_password_in(base.path()).unwrap().password.as_deref(), Some("pw")); // the empty password field kept it
         // Delete removes the connection with its password, and leaves the pick.
         cx.update(|window, cx| app.update(cx, |this, cx| this.delete_connection("gl", window, cx)));
         assert!(db_conn::read_form(&dir, "gl").is_none() && !db_conn::has_password(&dir, "gl"));
-        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().picked.clone()).as_deref(), Some("other"));
+        assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().connection().map(str::to_string)).as_deref(), Some("other"));
     }
 
     #[gpui::test]
     fn json_cells_stay_one_line_until_toggled_on(tcx: &mut TestAppContext) {
         use db_exec::Value::{Int, Json, Text};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
         let rows = vec![vec![Int(1), Json(serde_json::json!({"a": [1, 2, 3], "b": {"c": null}}))], vec![Int(2), Text("[1]".into())]];
         cx.update(|_, cx| app.update(cx, |this, _| this.store.put((a.clone(), "SELECT 1".into()), done("SELECT 1", &[("id", "int4"), ("doc", "jsonb")], rows, false))));
@@ -2617,7 +2408,7 @@ mod tests {
     #[gpui::test]
     fn db_tab_inserts_the_select_after_the_current_statement(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.select_connection(Some("dev".into()), window, cx);
@@ -2636,40 +2427,42 @@ mod tests {
         // The cursor is on the first statement: the new one goes right below it and becomes the active one.
         let ok = cx.update(|window, cx| app.update(cx, |this, cx| this.insert_select("public", "users", window, cx)));
         assert!(ok);
-        // A blank line separates it from the statement above.
-        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\n\nSELECT * FROM users;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n");
+        // A blank line separates it from the statement above (the picked connection is the first line).
+        assert_eq!(text_of(&app, &mut cx), "-- @connection dev\nSELECT 1;\n\nSELECT * FROM users;\n\nSELECT 2;\n\n-- @name third\nSELECT 3;\n");
         let active = cx.update(|_, cx| {
             let d = app.read(cx).doc().unwrap();
             let src = d.editor.read(cx).value();
             d.active_statement().map(|s| (s.line, s.text(&src).to_string()))
         });
-        assert_eq!(active, Some((3, "SELECT * FROM users".to_string())));
-        assert_eq!(cursor_line(&app, &mut cx), 2);
+        assert_eq!(active, Some((4, "SELECT * FROM users".to_string())));
+        assert_eq!(cursor_line(&app, &mut cx), 3);
         // Outside the default schema the name is qualified; a statement without `;` gets one.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.docs[0].editor.update(cx, |s, cx| s.set_value("SELECT 1", window, cx));
+                // The connection is the file's first line, so new text keeps it.
+                this.docs[0].editor.update(cx, |s, cx| s.set_value("-- @connection dev\nSELECT 1", window, cx));
                 this.docs[0].reparse(cx);
                 assert!(this.insert_select("analytics", "events", window, cx));
             })
         });
-        assert_eq!(text_of(&app, &mut cx), "SELECT 1;\n\nSELECT * FROM analytics.events;");
+        assert_eq!(text_of(&app, &mut cx), "-- @connection dev\nSELECT 1;\n\nSELECT * FROM analytics.events;");
         // "Insert name" replaces the selection.
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.docs[0].editor.update(cx, |s, cx| s.set_value("SELECT  FROM x", window, cx));
-                this.docs[0].editor.update(cx, |s, cx| s.set_cursor_position(gpui_component::input::Position::new(0, 7), window, cx));
+                this.docs[0].editor.update(cx, |s, cx| s.set_value("-- @connection dev\nSELECT  FROM x", window, cx));
+                this.docs[0].reparse(cx);
+                this.docs[0].editor.update(cx, |s, cx| s.set_cursor_position(gpui_component::input::Position::new(1, 7), window, cx));
                 this.insert_name("public", "users", window, cx);
             })
         });
-        assert_eq!(text_of(&app, &mut cx), "SELECT users FROM x");
+        assert_eq!(text_of(&app, &mut cx), "-- @connection dev\nSELECT users FROM x");
     }
 
     #[gpui::test]
     fn completion_provider_offers_tables_after_from(tcx: &mut TestAppContext) {
         use gpui_component::input::{CompletionProvider as _, Rope};
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("a.sql")));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(ws.path().join("collections/a.sql")));
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.select_connection(Some("dev".into()), window, cx);
@@ -2710,7 +2503,7 @@ mod tests {
         use super::DbRow;
         use crate::runner::DbList;
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
-        let a = ws.path().join("a.sql");
+        let a = ws.path().join("collections/a.sql");
         let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a));
         cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
         let key = cx.update(|_, cx| crate::schema_cache::key(&app.read(cx).doc().unwrap().conns.connections["dev"]));

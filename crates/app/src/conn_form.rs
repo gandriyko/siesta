@@ -456,14 +456,11 @@ impl Siesta {
         }
     }
 
-    /// A connection was deleted: files that had picked it are left with "No connection".
+    /// A connection was deleted: its sessions close. Files that name it keep their `-- @connection`
+    /// line, which the picker then shows in red as unknown (nothing is rewritten behind the user's back).
     pub(crate) fn connection_deleted(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.connection_changed(window, cx);
         self.close_connection_sessions(name);
-        let paths: Vec<PathBuf> = self.docs.iter().filter(|d| d.picked.as_deref() == Some(name)).map(|d| (*d.path).clone()).collect();
-        for p in paths {
-            self.pick_for(&p, None, window, cx);
-        }
         self.conn_form = None;
     }
 }

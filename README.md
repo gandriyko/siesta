@@ -35,11 +35,11 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 |---|---|
 | **Editor** | SQL highlighting, completion of tables and columns from the live schema, the statement under the cursor highlighted and run with <kbd>⌘</kbd> <kbd>Enter</kbd>, server errors underlined at their position |
 | **Results** | Server-side paging, sorting and column filters on any query; Count all; JSON / JSONB shown as JSON, with a formatted, highlighted preview on hover; a value dialog with search and a JSONPath filter; copy as TSV, JSON or `INSERT` |
-| **Connections** | Postgres and MySQL / MariaDB, one JSON file each; pick the connection and the database per file, or fix them in the file with `-- @connection` / `-- @database` |
+| **Connections** | Postgres and MySQL / MariaDB, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
 | **Safety** | Production connections get a red banner and confirm every non-read statement; read-only connections refuse writes in Siesta and in the server session; open transactions are asked about before a file or the app closes |
 | **Schema** | DB tab: schemas, tables, columns and indexes; insert a `SELECT` for a table or show its DDL |
 | **History** | Every run is stored per project (statement, connection, time, duration, rows or error; never the data). A filterable list (<kbd>⌘</kbd> <kbd>Y</kbd>) to insert or rerun any entry |
-| **Workspace** | Any folder of `.sql` files, a statement tree, command palette, light and dark themes, VS Code / JetBrains keymaps, state restored on launch |
+| **Files** | A central folder of `.sql` files with subfolders, plus files added from anywhere; import, new file / folder, Trash, drag and drop; a statement tree, command palette, light and dark themes, VS Code / JetBrains keymaps, state restored on launch |
 
 ## Quick start
 
@@ -80,7 +80,7 @@ You need a recent stable Rust toolchain (edition 2024).
 
 ## Desktop app
 
-Run `siesta path/to/dir` (or <kbd>⌘</kbd> <kbd>O</kbd>) to open a folder of `.sql` files. `siesta report.sql:12` opens just that one file, at a line, with its own state and history. **File → Open File…** and the folder button above the file tree pick several `.sql` files at once (from any folders): together they become the workspace, with their own state, history and place in the recent list. The button also takes a folder. Hover a chosen file and press × to drop it from the workspace (the file stays on disk); a new file made with + joins them. A plain `siesta` reopens whatever was open last.
+The sidebar works as in Respite. **COLLECTIONS** is the central folder `~/.config/siesta/collections` with its subfolders: the buttons on its header, and on a folder when you hover it, import `.sql` files (copied in), make a new file or a new folder; the trash button on a file or folder asks, then moves it to the Trash. **FILES** lists `.sql` files from anywhere: `+` (or **File → Add Files…**, <kbd>⌘</kbd> <kbd>O</kbd>) adds several at once, dropping files from Finder on the window does the same, and × takes one off the list (the file stays). `siesta report.sql:12` opens a file at a line and adds it to FILES. Open tabs and cursors come back on the next launch.
 
 | Shortcut | Action |
 |---|---|
@@ -113,8 +113,8 @@ Each connection is one JSON file in `~/.config/siesta/connections/`, named after
 { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
 ```
 
-- **Choosing one.** Pick the connection in the top-right dropdown (remembered per file), or put `-- @connection dev-pg` on the first line of the file.
-- **Any database.** `database` is only the default. Pick another one in the second dropdown, or write `-- @database app_test` under `-- @connection`. The CLI takes `-d app_test`.
+- **Choosing one.** A file runs on the connection its `-- @connection dev-pg` line names. The top-right dropdown writes that line for you (first line of the file; "No connection" removes it), as an ordinary edit you save or undo, so the choice travels with the file and the CLI sees it.
+- **Any database.** `database` is only the default. The second dropdown writes `-- @database app_test` under `-- @connection` ("Default" removes it); picking another connection drops it. The CLI takes `-d app_test`.
 - **`"prod": true`.** A red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation. `SELECT`, `SHOW` and `EXPLAIN` run freely.
 - **`"read_only": true`.** Writes are refused before they reach the server, and the session itself is read-only. This is a safety default, not a security boundary.
 - **Environment values.** `${env:SHOP_DB_HOST}` is read from the environment, which is handy in CI.
@@ -126,16 +126,31 @@ A password is never written in clear. Type it in the connection form, or run `si
 - **The key is the secret.** It stays in the data folder, so the connection files can go to a dotfiles repo without it. If it is lost, set the passwords again.
 - **What this protects against.** Passwords stay out of screenshots, `grep`, backups and synced files that don't include the key. It does not protect against malware running as your user, which can read the key too.
 
-## Where Siesta keeps its files
+## Where files live
 
-Two folders, each with one job. Nothing is written to both.
+Two folders, kept apart on purpose: one for what you write, one for what the app writes.
 
-| Folder | What is in it | Who writes it |
-|---|---|---|
-| `~/.config/siesta/` | `settings.json`, `keymap.json`, `connections/`, `sql/` (the scratch workspace opened when there is no last one) | you (and the settings page / connection form on your behalf) |
-| `~/.siesta/` | `state.json` (open tabs, last and recent workspaces), `history/`, `cache/` (database schemas), `key` (password key) | Siesta itself |
+```text
+~/.config/siesta/           what you write; fine for a dotfiles repo
+  settings.json             settings (the Settings page edits it)
+  keymap.json               your key bindings over the defaults (optional)
+  collections/              the sidebar's Collections: .sql files, any subfolders
+  connections/              one JSON file per connection (passwords only encrypted)
+    dev-pg.json             …
 
-Put `~/.config/siesta` in a dotfiles repo if you like. Keep `~/.siesta` out of it: it holds the password key, the SQL you ran and your database structure. `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace the two folders (tests, sandboxes).
+~/.siesta/                  what the app writes; holds the password key and the SQL you ran, keep it private
+  key                       the key the connection passwords are encrypted with
+  files.json                the sidebar's Files: paths of .sql files added from elsewhere
+  state.json                open tabs and cursors, reopened on launch
+  history/                  every run: <time>.json (file, statement, connection, database, outcome)
+  cache/                    database structure per connection, for the DB tab and completion
+```
+
+- **Collections** are plain files and folders, so Finder, an editor or git work on them too. The trash button moves them to the Trash.
+- **Files** stay where they are, for example in a repository; Siesta keeps only their paths. **×** drops one from the list, the file is untouched.
+- **A file's connection and database** are its own `-- @connection` / `-- @database` lines: the pickers above the editor write them (an edit you save, or undo), so the choice travels with the file and `siesta run` uses it too. Nothing about them is kept in `~/.siesta`.
+- **History** names each file by its full path.
+- `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace the two folders (tests, sandboxes).
 
 ## CLI
 
@@ -186,7 +201,7 @@ crates/
   db-conn/    connection files, encrypted passwords
   db-exec/    sqlx sessions, paging, schema, history
   settings/   settings.json
-  workspace/  project folder, file index, UI state
+  workspace/  central folder scan, added files, UI state
 ```
 
 ```sh

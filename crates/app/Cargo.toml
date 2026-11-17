@@ -26,6 +26,9 @@ gpui-base = "=0.9.1"
 # Same version and features as gpui-component's, so the editor's provider types match.
 lsp-types = { version = "0.97", features = ["proposed"] }
 anyhow = "1"
+# The sidebar's Trash button, as in Respite.
+trash = "5.3.0"
+
 
 [dev-dependencies]
 tempfile = "3"

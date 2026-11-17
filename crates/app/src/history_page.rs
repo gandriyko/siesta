@@ -1,4 +1,4 @@
-//! History (Cmd+Y): every statement run in this project, newest first, with a filter. Insert puts
+//! History (Cmd+Y): every statement run, newest first, with a filter. Insert puts
 //! the statement into the current file after the statement under the cursor; Run runs it again in
 //! its own file (where it still is), else inserted into the current file.
 
@@ -14,13 +14,11 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::Input,
 };
-use siesta_workspace::Workspace;
-
 use crate::Siesta;
 
-/// The file an entry was run in: its `file` counts from the folder of the workspace it was recorded in.
+/// The file an entry was run in.
 fn entry_path(e: &Entry) -> PathBuf {
-    Workspace::from_key(&e.workspace).folder().join(&e.file)
+    PathBuf::from(&e.file)
 }
 
 const TIME_W: f32 = 104.;
@@ -32,7 +30,7 @@ const ACTIONS_W: f32 = 56.;
 
 impl Siesta {
     fn history_store(&self) -> Option<Store> {
-        let mut s = Store::open(self.base.as_deref()?, &self.workspace.key(), &self.folder()).inspect_err(|e| eprintln!("siesta: history disabled: {e}")).ok()?;
+        let mut s = Store::open(self.base.as_deref()?).inspect_err(|e| eprintln!("siesta: history disabled: {e}")).ok()?;
         s.total = self.settings.settings.history.total;
         Some(s)
     }
@@ -75,14 +73,16 @@ impl Siesta {
         cx.notify();
     }
 
-    /// A folder: the runs made in it. Chosen files: the runs of those files, whatever set they were
-    /// chosen with then (adding or dropping a file changes the set, not the files' history).
+    /// A file as the sidebar names it: relative in the central folder, else just its name.
+    pub(crate) fn short_path(&self, p: &Path) -> String {
+        match p.strip_prefix(self.folder()) {
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        }
+    }
+
     pub(crate) fn reload_history(&mut self) {
-        let Some(s) = self.history_store() else { return self.history = vec![] };
-        self.history = match &self.workspace {
-            Workspace::Folder(_) => s.list(),
-            Workspace::Files(files) => s.list_all().into_iter().filter(|e| files.contains(&entry_path(e))).collect(),
-        };
+        self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
     }
 
     /// Indices of entries matching every word of the filter (SQL, connection, database, file, outcome).
@@ -243,7 +243,7 @@ impl Siesta {
             .child(div().w(px(TIME_W)).flex_none().text_xs().font_family(mono.clone()).text_color(muted).child(e.time_label()))
             .child(div().w(px(CONN_W)).flex_none().truncate().text_xs().child(conn))
             .child(div().flex_1().min_w_0().truncate().text_sm().font_family(mono).child(sql))
-            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(format!("{}:{}", e.file, e.line)))
+            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(format!("{}:{}", self.short_path(Path::new(&e.file)), e.line)))
             .child(div().w(px(OUTCOME_W)).flex_none().truncate().text_xs().text_color(outcome_color).child(e.outcome()))
             .child(div().w(px(MS_W)).flex_none().text_right().text_xs().text_color(slow).child(e.duration_ms.to_string()))
             .child(div().w(px(ACTIONS_W)).flex_none().flex().child(insert).child(run))

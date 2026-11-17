@@ -20,10 +20,6 @@ pub struct Doc {
     pub dialect: Dialect,
     /// The connections of the config dir.
     pub conns: Arc<Connections>,
-    /// The picker's choice for this file; `-- @connection` in the text wins over it.
-    pub picked: Option<String>,
-    /// The database picked for this file; `-- @database` in the text wins over it.
-    pub picked_db: Option<String>,
     /// Index into `file.statements` of the statement under the cursor.
     pub active: Option<usize>,
     /// Byte range currently decorated as the active statement.
@@ -57,17 +53,7 @@ pub fn default_schema(c: &db_conn::Connection) -> Option<String> {
 }
 
 impl Doc {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        path: PathBuf,
-        editor: Entity<EditorState>,
-        conns: Arc<Connections>,
-        picked: Option<String>,
-        picked_db: Option<String>,
-        cache: crate::schema_cache::Shared,
-        subs: Vec<Subscription>,
-        cx: &mut App,
-    ) -> Self {
+    pub fn new(path: PathBuf, editor: Entity<EditorState>, conns: Arc<Connections>, cache: crate::schema_cache::Shared, subs: Vec<Subscription>, cx: &mut App) -> Self {
         let stmt_bar = editor.update(cx, |s, cx| s.create_gutter_decorations_collection(vec![], cx));
         let sql = siesta_workspace::is_sql(&path);
         let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { dialect: Dialect::default(), connection: None, default_schema: None, cache }));
@@ -82,8 +68,6 @@ impl Doc {
             file: Arc::default(),
             dialect: Dialect::default(),
             conns,
-            picked,
-            picked_db,
             active: None,
             applied: None,
             stmt_lines: None,
@@ -102,24 +86,14 @@ impl Doc {
         self.path.file_name().map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned())
     }
 
-    /// `-- @connection` wins over the picker; `None` = no connection.
+    /// The file's `-- @connection` (the picker writes it, as Respite's `# @env`); `None` = no connection.
     pub fn connection(&self) -> Option<&str> {
-        self.file.connection.as_deref().or(self.picked.as_deref())
-    }
-
-    /// The connection a `-- @connection` directive fixes; while it is there the picker is locked.
-    pub fn locked(&self) -> Option<&str> {
         self.file.connection.as_deref()
     }
 
-    /// The database a `-- @database` directive fixes; while it is there the picker rewrites it.
-    pub fn locked_db(&self) -> Option<&str> {
-        self.file.database.as_deref()
-    }
-
-    /// The database chosen for this file: `-- @database`, else the picker; `None` = the connection's default.
+    /// The file's `-- @database`; `None` = the connection's default.
     pub fn database(&self) -> Option<&str> {
-        self.file.database.as_deref().or(self.picked_db.as_deref())
+        self.file.database.as_deref()
     }
 
     /// The database shown for the file: its choice, else the connection's own, else `None`
@@ -128,7 +102,7 @@ impl Doc {
         self.effective_connection().and_then(|c| c.database)
     }
 
-    /// The file's connection pointed at its database (flag-less CLI rules: directive, pick, default).
+    /// The file's connection pointed at its database (as the CLI without flags: the directives, else the default).
     pub fn effective_connection(&self) -> Option<db_conn::Connection> {
         self.conns.connections.get(self.connection()?).map(|c| c.with_database(self.database()))
     }
@@ -152,7 +126,7 @@ impl Doc {
         }
         let text = self.editor.read(cx).value();
         let mut file = sql_split::split(&text, self.dialect);
-        let wanted = self.dialect_for(file.connection.as_deref().or(self.picked.as_deref()));
+        let wanted = self.dialect_for(file.connection.as_deref());
         if wanted != self.dialect {
             self.dialect = wanted;
             file = sql_split::split(&text, wanted);

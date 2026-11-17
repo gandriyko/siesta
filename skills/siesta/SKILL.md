@@ -190,8 +190,8 @@ project-level connection files.
 ### Folders
 
 - `~/.config/siesta/` — only what the user writes: `settings.json`, `keymap.json`, `connections/`,
-  `sql/` (scratch workspace). Fine for a dotfiles repo. Edit connection files here (never a password).
-- `~/.siesta/` — only what Siesta writes: `state.json`, `history/`, `cache/`, the password `key`.
+  `collections/` (the user's `.sql` files, with subfolders). Fine for a dotfiles repo. Edit connection files here (never a password).
+- `~/.siesta/` — only what Siesta writes: `state.json`, `files.json`, `history/`, `cache/`, the password `key`.
   Never read the key, never edit these files, and keep this folder out of dotfiles.
 - `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace them.
 

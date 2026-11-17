@@ -178,7 +178,7 @@ fn dir_from(var: &str, home_rel: &str) -> Option<PathBuf> {
 }
 
 /// `~/.config/siesta` (`SIESTA_CONFIG_DIR` replaces it): only what the user writes — `settings.json`,
-/// `keymap.json`, `connections/`, `sql/`. Safe to keep in a dotfiles repo.
+/// `keymap.json`, `connections/`, `collections/`. Safe to keep in a dotfiles repo.
 pub fn config_dir() -> Option<PathBuf> {
     dir_from("SIESTA_CONFIG_DIR", ".config/siesta")
 }
@@ -187,6 +187,11 @@ pub fn config_dir() -> Option<PathBuf> {
 /// `history/`, `cache/`, the password `key`. Never for a dotfiles repo.
 pub fn data_dir() -> Option<PathBuf> {
     dir_from("SIESTA_DATA_DIR", ".siesta")
+}
+
+/// `<config>/collections`: the central folder of the user's `.sql` files (`~/.config/siesta/collections`).
+pub fn collections_dir_in(config: &Path) -> PathBuf {
+    config.join("collections")
 }
 
 /// `<config_dir>/settings.json`.

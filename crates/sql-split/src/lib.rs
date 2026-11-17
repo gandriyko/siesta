@@ -106,6 +106,41 @@ pub fn rewrite_database(src: &str, dialect: Dialect, name: Option<&str>) -> Opti
     rewrite_directive_at(src, at, "database", name)
 }
 
+/// `src` running on connection `name` (`None`: none), as Respite's `# @env` line: the
+/// `-- @connection` directive is replaced, inserted as the first line, or removed. A
+/// `-- @database` line goes too when the connection changes (a database belongs to its server).
+pub fn set_connection(src: &str, dialect: Dialect, name: Option<&str>) -> String {
+    let file = split(src, dialect);
+    if file.connection.as_deref() == name {
+        return src.to_string();
+    }
+    let src = rewrite_database(src, dialect, None).unwrap_or_else(|| src.to_string());
+    match (rewrite_connection(&src, dialect, name), name) {
+        (Some(s), _) => s,
+        (None, Some(n)) => format!("-- @connection {n}\n{src}"),
+        (None, None) => src,
+    }
+}
+
+/// `src` running on database `name` (`None`: the connection's default): the `-- @database`
+/// directive is replaced, removed, or inserted right after `-- @connection` (else first).
+pub fn set_database(src: &str, dialect: Dialect, name: Option<&str>) -> String {
+    let file = split(src, dialect);
+    if file.database.as_deref() == name {
+        return src.to_string();
+    }
+    match (rewrite_database(src, dialect, name), name) {
+        (Some(s), _) => s,
+        (None, Some(n)) => {
+            // After the line holding `-- @connection`, so the two read together.
+            let at = file.connection_at.map_or(0, |r| src[r.end..].find('\n').map_or(src.len(), |i| r.end + i + 1));
+            let nl = if at == src.len() && !src.is_empty() && !src.ends_with('\n') { "\n" } else { "" };
+            format!("{}{nl}-- @database {n}\n{}", &src[..at], &src[at..])
+        }
+        (None, None) => src.to_string(),
+    }
+}
+
 fn rewrite_directive_at(src: &str, at: Range<usize>, word: &str, name: Option<&str>) -> Option<String> {
     let text = &src[at.clone()];
     let end = at.start + text.trim_end().len();
@@ -810,6 +845,34 @@ mod tests {
         // Not a top-of-file directive (after a statement): nothing to rewrite.
         assert_eq!(r("SELECT 1;\n-- @connection dev\nSELECT 2;", Some("x")), None);
         assert_eq!(r("SELECT 1;", None), None);
+    }
+
+    #[test]
+    fn set_connection_and_database_write_the_directives() {
+        let c = |src: &str, n| set_connection(src, PG, n);
+        // Inserted first, replaced, removed; the same name changes nothing.
+        assert_eq!(c("SELECT 1;\n", Some("dev")), "-- @connection dev\nSELECT 1;\n");
+        assert_eq!(c("", Some("dev")), "-- @connection dev\n");
+        assert_eq!(c("-- @connection dev\nSELECT 1;", Some("prod")), "-- @connection prod\nSELECT 1;");
+        assert_eq!(c("-- @connection dev\nSELECT 1;", None), "SELECT 1;");
+        assert_eq!(c("SELECT 1;", None), "SELECT 1;");
+        // Another connection drops the database line (it belonged to the old server); the same one keeps it.
+        assert_eq!(c("-- @connection dev\n-- @database app\nSELECT 1;", Some("prod")), "-- @connection prod\nSELECT 1;");
+        assert_eq!(c("-- @connection dev\n-- @database app\nSELECT 1;", Some("dev")), "-- @connection dev\n-- @database app\nSELECT 1;");
+        assert_eq!(c("-- @database app\nSELECT 1;", Some("dev")), "-- @connection dev\nSELECT 1;");
+
+        let d = |src: &str, n| set_database(src, PG, n);
+        // Right after `-- @connection` (CRLF kept), else first; replaced; removed.
+        assert_eq!(d("-- @connection dev\nSELECT 1;", Some("app")), "-- @connection dev\n-- @database app\nSELECT 1;");
+        assert_eq!(d("-- @name n\n-- @connection dev\r\nSELECT 1;", Some("app")), "-- @name n\n-- @connection dev\r\n-- @database app\nSELECT 1;");
+        assert_eq!(d("-- @connection dev", Some("app")), "-- @connection dev\n-- @database app\n");
+        assert_eq!(d("SELECT 1;", Some("app")), "-- @database app\nSELECT 1;");
+        assert_eq!(d("-- @connection dev\n-- @database a\nSELECT 1;", Some("b")), "-- @connection dev\n-- @database b\nSELECT 1;");
+        assert_eq!(d("-- @connection dev\n-- @database a\nSELECT 1;", None), "-- @connection dev\nSELECT 1;");
+        assert_eq!(d("SELECT 1;", None), "SELECT 1;");
+        // What the splitter then reads back.
+        let f = split(&d(&c("SELECT 1;", Some("dev")), Some("app")), PG);
+        assert_eq!((f.connection.as_deref(), f.database.as_deref(), f.statements.len()), (Some("dev"), Some("app"), 1));
     }
 
     #[test]

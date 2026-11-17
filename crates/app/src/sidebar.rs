@@ -1,8 +1,8 @@
-//! Sidebar: tabs Files | DB. Files: folders → `.sql` files → statements.
+//! Sidebar: tabs Files | DB. Files, as in Respite: the central folder (`~/.config/siesta/collections`:
+//! folders → `.sql` files → statements), then the `.sql` files added from elsewhere.
 //!
 //! Styled after the VS Code / Zed project panels: disclosure chevrons, indent guides,
-//! compact single-child folders (`crates/app`), inset rounded selection and muted meta on the
-//! right.
+//! compact single-child folders (`api/v2`), inset rounded selection and muted meta on the right.
 
 use std::{
     collections::BTreeMap,
@@ -12,14 +12,12 @@ use std::{
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     h_flex,
-    input::Input,
+    input::{Input, InputEvent, InputState},
+    notification::Notification,
     tab::{Tab, TabBar},
-    v_flex,
 };
-
-use siesta_workspace::Workspace;
 
 use crate::{Siesta, SideTab};
 
@@ -32,11 +30,30 @@ pub(crate) const PAD: f32 = 6.;
 /// Chevron column width; leaves get a spacer of the same width.
 pub(crate) const CHEVRON: f32 = 14.;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    /// `~/.config/siesta/collections`
+    Collections,
+    /// Added from elsewhere.
+    Files,
+}
+
 pub(crate) enum Row {
+    Section(Section),
     Dir { path: PathBuf, name: String, depth: usize },
-    File { path: PathBuf, name: String, depth: usize, statements: usize },
+    /// `added`: in the Files section (× drops it from the list).
+    File { path: PathBuf, name: String, depth: usize, statements: usize, added: bool },
     Statement { path: PathBuf, line: usize, label: String, depth: usize },
     Note { text: &'static str, depth: usize },
+}
+
+impl Row {
+    fn depth(&self) -> usize {
+        match self {
+            Row::Section(_) => 0,
+            Row::Dir { depth, .. } | Row::File { depth, .. } | Row::Statement { depth, .. } | Row::Note { depth, .. } => *depth,
+        }
+    }
 }
 
 /// `rows` cut into spans in order: a file's statements longer than [`FILE_STATEMENTS`] with that
@@ -71,15 +88,7 @@ fn long_statement_runs(rows: &[Row]) -> Vec<(std::ops::Range<usize>, Option<&Pat
     all
 }
 
-impl Row {
-    fn depth(&self) -> usize {
-        match self {
-            Row::Dir { depth, .. } | Row::File { depth, .. } | Row::Statement { depth, .. } | Row::Note { depth, .. } => *depth,
-        }
-    }
-}
-
-/// Folder tree of the workspace's files.
+/// Folder tree of the central folder.
 #[derive(Default)]
 struct Tree {
     dirs: BTreeMap<String, Tree>,
@@ -87,15 +96,40 @@ struct Tree {
 }
 
 impl Tree {
-    fn build(root: &Path, files: &[PathBuf]) -> Self {
+    /// `entries`: folders and `.sql` files under `root` (folders make empty nodes).
+    fn build(root: &Path, entries: &[PathBuf]) -> Self {
         let mut tree = Tree::default();
-        for f in files {
-            let rel = f.strip_prefix(root).unwrap_or(f);
-            let dirs = rel.parent().into_iter().flat_map(|p| p.components()).map(|c| c.as_os_str().to_string_lossy().into_owned());
-            dirs.fold(&mut tree, |node, d| node.dirs.entry(d).or_default()).files.push(f.clone());
+        for e in entries {
+            let rel = e.strip_prefix(root).unwrap_or(e);
+            let is_dir = !siesta_workspace::is_sql(e);
+            let parent = if is_dir { Some(rel) } else { rel.parent() };
+            let dirs = parent.into_iter().flat_map(|p| p.components()).map(|c| c.as_os_str().to_string_lossy().into_owned());
+            let node = dirs.fold(&mut tree, |node, d| node.dirs.entry(d).or_default());
+            if !is_dir {
+                node.files.push(e.clone());
+            }
         }
         tree
     }
+}
+
+/// Import, new file, new folder, `+`, `×`, Trash … on a row or a section header: shown on hover,
+/// or always; `tip` on hover.
+fn row_action(id: impl Into<ElementId>, child: impl IntoElement, tip: &'static str, always: bool, cx: &App) -> Stateful<Div> {
+    div()
+        .id(id)
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip).build(window, cx))
+        .flex_none()
+        .p_0p5()
+        .rounded_sm()
+        .text_color(cx.theme().muted_foreground)
+        .when(!always, |d| d.invisible().group_hover("row", |s| s.visible()))
+        .hover(|s| s.bg(cx.theme().list_active))
+        .child(child)
+}
+
+fn name_of(p: &Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 impl Siesta {
@@ -117,69 +151,200 @@ impl Siesta {
         }
     }
 
-    /// Hover `+`: a new `.sql` file in `dir`, named in the system save dialog.
-    fn add_button(&self, ix: usize, dir: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id(("add-file", ix))
-            .flex_none()
-            .px_1()
-            .rounded_sm()
-            .text_color(cx.theme().muted_foreground)
-            .invisible()
-            .group_hover("row", |s| s.visible())
-            .hover(|s| s.bg(cx.theme().list_active))
-            .child("+")
-            .on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.new_file(&dir, window, cx);
-            }))
-    }
-
-    /// Hover `×` on a chosen file (when there are others): drop it from the workspace, not from disk.
-    fn remove_button(&self, ix: usize, path: PathBuf, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let Workspace::Files(files) = &self.workspace else { return None };
-        (files.len() > 1).then(|| {
-            div()
-                .id(("remove-file", ix))
-                .flex_none()
-                .rounded_sm()
-                .invisible()
-                .group_hover("row", |s| s.visible())
-                .hover(|s| s.bg(cx.theme().list_active))
-                .child(Icon::new(IconName::Close).size_3().text_color(cx.theme().muted_foreground))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.remove_from_workspace(&path, window, cx);
-                }))
-        })
-    }
-
-    pub(crate) fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_new_path(dir, Some("query.sql"));
+    /// `+` in the Files section (File → Add Files…, Cmd+O): `.sql` files from anywhere, several at once.
+    pub(crate) fn add_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Add".into()) });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(mut path))) = picked.await else { return };
-            if !siesta_workspace::is_sql(&path) {
-                path.set_extension("sql");
-            }
-            this.update_in(cx, |this, window, cx| {
-                // The dialog already confirmed overwriting; an existing file is just opened, never truncated.
-                if !path.exists()
-                    && let Err(e) = std::fs::write(&path, "")
-                {
-                    window.push_notification(format!("{}: {e}", path.display()), cx);
-                    return;
-                }
-                // Chosen files: the new file joins them, so the tree shows it.
-                match &this.workspace {
-                    Workspace::Files(files) => this.set_files(files.iter().cloned().chain([path.clone()]).collect(), cx),
-                    Workspace::Folder(_) => this.rescan(),
-                }
-                this.open(path, None, window, cx);
-                cx.notify();
-            })
-            .ok();
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            this.update_in(cx, |this, window, cx| this.add_paths(paths, window, cx)).ok();
         })
         .detach();
+    }
+
+    /// Lists and opens the `.sql` files among `paths` (the `+` dialog, or files dropped on the
+    /// window); the rest are skipped with a notice.
+    pub(crate) fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        // ponytail: the system dialog has no extension filter here; other files are skipped after.
+        let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.is_file() && siesta_workspace::is_sql(p));
+        if !skipped.is_empty() {
+            let names: Vec<String> = skipped.iter().map(|p| name_of(p)).collect();
+            let title = if skipped.len() == 1 { "Not an SQL file" } else { "Not SQL files" };
+            window.push_notification(Notification::warning(format!("{}\nOnly .sql files can be added.", names.join(", "))).title(title), cx);
+        }
+        let first = ok.first().cloned();
+        for p in ok {
+            self.add_file(p);
+        }
+        if let Some(p) = first {
+            self.open(p, None, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// List `path` in the Files section, unless it's there already or under the central folder.
+    pub(crate) fn add_file(&mut self, path: PathBuf) {
+        if self.config_dir.as_ref().is_some_and(|c| path.starts_with(c)) || self.added.contains(&path) {
+            return;
+        }
+        self.added.push(path);
+        self.save_added();
+        self.rescan();
+    }
+
+    /// Drops the file from the list only; the file, its tab and its history stay.
+    pub(crate) fn remove_file(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.added.retain(|p| p != path);
+        self.save_added();
+        self.rescan();
+        window.push_notification(format!("Removed {} from the list. The file and its history are kept.", name_of(path)), cx);
+        cx.notify();
+    }
+
+    fn save_added(&self) {
+        if let Some(base) = &self.base {
+            siesta_workspace::save_files(base, &self.added);
+        }
+    }
+
+    /// File → Import…: into the central folder.
+    pub(crate) fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_into(self.folder(), window, cx);
+    }
+
+    /// Several `.sql` files at once, copied into `dir` (a name already there is skipped, never
+    /// overwritten); the first one opens.
+    pub(crate) fn import_into(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Import".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            this.update_in(cx, |this, window, cx| this.import_paths(paths, &dir, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Copies the `.sql` files among `paths` into `dir`; returns what was copied.
+    pub(crate) fn import_paths(&mut self, paths: Vec<PathBuf>, dir: &Path, window: &mut Window, cx: &mut Context<Self>) -> Vec<PathBuf> {
+        let mut copied = vec![];
+        for src in paths {
+            let name = name_of(&src);
+            let dest = dir.join(&name);
+            let result = if !siesta_workspace::is_sql(&src) {
+                Err("only .sql files can be imported".to_string())
+            } else if dest.exists() {
+                Err("a file with this name is already there".to_string())
+            } else {
+                std::fs::create_dir_all(dir).and_then(|()| std::fs::copy(&src, &dest)).map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(_) => copied.push(dest),
+                Err(e) => window.push_notification(Notification::warning(format!("{name}: {e}")).title("Not imported"), cx),
+            }
+        }
+        self.collapsed_dirs.remove(dir);
+        self.rescan();
+        if let Some(f) = copied.first() {
+            self.open(f.clone(), None, window, cx);
+        }
+        cx.notify();
+        copied
+    }
+
+    /// A new `.sql` file in `dir`, named in an in-app dialog.
+    pub(crate) fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dir.to_path_buf();
+        self.ask_name("New File", "query.sql", "Create", window, cx, move |this, name, window, cx| {
+            this.create_file(&dir, name, window, cx);
+        });
+    }
+
+    /// `name` (`.sql` added when missing) in `dir`, made empty unless it exists (never truncated),
+    /// then opened; `None` when it can't be written.
+    pub(crate) fn create_file(&mut self, dir: &Path, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
+        let mut path = dir.join(name);
+        if !siesta_workspace::is_sql(&path) {
+            path.set_extension("sql");
+        }
+        if !path.exists()
+            && let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, ""))
+        {
+            window.push_notification(format!("{}: {e}", path.display()), cx);
+            return None;
+        }
+        self.rescan();
+        self.open(path.clone(), None, window, cx);
+        cx.notify();
+        Some(path)
+    }
+
+    /// A new folder in `dir`, named in an in-app dialog.
+    pub(crate) fn new_folder(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dir.to_path_buf();
+        self.ask_name("New Folder", "New Folder", "Create", window, cx, move |this, name, window, cx| {
+            let path = dir.join(name);
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                window.push_notification(format!("{}: {e}", path.display()), cx);
+                return;
+            }
+            this.collapsed_dirs.remove(&path);
+            this.rescan();
+            cx.notify();
+        });
+    }
+
+    /// Not the system save dialog: macOS won't open it inside the hidden `~/.config`, so it
+    /// started wherever it was last. Enter or the button applies; a name with `/` is refused.
+    fn ask_name(
+        &mut self,
+        title: &'static str,
+        default: &str,
+        ok: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut Self, &str, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(default.to_string()));
+        let this = cx.entity().downgrade();
+        let apply = std::rc::Rc::new(apply);
+        let apply = std::rc::Rc::new({
+            let input = input.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let name = input.read(cx).value().trim().to_string();
+                if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
+                    window.push_notification(format!("Invalid name: {name}"), cx);
+                    return;
+                }
+                window.close_dialog(cx);
+                // Enter arrives through a subscription of `Siesta`, which is mid-update then.
+                let (this, apply) = (this.clone(), apply.clone());
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |this, cx| apply(this, &name, window, cx)).ok();
+                });
+            }
+        });
+        self.picker_sub = Some(cx.subscribe_in(&input, window, {
+            let apply = apply.clone();
+            move |_, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    apply(window, cx);
+                }
+            }
+        }));
+        let field = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let apply = apply.clone();
+            dialog.title(title).w(px(420.)).child(Input::new(&field)).footer(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("name-cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("name-ok").label(ok).primary().on_click(move |_, window, cx| apply(window, cx))),
+            )
+        });
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.select_all(window, cx);
+        });
     }
 
     fn toggle(&mut self, key: &Path) {
@@ -194,60 +359,25 @@ impl Siesta {
         }
     }
 
-    /// No `.sql` files here (a first launch, or the last workspace is gone): ways out, and the
-    /// workspaces opened before.
-    fn empty_files(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = cx.theme();
-        let (muted, hover) = (t.muted_foreground, t.list_hover);
-        let recent = self.recent.iter().enumerate().map(|(i, w)| {
-            let (file, name) = (matches!(w, Workspace::Files(_)), w.name());
-            // Where it is: the folder's parent, or the folder holding the chosen files.
-            let dir = match w {
-                Workspace::Folder(p) => p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
-                Workspace::Files(_) => w.folder().display().to_string(),
-            };
-            let ws = w.clone();
-            div()
-                .id(("recent", i))
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(if file { IconName::File } else { IconName::Folder }).size_3p5().flex_none().text_color(muted))
-                .child(v_flex().min_w_0().child(div().text_sm().truncate().child(name)).child(div().text_xs().text_color(muted).truncate().child(dir)))
-                .on_click(cx.listener(move |this, _, window, cx| this.set_workspace(ws.clone(), window, cx)))
-        });
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .px_2()
-            .gap_2()
-            .child(div().px_1().text_sm().text_color(muted).child("No .sql files here."))
-            .child(
-                h_flex()
-                    .px_1()
-                    .gap_2()
-                    .child(Button::new("empty-open-folder").label("Open Folder…").small().on_click(cx.listener(|this, _, window, cx| this.open_dialog(false, true, window, cx))))
-                    .child(Button::new("empty-open-file").label("Open Files…").small().on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, false, window, cx)))),
-            )
-            .when(!self.recent.is_empty(), |el| {
-                el.child(div().px_1().pt_2().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("RECENT"))
-                    .child(div().id("recent-list").flex_1().min_h_0().overflow_y_scroll().children(recent))
-            })
-            .into_any_element()
-    }
-
     pub(crate) fn build_rows(&mut self, query: &str, cx: &App) -> Vec<Row> {
-        let (root, files) = (self.folder(), self.files.clone());
-        let mut rows = vec![];
-        if files.is_empty() {
-            rows.push(Row::Note { text: "No .sql files", depth: 0 });
+        let root = self.folder();
+        let central = self.central.clone();
+        let mut rows = vec![Row::Section(Section::Collections)];
+        let mut found = vec![];
+        self.emit(&Tree::build(&root, &central), &root, 0, query, &mut found, cx);
+        if found.is_empty() && query.is_empty() {
+            rows.push(Row::Note { text: "No files yet: the buttons above make or import one", depth: 0 });
         }
-        self.emit(&Tree::build(&root, &files), &root, 0, query, &mut rows, cx);
+        rows.extend(found);
+        rows.push(Row::Section(Section::Files));
+        let mut found = vec![];
+        for f in self.added.clone() {
+            self.emit_file(&f, 0, query, true, &mut found, cx);
+        }
+        if found.is_empty() && query.is_empty() {
+            rows.push(Row::Note { text: "+ adds .sql files from anywhere", depth: 0 });
+        }
+        rows.extend(found);
         rows
     }
 
@@ -275,30 +405,110 @@ impl Siesta {
             }
         }
         for f in &tree.files {
-            let outline = self.outline_of(f, cx);
-            let name = f.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-            if searching {
-                // A file-name match keeps all its statements; otherwise only the matching ones.
-                let file_hit = name.to_lowercase().contains(query);
-                let hits: Vec<_> = outline.into_iter().filter(|(_, l)| file_hit || l.to_lowercase().contains(query)).collect();
-                if hits.is_empty() && !file_hit {
-                    continue;
-                }
-                rows.push(Row::File { path: f.clone(), name, depth, statements: hits.len() });
-                rows.extend(hits.into_iter().map(|(line, label)| Row::Statement { path: f.clone(), line, label, depth: depth + 1 }));
-                continue;
-            }
-            rows.push(Row::File { path: f.clone(), name, depth, statements: outline.len() });
-            if self.expanded.contains(f) {
-                rows.extend(outline.into_iter().map(|(line, label)| Row::Statement { path: f.clone(), line, label, depth: depth + 1 }));
-            }
+            self.emit_file(f, depth, query, false, rows, cx);
         }
+    }
+
+    fn emit_file(&mut self, f: &Path, depth: usize, query: &str, added: bool, rows: &mut Vec<Row>, cx: &App) {
+        let outline = self.outline_of(f, cx);
+        let (name, path) = (name_of(f), f.to_path_buf());
+        if !query.is_empty() {
+            // A file-name match keeps all its statements; otherwise only the matching ones.
+            let file_hit = name.to_lowercase().contains(query);
+            let hits: Vec<_> = outline.into_iter().filter(|(_, l)| file_hit || l.to_lowercase().contains(query)).collect();
+            if hits.is_empty() && !file_hit {
+                return;
+            }
+            rows.push(Row::File { path: path.clone(), name, depth, statements: hits.len(), added });
+            rows.extend(hits.into_iter().map(|(line, label)| Row::Statement { path: path.clone(), line, label, depth: depth + 1 }));
+            return;
+        }
+        rows.push(Row::File { path: path.clone(), name, depth, statements: outline.len(), added });
+        if self.expanded.contains(&path) {
+            rows.extend(outline.into_iter().map(|(line, label)| Row::Statement { path: path.clone(), line, label, depth: depth + 1 }));
+        }
+    }
+
+    /// Import / new file / new folder buttons for `dir` (a folder row or the Collections header).
+    fn folder_actions(&self, ix: usize, dir: &Path, always: bool, cx: &mut Context<Self>) -> [Stateful<Div>; 3] {
+        let size = cx.theme().font_size * 0.95;
+        let (d1, d2, d3) = (dir.to_path_buf(), dir.to_path_buf(), dir.to_path_buf());
+        [
+            row_action(("import", ix), Icon::default().data(include_bytes!("../assets/file-down.svg")).size(size), "Import Files…", always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.import_into(d3.clone(), window, cx);
+                }),
+            ),
+            row_action(("new-file", ix), Icon::default().data(include_bytes!("../assets/file-plus.svg")).size(size), "New File", always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.new_file(&d1, window, cx);
+                }),
+            ),
+            row_action(("new-folder", ix), Icon::default().data(include_bytes!("../assets/folder-plus.svg")).size(size), "New Folder", always, cx).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.new_folder(&d2, window, cx);
+                }),
+            ),
+        ]
+    }
+
+    /// Trash button on a file or folder of the central folder.
+    fn trash_action(&self, ix: usize, path: &Path, cx: &mut Context<Self>) -> Stateful<Div> {
+        let size = cx.theme().font_size * 0.95;
+        let p = path.to_path_buf();
+        row_action(("trash", ix), Icon::default().data(include_bytes!("../assets/trash.svg")).size(size), "Move to Trash", false, cx).on_click(cx.listener(
+            move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.trash(p.clone(), window, cx);
+            },
+        ))
+    }
+
+    /// Asks, then moves a file or a folder of the central folder to the system Trash (it can be
+    /// put back from there).
+    fn trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name_of(&path);
+        let (message, detail) = if path.is_dir() {
+            (format!("Move the folder “{name}” to the Trash?"), "Everything in it goes too. You can put it back from the Trash.")
+        } else {
+            (format!("Move “{name}” to the Trash?"), "You can put it back from the Trash.")
+        };
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Move to Trash", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| this.move_to_trash(&path, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn move_to_trash(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // Unsaved edits aren't in the Trash copy, and an open transaction needs an answer: first.
+        if let Some(d) = self.docs.iter().find(|d| d.path.starts_with(path) && (d.dirty || self.in_tx(&d.path))) {
+            window.push_notification(format!("Save {} and end its transaction first.", d.name()), cx);
+            return;
+        }
+        if let Err(e) = trash::delete(path) {
+            window.push_notification(format!("Couldn't move {} to the Trash: {e}", path.display()), cx);
+            return;
+        }
+        while let Some(ix) = self.docs.iter().position(|d| d.path.starts_with(path)) {
+            self.close_now(ix, window, cx);
+        }
+        self.rescan();
+        self.remember(cx);
+        window.push_notification(format!("Moved {} to the Trash", name_of(path)), cx);
+        cx.notify();
     }
 
     /// Every row; a file's statements beyond [`FILE_STATEMENTS`] go into a block of that height
     /// that scrolls on its own, so one long file doesn't push the rest of the tree away.
     // ponytail: not virtualized (uniform_list can't hold a block of another height); fine for
-    // hundreds of rows, a variable-height `list` if a workspace ever has thousands.
+    // hundreds of rows, a variable-height `list` if the tree ever has thousands.
     fn render_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = vec![];
         for (span, path) in long_statement_runs(&self.rows) {
@@ -345,26 +555,47 @@ impl Siesta {
 
         // Inset by 4 px on both sides, so selection and hover read as rounded pills.
         let row = match row {
+            Row::Section(section) => {
+                let title = match section {
+                    Section::Collections => "COLLECTIONS",
+                    Section::Files => "FILES",
+                };
+                let head = base
+                    .cursor_default()
+                    .when(ix > 0, |r| r.mt_2())
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child(div().flex_1().child(title));
+                match section {
+                    Section::Collections => head.children(self.folder_actions(ix, &self.folder(), true, cx)),
+                    Section::Files => head.child(
+                        row_action("add-files", Icon::new(IconName::Plus).size_3p5(), "Add .sql Files…", true, cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.add_files(window, cx))),
+                    ),
+                }
+                .into_any_element()
+            }
             Row::Dir { path, name, .. } => {
                 let open = !self.collapsed_dirs.contains(path);
                 let p = path.clone();
                 base.child(chevron(open, muted))
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, muted))
                     .child(div().flex_1().truncate().child(name.clone()))
-                    .child(self.add_button(ix, path.clone(), cx))
+                    .children(self.folder_actions(ix, path, false, cx))
+                    .child(self.trash_action(ix, path, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_dir(&p);
                         cx.notify();
                     }))
                     .into_any_element()
             }
-            Row::File { path, name, statements, .. } => {
+            Row::File { path, name, statements, added, .. } => {
                 let doc = self.docs.iter().position(|d| *d.path == *path);
                 let current = doc.is_some() && doc == self.current;
                 let dirty = doc.is_some_and(|i| self.docs[i].dirty);
-                let sql = siesta_workspace::is_sql(path);
                 let open = self.expanded.contains(path);
-                let (p, q) = (path.clone(), path.clone());
+                let (p, q, r) = (path.clone(), path.clone(), path.clone());
                 let toggle = div()
                     .id(("file-chevron", ix))
                     .flex_none()
@@ -374,17 +605,20 @@ impl Siesta {
                         this.toggle(&q);
                         cx.notify();
                     }));
-                let meta = match (dirty, sql) {
-                    (true, _) => "●".to_string(),
-                    (false, false) => String::new(),
-                    (false, true) => statements.to_string(),
+                let meta = if dirty { "●".to_string() } else { statements.to_string() };
+                let remove = if *added {
+                    row_action(("remove-file", ix), Icon::new(IconName::Close).size_3(), "Remove from the List (the file stays)", false, cx).on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.remove_file(&r, window, cx);
+                    }))
+                } else {
+                    self.trash_action(ix, path, cx)
                 };
                 base.when(current, |r| r.bg(active))
-                    .map(|r| if sql { r.child(toggle) } else { r.child(spacer()) })
-                    .child(icon(IconName::FileText, if current { t.foreground } else { muted }))
+                    .child(toggle)
+                    .child(icon(IconName::FileText, if current { cx.theme().foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
-                    .children(path.parent().map(|d| self.add_button(ix, d.to_path_buf(), cx)))
-                    .children(self.remove_button(ix, path.clone(), cx))
+                    .child(remove)
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let is_current = this.doc().is_some_and(|d| *d.path == p);
@@ -439,9 +673,6 @@ impl Siesta {
     pub(crate) fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let (muted, hover, fg, border) = (t.muted_foreground, t.list_hover, t.sidebar_foreground, t.sidebar_border);
-        let icon_button = |id: &'static str, name: IconName| {
-            div().id(id).p_1().rounded_md().cursor_pointer().text_color(muted).hover(move |s| s.bg(hover)).child(Icon::new(name).size_3p5())
-        };
         let tab_ix = if self.side_tab == SideTab::Files { 0 } else { 1 };
         let tabs = TabBar::new("side-tabs")
             .segmented()
@@ -453,24 +684,12 @@ impl Siesta {
             }))
             .child(Tab::new().label("Files"))
             .child(Tab::new().label("DB"));
-        let header = div()
-            .flex_none()
-            .h(px(36.))
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(tabs)
-            .child(div().flex().items_center().when(self.side_tab == SideTab::Files, |el| {
-                el.child(icon_button("open-folder", IconName::FolderOpen).on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, true, window, cx))))
-            }));
+        let header = div().flex_none().h(px(36.)).px_2().flex().items_center().gap_2().child(tabs);
         let body = match self.side_tab {
             SideTab::Files => {
                 let query = self.sidebar_filter.read(cx).value().trim().to_lowercase();
                 self.rows = self.build_rows(&query, cx);
                 let list = div().id("sidebar").overflow_y_scroll().children(self.render_rows(cx));
-                let root_name = self.workspace.name();
                 let search = div()
                     .flex_none()
                     .px_2()
@@ -485,25 +704,7 @@ impl Siesta {
                         this.step_search_hit(step, window, cx);
                     }))
                     .child(Input::new(&self.sidebar_filter).small().cleanable(true));
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_3()
-                            .pb_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(muted)
-                            .truncate()
-                            .child(root_name.to_uppercase()),
-                    )
-                    .child(search)
-                    .child(if self.files.is_empty() { self.empty_files(cx) } else { div().flex_1().min_h_0().child(list.size_full()).into_any_element() })
-                    .into_any_element()
+                div().flex_1().min_h_0().flex().flex_col().child(search).child(div().flex_1().min_h_0().child(list.size_full())).into_any_element()
             }
             SideTab::Db => self.db_body(cx),
         };
@@ -568,7 +769,7 @@ mod tests {
     #[test]
     fn only_long_statement_lists_get_their_own_block() {
         let (a, b) = (PathBuf::from("/w/a.sql"), PathBuf::from("/w/b.sql"));
-        let file = |p: &PathBuf| Row::File { path: p.clone(), name: String::new(), depth: 0, statements: 0 };
+        let file = |p: &PathBuf| Row::File { path: p.clone(), name: String::new(), depth: 0, statements: 0, added: false };
         let st = |p: &PathBuf, n: usize| (0..n).map(|line| Row::Statement { path: p.clone(), line, label: String::new(), depth: 1 }).collect::<Vec<_>>();
         let long = FILE_STATEMENTS + 1;
         // a: over the limit (own block), b: exactly the limit (inline).
@@ -585,13 +786,14 @@ mod tests {
     }
 
     #[test]
-    fn tree_groups_by_folder() {
+    fn tree_groups_by_folder_and_keeps_empty_folders() {
         let root = Path::new("/w");
-        let files = ["/w/a.sql", "/w/crates/app/x.sql", "/w/crates/app/y.sql", "/w/api/v1/z.sql"].map(PathBuf::from);
-        let t = Tree::build(root, &files);
+        let entries = ["/w/a.sql", "/w/crates/app/x.sql", "/w/crates/app/y.sql", "/w/api/v1/z.sql", "/w/empty"].map(PathBuf::from);
+        let t = Tree::build(root, &entries);
         assert_eq!(t.files, [PathBuf::from("/w/a.sql")]);
-        assert_eq!(t.dirs.keys().collect::<Vec<_>>(), ["api", "crates"]);
+        assert_eq!(t.dirs.keys().collect::<Vec<_>>(), ["api", "crates", "empty"]);
         assert_eq!(t.dirs["crates"].dirs["app"].files.len(), 2);
         assert_eq!(t.dirs["api"].dirs["v1"].files, [PathBuf::from("/w/api/v1/z.sql")]);
+        assert!(t.dirs["empty"].files.is_empty() && t.dirs["empty"].dirs.is_empty());
     }
 }
