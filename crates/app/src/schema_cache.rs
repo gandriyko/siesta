@@ -67,6 +67,7 @@ mod tests {
             driver: db_conn::Driver::Postgres,
             url: None,
             host: Some(host.into()),
+            socket: None,
             port: None,
             database: Some("app".into()),
             user: None,

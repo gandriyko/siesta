@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use db_conn::{Connection, Driver, SslMode};
+use db_conn::{Connection, Driver, Socket, SslMode};
+use std::path::PathBuf;
 use futures_util::{Stream, StreamExt};
 use sql_split::{Dialect, Kind};
 use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlRow, MySqlSslMode};
@@ -224,12 +225,27 @@ pub struct Session {
     pub max_rows: usize,
 }
 
+/// The Unix socket to use (Postgres: folder, MySQL: file): the typed path, or the detected one.
+fn socket_path(c: &Connection) -> Result<Option<PathBuf>, DbError> {
+    match &c.socket {
+        None => Ok(None),
+        Some(Socket::Path(p)) => Ok(Some(PathBuf::from(p))),
+        Some(Socket::Auto) => db_conn::detect_socket(c.driver, c.port).map(Some).ok_or_else(|| {
+            let name = if c.driver == Driver::Postgres { "Postgres" } else { "MySQL / MariaDB" };
+            DbError::msg(format!("No Unix socket found for {name} (looked in {}); type its path in the connection form", db_conn::socket_candidates(c.driver).join(", ")))
+        }),
+    }
+}
+
 fn pg_options(c: &Connection) -> Result<PgConnectOptions, DbError> {
     let mut o = match &c.url {
         Some(u) => u.parse::<PgConnectOptions>().map_err(|e| DbError::msg(format!("invalid url: {e}")))?,
         None => PgConnectOptions::new(),
     };
-    if let Some(h) = &c.host {
+    if let Some(dir) = socket_path(c)? {
+        // A folder: sqlx connects to `<dir>/.s.PGSQL.<port>`.
+        o = o.socket(dir);
+    } else if let Some(h) = &c.host {
         o = o.host(h);
     }
     if let Some(p) = c.port {
@@ -273,9 +289,10 @@ fn mysql_options(c: &Connection) -> Result<MySqlConnectOptions, DbError> {
         Some(u) => u.parse::<MySqlConnectOptions>().map_err(|e| DbError::msg(format!("invalid url: {e}")))?,
         None => MySqlConnectOptions::new(),
     };
-    if let Some(h) = &c.host {
-        // A path is the socket file (`/tmp/mysql.sock`).
-        o = if h.starts_with('/') { o.socket(h) } else { o.host(h) };
+    if let Some(file) = socket_path(c)? {
+        o = o.socket(file);
+    } else if let Some(h) = &c.host {
+        o = o.host(h);
     }
     if let Some(p) = c.port {
         o = o.port(p);
@@ -916,7 +933,7 @@ pub(crate) fn read_write_switch(sql: &str, d: Dialect) -> bool {
 mod tests {
     #[test]
     fn socket_hosts_and_default_user() {
-        let mut c = Connection { name: "t".into(), driver: Driver::Postgres, url: None, host: Some("/tmp".into()), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
+        let mut c = Connection { name: "t".into(), driver: Driver::Postgres, url: None, host: None, socket: Some(Socket::Path("/tmp".into())), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
         let o = pg_options(&c).unwrap();
         assert!(!matches!(o.get_username(), "" | "anonymous" | "unknown"));
         assert_eq!(Opts::Pg(o).target(), None);
@@ -925,7 +942,7 @@ mod tests {
         c.user = None;
         c.url = Some("postgres://alice@h/d".into());
         assert_eq!(pg_options(&c).unwrap().get_username(), "alice");
-        let m = Connection { name: "t".into(), driver: Driver::MySql, url: None, host: Some("/tmp/mysql.sock".into()), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
+        let m = Connection { name: "t".into(), driver: Driver::MySql, url: None, host: None, socket: Some(Socket::Path("/tmp/mysql.sock".into())), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
         let o = mysql_options(&m).unwrap();
         assert!(o.get_socket().is_some());
         assert_eq!(Opts::My(o).target(), None);

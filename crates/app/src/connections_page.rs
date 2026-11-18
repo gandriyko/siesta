@@ -38,6 +38,10 @@ fn target_of(c: &Connection) -> String {
         return db_conn::masked(c)["url"].as_str().unwrap_or_default().to_string();
     }
     let host = match (&c.host, c.port) {
+        _ if c.socket.is_some() => match &c.socket {
+            Some(db_conn::Socket::Path(p)) => p.clone(),
+            _ => "unix socket".into(),
+        },
         (Some(h), Some(p)) => format!("{h}:{p}"),
         (Some(h), None) => h.clone(),
         (None, Some(p)) => format!(":{p}"),
@@ -279,6 +283,7 @@ mod tests {
             driver: Driver::Postgres,
             url: None,
             host: Some("h".into()),
+            socket: None,
             port: Some(5432),
             database: Some("d".into()),
             user: None,

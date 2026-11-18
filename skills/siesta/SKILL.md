@@ -180,10 +180,12 @@ on stderr, so JSON on stdout stays clean.
 { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
 ```
 
-- Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database`
+- Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
   (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
-  `host` may be a Unix socket path: a folder for Postgres (`/tmp`), the socket file for MySQL (`/tmp/mysql.sock`).
+  `socket`: `true` connects through the local Unix socket found at connect time (Postgres: a folder with `.s.PGSQL.<port>` among `/tmp`,
+  `/var/run/postgresql`, Homebrew's; MySQL: the usual `mysql.sock` / `mysqld.sock` files), or a path (Postgres: the folder, MySQL: the file); `host` is then ignored.
+  A `host` that starts with `/` still works as a socket path. `siesta connections` shows `socket`.
   Postgres without `user` connects as the OS user.
   There is no `password` key.
 - `${env:NAME}` reads the environment.

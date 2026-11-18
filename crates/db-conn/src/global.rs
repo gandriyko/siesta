@@ -18,6 +18,9 @@ pub struct ConnectionForm {
     pub driver: Option<Driver>,
     pub url: String,
     pub host: String,
+    /// Connect through a Unix socket: `socket_path` (empty: detected at connect time) replaces `host`.
+    pub socket: bool,
+    pub socket_path: String,
     pub port: String,
     pub database: String,
     pub user: String,
@@ -48,6 +51,15 @@ impl ConnectionForm {
         // The `url` field only fills the other fields in the form; it is never written (no password in JSON).
         for (k, v) in [("host", &self.host), ("database", &self.database), ("user", &self.user), ("schema", &self.schema), ("init_sql", &self.init_sql), ("color", &self.color)] {
             set(k, v);
+        }
+        // With a socket the host is ignored, so it is not written; without one, `socket` goes away.
+        m.remove("socket");
+        if self.socket {
+            m.remove("host");
+            match self.socket_path.trim() {
+                "" => m.insert("socket".into(), true.into()),
+                p => m.insert("socket".into(), p.into()),
+            };
         }
         match self.port.trim() {
             "" => m.remove("port"),
@@ -136,7 +148,7 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
     };
     let b = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
     let mut base = e.clone();
-    for k in ["host", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password", "password_enc"] {
+    for k in ["host", "socket", "port", "database", "user", "schema", "init_sql", "color", "driver", "read_only", "prod", "password", "password_enc"] {
         base.remove(k);
     }
     if let Some(Value::Object(o)) = base.get_mut("ssl") {
@@ -155,12 +167,28 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
         base.remove("url");
     }
     let p = p.unwrap_or_default();
+    // `socket`: true or a path; a `host` that is a path (legacy) or a socket in the `url` counts too.
+    let (mut socket, mut socket_path) = match e.get("socket") {
+        Some(Value::Bool(true)) => (true, String::new()),
+        Some(Value::String(p)) => (true, p.trim().to_string()),
+        _ => (false, String::new()),
+    };
+    let mut host = or_host(&s("host"), &p.host);
+    if !socket {
+        if host.starts_with('/') {
+            (socket, socket_path, host) = (true, std::mem::take(&mut host), String::new());
+        } else if !p.socket.is_empty() && s("host").is_empty() {
+            (socket, socket_path) = (true, p.socket.clone());
+        }
+    }
     let or = |k: &str, v: String| Some(s(k)).filter(|x| !x.is_empty()).unwrap_or(v);
     Some(ConnectionForm {
         name: name.into(),
         driver: parse_driver(e.get("driver").and_then(Value::as_str), e.get("url").and_then(Value::as_str)).ok(),
         url: String::new(),
-        host: or("host", p.host),
+        host,
+        socket,
+        socket_path,
         port: or("port", p.port.map(|p| p.to_string()).unwrap_or_default()),
         database: or("database", p.database),
         user: or("user", p.user),
@@ -174,6 +202,10 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
         has_password: e.get("password_enc").is_some_and(Value::is_string),
         base,
     })
+}
+
+fn or_host(own: &str, parsed: &str) -> String {
+    if own.is_empty() { parsed.to_string() } else { own.to_string() }
 }
 
 /// Saves the form as `<name>.json`. `original` is the name being edited (a rename moves the file
@@ -327,6 +359,29 @@ mod tests {
         assert!(json(d, "ok").is_object());
         // Second run: nothing left to do.
         assert_eq!(migrate_names(d, keys), (vec![], vec![]));
+    }
+
+    #[test]
+    fn socket_roundtrips_through_the_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (d, keys) = (&tmp.path().join("config"), &tmp.path().join("data"));
+        let mut f = form("kc-sock");
+        f.socket = true;
+        save(d, keys, &f, None).unwrap();
+        assert_eq!(json(d, "kc-sock")["socket"], true);
+        assert!(json(d, "kc-sock").get("host").is_none());
+        let r = read_form(d, "kc-sock").unwrap();
+        assert!(r.socket && r.socket_path.is_empty());
+        f.socket_path = "/var/x".into();
+        save(d, keys, &f, Some("kc-sock")).unwrap();
+        assert_eq!(json(d, "kc-sock")["socket"], "/var/x");
+        f.socket = false;
+        save(d, keys, &f, Some("kc-sock")).unwrap();
+        assert!(json(d, "kc-sock").get("socket").is_none());
+        assert_eq!(json(d, "kc-sock")["host"], "h");
+        fs::write(path_of(d, "old"), r#"{"driver": "postgres", "host": "/tmp"}"#).unwrap();
+        let r = read_form(d, "old").unwrap();
+        assert_eq!((r.socket, r.socket_path.as_str(), r.host.as_str()), (true, "/tmp", ""));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Connections: one JSON file per connection in `<config dir>/connections/<name>.json`
 //! (`~/.config/siesta` unless `SIESTA_CONFIG_DIR` says otherwise); the file name is the connection name.
 //!
-//! A file holds driver, url | host / port / database / user, ssl, read_only, prod, schema, init_sql, color.
+//! A file holds driver, url | host / socket / port / database / user, ssl, read_only, prod, schema, init_sql, color.
 //! Values may use `${env:NAME}`. The password lives only as `password_enc` (encrypted with the local
 //! key `<data dir>/key`, see [`crypto`]), decrypted when a session opens.
 //! A broken connection lands in `errors`, a suspicious key in `warnings`; the rest loads.
@@ -20,7 +20,7 @@ pub use global::{ConnectionForm, delete, has_password, migrate_names, names, rea
 mod urlparse;
 pub use urlparse::{ParsedUrl, parse_url};
 
-const KEYS: [&str; 13] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color", "password_enc"];
+const KEYS: [&str; 14] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color", "password_enc", "socket"];
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
 
 /// The folder of the per-connection files inside the config dir.
@@ -103,12 +103,47 @@ pub struct Ssl {
     pub key: Option<PathBuf>,
 }
 
+/// Which Unix socket to connect through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socket {
+    /// Found at connect time, see [`detect_socket`].
+    Auto,
+    /// Postgres: the socket folder, MySQL / MariaDB: the socket file.
+    Path(String),
+}
+
+const PG_SOCKET_DIRS: [&str; 6] = ["/tmp", "/private/tmp", "/var/run/postgresql", "/run/postgresql", "/opt/homebrew/var/run/postgresql", "/usr/local/var/run/postgresql"];
+const MYSQL_SOCKETS: [&str; 7] = ["/tmp/mysql.sock", "/tmp/mysqld.sock", "/var/run/mysqld/mysqld.sock", "/run/mysqld/mysqld.sock", "/var/lib/mysql/mysql.sock", "/opt/homebrew/var/mysql/mysql.sock", "/usr/local/var/mysql/mysql.sock"];
+
+/// The places a server's Unix socket is usually at (Postgres: folders, MySQL: files).
+pub fn socket_candidates(driver: Driver) -> &'static [&'static str] {
+    match driver {
+        Driver::Postgres => &PG_SOCKET_DIRS,
+        Driver::MySql => &MYSQL_SOCKETS,
+    }
+}
+
+/// The local server's Unix socket: Postgres' folder (holding `.s.PGSQL.<port>`) or MySQL's file.
+pub fn detect_socket(driver: Driver, port: Option<u16>) -> Option<PathBuf> {
+    detect_socket_in(driver, port, socket_candidates(driver), |p| p.exists())
+}
+
+/// [`detect_socket`] over an explicit candidate list and existence check.
+pub fn detect_socket_in(driver: Driver, port: Option<u16>, candidates: &[&str], exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    candidates.iter().map(PathBuf::from).find(|c| match driver {
+        Driver::Postgres => exists(&c.join(format!(".s.PGSQL.{}", port.unwrap_or(5432)))),
+        Driver::MySql => exists(c),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     pub name: String,
     pub driver: Driver,
     pub url: Option<String>,
     pub host: Option<String>,
+    /// A Unix socket instead of TCP; `host` is then ignored.
+    pub socket: Option<Socket>,
     pub port: Option<u16>,
     pub database: Option<String>,
     pub user: Option<String>,
@@ -178,6 +213,10 @@ impl Connection {
             Some(if self.driver == Driver::Postgres { "postgres" } else { "mysql" }.to_string()),
             self.url.as_deref().map(mask_url),
             self.host.clone(),
+            self.socket.as_ref().map(|s| match s {
+                Socket::Auto => "socket:auto".to_string(),
+                Socket::Path(p) => format!("socket:{p}"),
+            }),
             self.port.map(|p| p.to_string()),
             self.database.clone(),
             self.user.clone(),
@@ -256,6 +295,13 @@ pub fn masked(c: &Connection) -> Value {
     put("driver", Some(if c.driver == Driver::Postgres { "postgres" } else { "mysql" }.into()));
     put("url", c.url.as_ref().map(|u| mask_url(u).into()));
     put("host", s(&c.host));
+    put(
+        "socket",
+        c.socket.as_ref().map(|k| match k {
+            Socket::Auto => Value::Bool(true),
+            Socket::Path(p) => Value::from(p.clone()),
+        }),
+    );
     put("port", c.port.map(Value::from));
     put("database", s(&c.database));
     put("user", s(&c.user));
@@ -430,11 +476,24 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
         };
         (ssl.ca, ssl.cert, ssl.key) = (path("ca"), path("cert"), path("key"));
     }
+    let mut host = str_of("host")?;
+    let mut socket = match f.get("socket") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(Socket::Auto),
+        Some(Value::String(p)) if p.trim().is_empty() => Some(Socket::Auto),
+        Some(Value::String(p)) => Some(Socket::Path(p.trim().to_string())),
+        Some(_) => return Err("'socket' must be true or a path".into()),
+    };
+    // Legacy: a host that is a path is a socket.
+    if socket.is_none() && host.as_deref().is_some_and(|h| h.starts_with('/')) {
+        socket = host.take().map(Socket::Path);
+    }
     Ok(Connection {
         name: name.to_string(),
         driver,
         url,
-        host: str_of("host")?,
+        host,
+        socket,
         port,
         database: str_of("database")?,
         user: str_of("user")?,
@@ -453,6 +512,24 @@ fn build(name: &str, f: &Map<String, Value>) -> Result<Connection, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn socket_detection_and_keys() {
+        let pg = |dirs: &[&str], port, present: &[&str]| detect_socket_in(Driver::Postgres, port, dirs, |p| present.iter().any(|x| Path::new(x) == p));
+        assert_eq!(pg(&["/a", "/b"], None, &["/b/.s.PGSQL.5432"]), Some(PathBuf::from("/b")));
+        assert_eq!(pg(&["/a", "/b"], Some(6000), &["/a/.s.PGSQL.5432"]), None);
+        assert_eq!(pg(&["/a", "/b"], Some(6000), &["/a/.s.PGSQL.6000", "/b/.s.PGSQL.6000"]), Some(PathBuf::from("/a")));
+        let my = detect_socket_in(Driver::MySql, Some(1), &["/x.sock", "/y.sock"], |p| p == Path::new("/y.sock"));
+        assert_eq!(my, Some(PathBuf::from("/y.sock")));
+
+        let t = config(&[("a", r#"{"driver": "postgres", "socket": true}"#), ("b", r#"{"driver": "mysql", "socket": "/s.sock"}"#), ("c", r#"{"driver": "postgres", "host": "/tmp"}"#), ("d", r#"{"driver": "postgres", "socket": 3}"#)]);
+        let c = Connections::load(t.path());
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(c.connections["a"].socket, Some(Socket::Auto));
+        assert_eq!(c.connections["b"].socket, Some(Socket::Path("/s.sock".into())));
+        assert_eq!((c.connections["c"].socket.clone(), c.connections["c"].host.clone()), (Some(Socket::Path("/tmp".into())), None));
+        assert!(c.errors.contains_key("d"));
+    }
 
     /// A config dir with one connection file per `(name, json)`.
     fn config(files: &[(&str, &str)]) -> tempfile::TempDir {

@@ -297,7 +297,7 @@ fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
         .collect();
     rows.extend(env.conns.errors.iter().map(|(n, e)| json!({ "name": n, "error": e })));
     rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    emit_objects(out, format, &["name", "driver", "url", "host", "port", "database", "user", "password", "read_only", "prod", "error"], &rows);
+    emit_objects(out, format, &["name", "driver", "url", "host", "socket", "port", "database", "user", "password", "read_only", "prod", "error"], &rows);
     Ok(0)
 }
 

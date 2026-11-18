@@ -14,6 +14,7 @@ pub fn connection(driver: Driver) -> Connection {
         driver,
         url: Some(std::env::var(var).unwrap_or_else(|_| panic!("{var} is not set; run scripts/test-db.sh"))),
         host: None,
+        socket: None,
         port: None,
         database: None,
         user: None,

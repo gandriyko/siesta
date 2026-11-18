@@ -37,8 +37,8 @@ fn default_port(d: Driver) -> &'static str {
 /// The hints of the fields that differ per driver: (URL, Host, User, Init SQL).
 fn driver_hints(d: Driver) -> [String; 4] {
     match d {
-        Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)".into(), "localhost, or a socket folder like /tmp".into(), format!("{} (your OS user)", db_conn::os_user()), "SET TIME ZONE 'UTC'".into()],
-        Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)".into(), "localhost, or a socket file like /tmp/mysql.sock".into(), "root".into(), "SET time_zone = '+00:00'".into()],
+        Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)".into(), "localhost".into(), format!("{} (your OS user)", db_conn::os_user()), "SET TIME ZONE 'UTC'".into()],
+        Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)".into(), "localhost".into(), "root".into(), "SET time_zone = '+00:00'".into()],
     }
 }
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
@@ -94,6 +94,11 @@ pub(crate) struct ConnForm {
     /// Keeps the Name field a valid connection name while typing.
     _name_sub: Subscription,
     pub host: Entity<InputState>,
+    /// Connect through a Unix socket: `socket_path` takes the Host field's place.
+    socket: bool,
+    pub socket_path: Entity<InputState>,
+    /// Re-detects the socket when the port changes.
+    _port_sub: Subscription,
     pub port: Entity<InputState>,
     database: Entity<InputState>,
     user: Entity<InputState>,
@@ -147,8 +152,15 @@ impl ConnForm {
                 }
             }
         });
+        let port = input("", &f.port, window, cx);
+        let _port_sub = cx.subscribe_in(&port, window, |this, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.socket_hint(window, cx);
+            }
+        });
         let mut this = Self {
             _sub,
+            _port_sub,
             _name_sub,
             url_note: None,
             has_password: f.has_password,
@@ -160,7 +172,9 @@ impl ConnForm {
             name,
             url,
             host: input("localhost", &f.host, window, cx),
-            port: input("", &f.port, window, cx),
+            socket: f.socket,
+            socket_path: input("", &f.socket_path, window, cx),
+            port,
             database: input("", &f.database, window, cx),
             user: input("", &f.user, window, cx),
             password,
@@ -202,6 +216,21 @@ impl ConnForm {
         for (input, hint) in [(&self.port, default_port(d).to_string()), (&self.url, url), (&self.host, host), (&self.user, user), (&self.init_sql, init)] {
             input.update(cx, |s, cx| s.set_placeholder(hint.clone(), window, cx));
         }
+        self.socket_hint(window, cx);
+    }
+
+    /// The socket field's hint: the detected socket, or why there is none.
+    fn socket_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.socket {
+            return;
+        }
+        let d = self.driver.unwrap_or(Driver::Postgres);
+        let port = self.port.read(cx).value().trim().parse::<u16>().ok();
+        let hint = match db_conn::detect_socket(d, port) {
+            Some(p) => format!("{} (detected)", p.display()),
+            None => "not found: type the socket path".to_string(),
+        };
+        self.socket_path.update(cx, |s, cx| s.set_placeholder(hint, window, cx));
     }
 
     /// A typed / pasted URL fills the other fields when it parses completely; otherwise they stay untouched.
@@ -213,6 +242,10 @@ impl ConnForm {
                 Ok(p) => {
                     let set = |i: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| i.update(cx, |s, cx| s.set_value(v, window, cx));
                     set(&self.host, p.host, window, cx);
+                    self.socket = !p.socket.is_empty();
+                    if self.socket {
+                        set(&self.socket_path, p.socket, window, cx);
+                    }
                     set(&self.port, p.port.map(|p| p.to_string()).unwrap_or_default(), window, cx);
                     set(&self.database, p.database, window, cx);
                     set(&self.user, p.user, window, cx);
@@ -239,6 +272,8 @@ impl ConnForm {
             driver: self.driver,
             url: v(&self.url),
             host: v(&self.host),
+            socket: self.socket,
+            socket_path: v(&self.socket_path),
             port: v(&self.port),
             database: v(&self.database),
             user: v(&self.user),
@@ -516,7 +551,24 @@ impl Render for ConnForm {
             .child(Self::field("Driver", muted, driver))
             .child(field("URL", &self.url))
             .children(self.url_note.clone().map(|n| div().text_xs().text_color(muted).child(n)))
-            .child(h_flex().gap_2().child(div().flex_1().child(field("Host", &self.host))).child(div().w(px(100.)).child(field("Port", &self.port))))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(if self.socket { field("Socket", &self.socket_path) } else { field("Host", &self.host) }))
+                    // A MySQL socket is a file: no port.
+                    .when(!(self.socket && self.driver == Some(Driver::MySql)), |r| r.child(div().w(px(100.)).child(field("Port", &self.port)))),
+            )
+            .child(
+                Checkbox::new("conn-socket")
+                    .label("Unix socket")
+                    .checked(self.socket)
+                    .tooltip("Connect through the server's local Unix socket instead of TCP. Leave the path empty to use the detected one, or type your own.")
+                    .on_click(cx.listener(|this, v: &bool, window, cx| {
+                        this.socket = *v;
+                        this.socket_hint(window, cx);
+                        cx.notify();
+                    })),
+            )
             .child(h_flex().gap_2().items_start().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(div().flex_1().min_w_0().child(field("User", &self.user))))
             .children(db_note)
             .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))

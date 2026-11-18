@@ -8,6 +8,8 @@ pub struct ParsedUrl {
     pub user: String,
     pub password: String,
     pub host: String,
+    /// A Unix socket path (`?host=/dir`, `?socket=/file`); `host` is then empty.
+    pub socket: String,
     /// `None`: the driver's default.
     pub port: Option<u16>,
     pub database: String,
@@ -72,7 +74,7 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
         let v = decode(v);
         // A Unix socket: libpq's `?host=/dir`, MySQL's `?socket=/file`.
         if matches!((driver, k), (Driver::Postgres, "host") | (Driver::MySql, "socket")) && v.starts_with('/') {
-            p.host = v;
+            p.socket = v;
             continue;
         }
         let mode = match (driver, k) {
@@ -99,7 +101,7 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
             None => p.ignored.push(k.into()),
         }
     }
-    if p.host.is_empty() {
+    if p.host.is_empty() && p.socket.is_empty() {
         return Err("Missing host".into());
     }
     Ok(p)
@@ -114,7 +116,7 @@ mod tests {
 
     fn ok(url: &str) -> Cols<String> {
         let p = parse_url(url).unwrap();
-        (p.driver, p.user, p.password, p.host, p.port, p.database, p.ssl_mode, p.ignored)
+        (p.driver, p.user, p.password, if p.socket.is_empty() { p.host } else { p.socket }, p.port, p.database, p.ssl_mode, p.ignored)
     }
 
     fn own(r: Row) -> Cols<String> {
