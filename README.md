@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="crates/app/assets/icon.svg" width="96" alt="Siesta icon">
-
-# Siesta
+# <img src="crates/app/assets/icon.svg" width="48" align="center" alt="Siesta icon"> Siesta
 
 **A fast, text-first SQL client for Postgres and MySQL / MariaDB. Queries are plain `.sql` files.**
 
