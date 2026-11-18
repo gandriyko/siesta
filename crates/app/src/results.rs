@@ -405,22 +405,9 @@ impl TableDelegate for Grid {
                 .rounded_sm()
                 .bg(cx.theme().primary.opacity(0.14))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .capture_key_down({
-                    let input = input.clone();
-                    move |ev: &KeyDownEvent, window, cx| {
-                        let m = &ev.keystroke.modifiers;
-                        let plain = !(m.shift || m.alt || m.control || m.platform);
-                        let s = input.read(cx);
-                        let (selected, len) = (s.selected_range(), s.value().len());
-                        let Some(action) = crate::edit::move_key(&ev.keystroke.key, m.shift, plain, selected, len) else { return };
-                        cx.stop_propagation();
-                        view.update(cx, |this, cx| match action {
-                            Some(dir) => this.move_inline(dir, window, cx),
-                            None => this.cancel_inline(window, cx),
-                        })
-                        .ok();
-                    }
-                })
+                // Only Enter (keep) and Esc (cancel) leave the field; no other key reaches another
+                // cell. Enter arrives as the table's `OpenCell` (see `open_selected`).
+                .map(|d| edit_keys(d, view))
                 // Bare text: the selected cell's own frame is the only border.
                 .child(Input::new(input).appearance(false).xsmall().p_0())
                 .into_any_element();
@@ -481,6 +468,43 @@ impl TableDelegate for Grid {
     }
 }
 
+/// The keys of the in-place field. A key may arrive as a binding of the field (Input context), of
+/// the table (`SelectUp`, `SelectNextColumn`… run when the field lets an arrow through), or, when
+/// nothing binds it, as a plain key (Tab would type a tab). The wrapper sits between the table and
+/// the field, so its capture listeners see all of them first: the table's navigation is swallowed,
+/// ↑ / ↓ / Tab do nothing, Esc cancels. ← / → stay the field's (the caret).
+fn edit_keys(d: Stateful<Div>, view: WeakEntity<Siesta>) -> Stateful<Div> {
+    use gpui_base::actions as a;
+    use gpui_component::input as i;
+    fn swallow<A: Action>(d: Stateful<Div>) -> Stateful<Div> {
+        d.capture_action(|_: &A, _, cx| cx.stop_propagation())
+    }
+    let commit = {
+        let view = view.clone();
+        move |_: &i::Enter, window: &mut Window, cx: &mut App| {
+            cx.stop_propagation();
+            view.update(cx, |this, cx| this.commit_inline(window, cx)).ok();
+        }
+    };
+    let d = d.capture_action(commit);
+    let cancel = move |window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        view.update(cx, |this, cx| this.cancel_inline(window, cx)).ok();
+    };
+    let d = [swallow::<a::SelectUp>, swallow::<a::SelectDown>, swallow::<a::SelectPrevColumn>, swallow::<a::SelectNextColumn>, swallow::<a::SelectFirst>, swallow::<a::SelectLast>, swallow::<a::SelectPageUp>, swallow::<a::SelectPageDown>]
+        .into_iter()
+        .chain([swallow::<i::MoveUp>, swallow::<i::MoveDown>, swallow::<i::IndentInline>, swallow::<i::OutdentInline>])
+        .fold(d, |d, f| f(d));
+    let (c1, c2) = (cancel.clone(), cancel.clone());
+    d.capture_action(move |_: &i::Escape, window, cx| c1(window, cx))
+        .capture_action(move |_: &a::Cancel, window, cx| c2(window, cx))
+        .capture_key_down(move |ev: &KeyDownEvent, window, cx| match ev.keystroke.key.as_str() {
+            "tab" | "up" | "down" => cx.stop_propagation(),
+            "escape" => cancel(window, cx),
+            _ => {}
+        })
+}
+
 /// Everything the panel keeps besides the results themselves.
 pub struct Ui {
     pub table: Entity<TableState<Grid>>,
@@ -514,8 +538,11 @@ impl Ui {
         let subs = vec![cx.subscribe_in(&table, window, |this, _, ev: &TableEvent, window, cx| {
             // A single click only selects (it must be possible to select and copy);
             // a double click, Enter or Space opens the value.
-            if let TableEvent::DoubleClickedCell(r, c) = ev {
-                this.open_cell(*r, *c, window, cx);
+            match ev {
+                TableEvent::DoubleClickedCell(r, c) => this.open_cell(*r, *c, window, cx),
+                // The selection left the cell being edited (any way at all): editing ends there.
+                TableEvent::SelectCell(r, c) if this.ui.edit.as_ref().and_then(|e| e.inline.as_ref()).is_some_and(|i| (i.row, i.col) != (*r, *c)) => this.commit_inline(window, cx),
+                _ => {}
             }
         })];
         Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, edit: None, _subs: subs }
@@ -830,6 +857,10 @@ impl Siesta {
 
     /// Enter / Space: the selected cell in the popup.
     pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter while a cell is edited in place: keep the value and close the field (Enter toggles).
+        if self.ui.edit.as_ref().is_some_and(|e| e.inline.is_some()) {
+            return self.commit_inline(window, cx);
+        }
         if let Some((r, c)) = self.selected(cx) {
             self.open_cell(r, c, window, cx);
         }

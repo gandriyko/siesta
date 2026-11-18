@@ -1796,6 +1796,74 @@ mod tests {
         assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "plain");
     }
 
+    /// In-place editing with real keys: ↑ / Tab / Enter end editing (no caret left in the old
+    /// cell) and move only the table's selection; Esc drops the edit.
+    #[gpui::test]
+    fn in_place_editing_keys_end_editing(cx: &mut TestAppContext) {
+        use crate::edit::{Edit, NewValue, State, Target};
+        use db_exec::Value::{Int, Text};
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("collections/a.sql");
+        let key = (a.clone(), "SELECT 1".to_string());
+        let (app, mut cx) = open_app(cx, ws.path(), base.path(), Some(a.clone()));
+        let rows = (1..=3).map(|i| vec![Int(i), Text(format!("n{i}"))]).collect();
+        cx.update(|_, cx| app.update(cx, |this, _| this.store.put(key.clone(), done("SELECT 1", &[("id", "int4"), ("name", "text")], rows, false))));
+        assert_eq!(shown_at(&app, &mut cx, 0).as_deref(), Some("SELECT 1"));
+        let table = db_exec::SourceTable { schema: "public".into(), name: "t".into(), primary_key: vec!["id".into()] };
+        let target = Target { tables: vec![table], cols: vec![Some((0, "id".into())), Some((0, "name".into()))], keys: vec![vec![0]], note: None };
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                let id = this.store.entries[&key].id;
+                this.ui.edit = Some(Edit { key: key.clone(), state: State::Ready(std::sync::Arc::new(target)), id, changes: Default::default(), error: None, saving: false, inline: None });
+            })
+        });
+        let edit = |cx: &mut VisualTestContext, r: usize, c: usize| {
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.ui.table.update(cx, |t, cx| t.set_selected_cell(r, c, cx));
+                    this.edit_cell(r, c, window, cx);
+                })
+            });
+            cx.run_until_parked();
+            assert!(cx.update(|_, cx| app.read(cx).ui.edit.as_ref().unwrap().inline.is_some()), "field open at {r},{c}");
+        };
+        let state = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let this = app.read(cx);
+                let e = this.ui.edit.as_ref().unwrap();
+                (e.inline.is_some(), this.ui.table.read(cx).selected_cell(), e.changes.clone())
+            })
+        };
+        // ↑ / ↓ / Tab do nothing while the field is open: no other cell is reached by keys.
+        edit(&mut cx, 1, 1);
+        cx.simulate_keystrokes("up down tab shift-tab");
+        assert!(state(&mut cx).0);
+        assert_eq!(state(&mut cx).1, Some((1, 1)));
+        // Enter keeps the typed value and closes the field on the same cell.
+        cx.simulate_input("X");
+        // Tab typed nothing: the field has just what was typed.
+        let typed = cx.update(|_, cx| app.read(cx).ui.edit.as_ref().unwrap().inline.as_ref().unwrap().input.read(cx).value().to_string());
+        assert_eq!(typed, "X");
+        cx.simulate_keystrokes("enter");
+        let (open, selected, changes) = state(&mut cx);
+        assert_eq!((open, selected), (false, Some((1, 1))));
+        assert_eq!(changes.get(&(1, 1)), Some(&Some(NewValue::Text("X".into()))));
+        // Esc drops what was typed.
+        edit(&mut cx, 2, 1);
+        cx.simulate_input("Y");
+        cx.simulate_keystrokes("escape");
+        let (open, _, changes) = state(&mut cx);
+        assert!(!open && !changes.contains_key(&(2, 1)));
+        // Selecting another cell (a click) keeps the value and closes the field.
+        edit(&mut cx, 0, 1);
+        cx.simulate_input("Z");
+        cx.update(|_, cx| app.update(cx, |this, cx| this.ui.table.update(cx, |t, cx| t.set_selected_cell(2, 0, cx))));
+        cx.run_until_parked();
+        let (open, _, changes) = state(&mut cx);
+        assert!(!open, "the field closes when another cell is selected");
+        assert_eq!(changes.get(&(0, 1)), Some(&Some(NewValue::Text("Z".into()))));
+    }
+
     #[gpui::test]
     fn sort_clicks_and_filters_become_the_page(cx: &mut TestAppContext) {
         use db_exec::Value::Int;
