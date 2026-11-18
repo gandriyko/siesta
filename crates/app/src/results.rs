@@ -400,6 +400,10 @@ impl TableDelegate for Grid {
             return div()
                 .id(("cell-edit", col))
                 .w_full()
+                // A light tint marks the cell being edited (pending values are tinted with `warning`).
+                .px_1()
+                .rounded_sm()
+                .bg(cx.theme().primary.opacity(0.14))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .capture_key_down(move |ev: &KeyDownEvent, window, cx| {
                     if ev.keystroke.key == "escape" {
