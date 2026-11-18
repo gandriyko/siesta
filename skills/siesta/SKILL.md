@@ -202,7 +202,7 @@ on stderr, so JSON on stdout stays clean.
 
 - `~/.config/siesta/` — only what the user writes: `settings.json`, `keymap.json`, `connections/`,
   `collections/` (the user's `.sql` files, with subfolders). Fine for a dotfiles repo. Edit connection files here (never a password).
-- `~/.siesta/` — only what Siesta writes: `state.json`, `files.json`, `history/`, `cache/`, the password `key`.
+- `~/.siesta/` — only what Siesta writes: `state.json`, `files.json`, `history/`, `cache/`, the password `key`. Every statement you run (CLI or MCP) is recorded in `history/` with source `cli` / `mcp`, visible to the user in the app's History (⌘Y).
   Never read the key, never edit these files, and keep this folder out of dotfiles.
 - `SIESTA_CONFIG_DIR` and `SIESTA_DATA_DIR` replace them.
 

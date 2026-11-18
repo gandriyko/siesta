@@ -12,9 +12,9 @@ pub struct Entry {
     pub id: String,
     /// RFC 3339, UTC.
     pub time: String,
-    /// `gui` / `cli`.
+    /// `gui` / `cli` / `mcp` (a run by an agent through `siesta mcp`).
     pub source: String,
-    /// The file it ran in, absolute.
+    /// The file it ran in, absolute; empty for SQL from `siesta exec` / MCP `sql`.
     pub file: String,
     /// 1-based line of the statement when it ran.
     pub line: usize,

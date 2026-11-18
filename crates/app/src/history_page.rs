@@ -81,6 +81,17 @@ impl Siesta {
         }
     }
 
+    /// Where an entry ran: `file:line`; a run from the CLI or an agent (MCP) is marked, and one
+    /// without a file (SQL given directly) is only the mark.
+    fn history_origin(&self, e: &Entry) -> String {
+        let at = (!e.file.is_empty()).then(|| format!("{}:{}", self.short_path(Path::new(&e.file)), e.line));
+        match (e.source.as_str(), at) {
+            ("cli" | "mcp", Some(at)) => format!("{} · {at}", e.source),
+            ("cli" | "mcp", None) => e.source.clone(),
+            (_, at) => at.unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn reload_history(&mut self) {
         self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
     }
@@ -92,7 +103,7 @@ impl Siesta {
         (0..self.history.len())
             .filter(|&i| {
                 let e = &self.history[i];
-                let hay = format!("{} {} {} {} {}", e.sql, e.connection, e.database.as_deref().unwrap_or(""), e.file, e.outcome()).to_lowercase();
+                let hay = format!("{} {} {} {} {} {}", e.sql, e.connection, e.database.as_deref().unwrap_or(""), e.file, e.source, e.outcome()).to_lowercase();
                 words.iter().all(|w| hay.contains(w))
             })
             .collect()
@@ -106,7 +117,7 @@ impl Siesta {
         let path = entry_path(&e);
         if !(path.is_file() && self.open(path, None, window, cx).is_some()) {
             let now = self.doc().filter(|d| d.sql).map(|d| d.connection().map(str::to_string));
-            if let Some(now) = now.filter(|n| n.as_deref() != Some(e.connection.as_str())) {
+            if let Some(now) = now.filter(|n| !e.file.is_empty() && n.as_deref() != Some(e.connection.as_str())) {
                 window.push_notification(format!("{} is gone; inserted here. Recorded on `{}`, this file uses `{}`", e.file, e.connection, now.as_deref().unwrap_or("no connection")), cx);
             }
         }
@@ -243,7 +254,7 @@ impl Siesta {
             .child(div().w(px(TIME_W)).flex_none().text_xs().font_family(mono.clone()).text_color(muted).child(e.time_label()))
             .child(div().w(px(CONN_W)).flex_none().truncate().text_xs().child(conn))
             .child(div().flex_1().min_w_0().truncate().text_sm().font_family(mono).child(sql))
-            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(format!("{}:{}", self.short_path(Path::new(&e.file)), e.line)))
+            .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(self.history_origin(e)))
             .child(div().w(px(OUTCOME_W)).flex_none().truncate().text_xs().text_color(outcome_color).child(e.outcome()))
             .child(div().w(px(MS_W)).flex_none().text_right().text_xs().text_color(slow).child(e.duration_ms.to_string()))
             .child(div().w(px(ACTIONS_W)).flex_none().flex().child(insert).child(run))

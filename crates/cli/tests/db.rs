@@ -189,6 +189,15 @@ fn scenario(f: &Fixture, sql_error_state: &str) {
     let (code, v) = f.json(&["schema", "-c", "c", "siesta_cli_zzz", "--output", "json"]);
     assert_eq!((code, v["error"]["code"].as_str()), (3, Some("table_not_found")));
 
+    // History: what ran is recorded as `cli` (a file's statements with its path, `exec` without
+    // one); what was refused before running is not.
+    let store = db_exec::history::Store::open(&f.dir.path().join("data")).unwrap();
+    let entries = store.list();
+    assert!(!entries.is_empty() && entries.iter().all(|e| e.source == "cli"), "{entries:?}");
+    assert!(entries.iter().any(|e| e.file == file && e.line == 7));
+    assert!(entries.iter().any(|e| e.file.is_empty() && e.connection == "c"));
+    assert!(entries.iter().all(|e| e.connection != "nope"));
+
     f.json(&with(&["exec", "-c", "c", "DROP TABLE siesta_cli_t"]));
     let _ = f.driver;
 }

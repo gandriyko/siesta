@@ -262,6 +262,11 @@ fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes:
     Ok(())
 }
 
+/// Whether this process was started by `siesta mcp` (an agent, not a person at a shell).
+fn agent_on_mcp() -> bool {
+    std::env::var_os(crate::mcp::AGENT_ENV).is_some()
+}
+
 /// Effective row limit: the flag (default 100), never above `results.max_rows`.
 pub(crate) fn row_limit(flag: Option<usize>, hard: usize) -> usize {
     let hard = hard.max(1);
@@ -293,7 +298,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     }
     // An agent (MCP) on prod: reads and `UPDATE … WHERE` only, checked up front like `read_only`;
     // those then need no prod confirmation (nobody could give it), `-- @confirm` still refuses.
-    let agent_on_prod = conn.prod && std::env::var_os(crate::mcp::AGENT_ENV).is_some();
+    let agent_on_prod = conn.prod && agent_on_mcp();
     if agent_on_prod {
         for j in &jobs {
             if let Some(m) = sql_split::prod_agent_violation(&j.text, dialect_of(conn.driver)) {
@@ -313,11 +318,36 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     let page = Page { size: cap as u64, ..Page::default() };
     let file_name = file.map(|p| p.display().to_string());
     let (mut exit, mut items) = (0, Vec::new());
+    // Every statement that ran is recorded like a GUI run, marked `cli` or `mcp`; SQL from `exec`
+    // has no file. A history that cannot be written only warns.
+    let source = if agent_on_mcp() { "mcp" } else { "cli" };
+    let history_file = file.map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())).unwrap_or_default();
+    let history = siesta_settings::data_dir().and_then(|b| db_exec::history::Store::open(&b).inspect_err(|e| eprintln!("{} history disabled: {e}", paint("warning:", YELLOW, true))).ok()).map(|mut h| {
+        h.total = env.settings.history.total;
+        h
+    });
     for (n, j) in jobs.iter().enumerate() {
         let result = rt.block_on(session.run(&j.text, j.kind, &page));
         let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, database: conn.database.as_deref(), result: &result, max_rows: cap };
         if let Err(e) = &result {
             exit = first_exit(exit, e);
+        }
+        if let Some(h) = &history {
+            let entry = db_exec::history::Entry {
+                source: source.into(),
+                line: j.line,
+                connection: conn.name.clone(),
+                database: conn.database.clone(),
+                sql: j.text.clone(),
+                duration_ms: result.as_ref().map_or(0, |o| o.duration.as_millis() as u64),
+                rows: result.as_ref().ok().filter(|o| o.rows_affected.is_none()).map(|o| o.rows.len() as u64),
+                affected: result.as_ref().ok().and_then(|o| o.rows_affected),
+                error: result.as_ref().err().map(|e| e.to_string()),
+                ..Default::default()
+            };
+            if let Err(e) = h.record(&history_file, entry) {
+                eprintln!("{} history: {e}", paint("warning:", YELLOW, true));
+            }
         }
         match format {
             Format::Table | Format::Csv => {
