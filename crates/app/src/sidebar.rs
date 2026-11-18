@@ -137,6 +137,12 @@ fn moved(p: &Path, from: &Path, to: &Path) -> PathBuf {
     }
 }
 
+/// `name` as a `.sql` file name: the extension is appended unless it is already there (a dot
+/// inside the name, as in `report.2024`, is part of the name, not an extension).
+fn sql_name(name: &str) -> String {
+    if siesta_workspace::is_sql(Path::new(name)) { name.to_string() } else { format!("{name}.sql") }
+}
+
 /// Where `from` goes when renamed to `input`: the same folder, the name trimmed; a file gets
 /// `.sql` when it lacks it (as New File does). Names with a path separator or empty ones are refused.
 fn renamed_path(from: &Path, input: &str, is_dir: bool) -> Result<PathBuf, String> {
@@ -144,11 +150,7 @@ fn renamed_path(from: &Path, input: &str, is_dir: bool) -> Result<PathBuf, Strin
     if name.is_empty() || name.contains(['/', '\\']) {
         return Err(format!("Invalid name: {name}"));
     }
-    let mut to = from.with_file_name(name);
-    if !is_dir && !siesta_workspace::is_sql(&to) {
-        to.set_extension("sql");
-    }
-    Ok(to)
+    Ok(from.with_file_name(if is_dir { name.to_string() } else { sql_name(name) }))
 }
 
 /// `to` is `from` under a name that differs in case only (the same file on a case-insensitive
@@ -293,7 +295,7 @@ impl Siesta {
     /// A new `.sql` file in `dir`, named in an in-app dialog.
     pub(crate) fn new_file(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let dir = dir.to_path_buf();
-        self.ask_name("New File", "query.sql", "Create", window, cx, move |this, name, window, cx| {
+        self.ask_name("New File", "query", "Create", window, cx, move |this, name, window, cx| {
             this.create_file(&dir, name, window, cx);
         });
     }
@@ -301,10 +303,7 @@ impl Siesta {
     /// `name` (`.sql` added when missing) in `dir`, made empty unless it exists (never truncated),
     /// then opened; `None` when it can't be written.
     pub(crate) fn create_file(&mut self, dir: &Path, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
-        let mut path = dir.join(name);
-        if !siesta_workspace::is_sql(&path) {
-            path.set_extension("sql");
-        }
+        let path = dir.join(sql_name(name));
         if !path.exists()
             && let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, ""))
         {
@@ -382,24 +381,17 @@ impl Siesta {
                     .child(Button::new("name-ok").label(ok).primary().on_click(move |_, window, cx| apply(window, cx))),
             )
         });
-        // A file's name is selected without its extension (`.sql` stays unless the user wants it gone).
-        let stem = default.strip_suffix(".sql").filter(|s| !s.is_empty()).map(|s| s.chars().count());
         input.update(cx, |s, cx| {
             s.focus(window, cx);
-            match stem {
-                Some(n) => {
-                    s.set_cursor_position(gpui_component::input::Position::new(0, n as u32), window, cx);
-                    window.defer(cx, |window, cx| window.dispatch_action(gpui_component::input::SelectToStartOfLine.boxed_clone(), cx));
-                }
-                None => s.select_all(window, cx),
-            }
+            s.select_all(window, cx);
         });
     }
 
     /// The pencil on a row and File → Rename File…: asks for the new name of a file or folder.
     pub(crate) fn rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let (title, ok) = if path.is_dir() { ("Rename Folder", "Rename") } else { ("Rename File", "Rename") };
-        let name = name_of(&path);
+        // A file is shown without `.sql`: it is always added back.
+        let name = if path.is_dir() { name_of(&path) } else { path.file_stem().map_or_else(|| name_of(&path), |n| n.to_string_lossy().into_owned()) };
         self.ask_name(title, &name, ok, window, cx, move |this, name, window, cx| {
             this.rename_path(&path, name, window, cx);
         });
@@ -980,6 +972,7 @@ mod tests {
         let from = Path::new("/w/q/a.sql");
         assert_eq!(renamed_path(from, " b.sql ", false), Ok(PathBuf::from("/w/q/b.sql")));
         assert_eq!(renamed_path(from, "b", false), Ok(PathBuf::from("/w/q/b.sql")));
+        assert_eq!(renamed_path(from, "report.2024", false), Ok(PathBuf::from("/w/q/report.2024.sql")));
         assert_eq!(renamed_path(from, "B.SQL", false), Ok(PathBuf::from("/w/q/B.SQL")));
         assert_eq!(renamed_path(from, "a.sql", false), Ok(from.to_path_buf()));
         assert_eq!(renamed_path(Path::new("/w/q"), "r.v2", true), Ok(PathBuf::from("/w/r.v2")));
