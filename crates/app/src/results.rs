@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::Instant,
 };
@@ -255,6 +256,19 @@ pub struct Grid {
     pub changes: crate::edit::Changes,
     /// The cell edited in place: (display row, column, its field).
     pub editing: Option<(usize, usize, Entity<InputState>)>,
+    /// What a cell draws, per (row in `done`, column), made on its first render: the table renders
+    /// all visible cells on every frame (a caret blink in the edited cell is one), so formatting
+    /// and JSON parsing happen once per result, not per frame.
+    cells: HashMap<(usize, usize), Rc<Cell>>,
+}
+
+/// A cell ready to draw.
+struct Cell {
+    text: SharedString,
+    /// The document of a JSON cell (its hover tip).
+    json: Option<Arc<serde_json::Value>>,
+    null: bool,
+    bytes: bool,
 }
 
 impl Grid {
@@ -278,7 +292,24 @@ impl Grid {
             editable: vec![],
             changes: Default::default(),
             editing: None,
+            cells: HashMap::new(),
         }
+    }
+
+    /// The drawable cell at (row in `done`, column), made once.
+    fn cell(&mut self, ri: usize, col: usize) -> Option<Rc<Cell>> {
+        if let Some(c) = self.cells.get(&(ri, col)) {
+            return Some(c.clone());
+        }
+        let v = self.outcome()?.rows.get(ri)?.get(col)?;
+        let c = Rc::new(Cell {
+            text: cell_display(v, &self.null_text, self.preview_bytes).into(),
+            json: cell_json(v).map(|j| Arc::new(j.into_owned())),
+            null: matches!(v, Value::Null),
+            bytes: matches!(v, Value::Bytes(_)),
+        });
+        self.cells.insert((ri, col), c.clone());
+        Some(c)
     }
 
     /// Whether the rows are tall (the JSON preview is on and there is JSON to show).
@@ -329,6 +360,7 @@ impl Grid {
         self.line_h = mono * 1.4;
         self.row_h = self.line_h * json_lines as f32 + px(10.);
         self.previews = previews;
+        self.cells.clear();
     }
 }
 
@@ -412,7 +444,8 @@ impl TableDelegate for Grid {
                 .child(Input::new(input).appearance(false).xsmall().p_0())
                 .into_any_element();
         }
-        let Some(v) = self.value(row, col) else { return div().into_any_element() };
+        let Some(&ri) = self.order.get(row) else { return div().into_any_element() };
+        let Some(cell) = self.cell(ri, col) else { return div().into_any_element() };
         let t = cx.theme();
         // A pending edit: the new value, highlighted, until it is saved or discarded.
         if let Some(new) = self.order.get(row).and_then(|r| self.changes.get(&(*r, col))) {
@@ -429,23 +462,21 @@ impl TableDelegate for Grid {
         // JSON cells: hovering shows the whole document, formatted; the tip stays while the
         // pointer is on it, so it can be scrolled.
         let json_tip = |el: Div| -> AnyElement {
-            let Some(j) = cell_json(v) else { return el.into_any_element() };
-            let j = j.into_owned();
+            let Some(j) = cell.json.clone() else { return el.into_any_element() };
             el.id(("json-cell", col)).hoverable_tooltip(move |_, cx| cx.new(|_| JsonTip::new(&j)).into()).into_any_element()
         };
-        if let Some(lines) = self.order.get(row).and_then(|&r| self.previews.get(&(r, col))) {
+        if let Some(lines) = self.previews.get(&(ri, col)) {
             let (mono, size, line_h) = (t.mono_font_family.clone(), t.mono_font_size, self.line_h);
             return json_tip(div().w_full().font_family(mono).text_size(size).children(lines.iter().map(|l| div().w_full().h(line_h).truncate().child(l.clone()))));
         }
-        let text = cell_display(v, &self.null_text, self.preview_bytes);
         json_tip(
             div()
                 .w_full()
                 .truncate()
-                .when(matches!(v, Value::Null), |d| d.italic().text_color(t.muted_foreground))
-                .when(matches!(v, Value::Bytes(_)), |d| d.text_color(t.muted_foreground))
+                .when(cell.null, |d| d.italic().text_color(t.muted_foreground))
+                .when(cell.bytes, |d| d.text_color(t.muted_foreground))
                 .when(self.numeric.get(col) == Some(&true), |d| d.text_right())
-                .child(text),
+                .child(cell.text.clone()),
         )
     }
 
