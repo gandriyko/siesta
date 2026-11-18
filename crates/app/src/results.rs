@@ -253,6 +253,8 @@ pub struct Grid {
     /// (row in `done`, column).
     pub editable: Vec<bool>,
     pub changes: crate::edit::Changes,
+    /// The cell edited in place: (display row, column, its field).
+    pub editing: Option<(usize, usize, Entity<InputState>)>,
 }
 
 impl Grid {
@@ -275,6 +277,7 @@ impl Grid {
             previews: HashMap::new(),
             editable: vec![],
             changes: Default::default(),
+            editing: None,
         }
     }
 
@@ -390,6 +393,23 @@ impl TableDelegate for Grid {
     }
 
     fn render_td(&mut self, row: usize, col: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        // Edited in place: the field, which keeps its clicks (they must not reselect the table)
+        // and turns Esc into cancel.
+        if let Some((_, _, input)) = self.editing.as_ref().filter(|(r, c, _)| (*r, *c) == (row, col)) {
+            let view = self.view.clone();
+            return div()
+                .id(("cell-edit", col))
+                .w_full()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .capture_key_down(move |ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        view.update(cx, |this, cx| this.cancel_inline(window, cx)).ok();
+                    }
+                })
+                .child(Input::new(input).xsmall())
+                .into_any_element();
+        }
         let Some(v) = self.value(row, col) else { return div().into_any_element() };
         let t = cx.theme();
         // A pending edit: the new value, highlighted, until it is saved or discarded.
@@ -434,7 +454,11 @@ impl TableDelegate for Grid {
                 view.update(cx, |this, cx| what(this, row, window, cx)).ok();
             })
         };
-        menu.item(item("Copy row", Siesta::copy_row_tsv)).item(item("Copy as JSON", Siesta::copy_row_json)).item(item("Copy as INSERT", Siesta::copy_row_insert))
+        let menu = menu.item(item("Copy row", Siesta::copy_row_tsv)).item(item("Copy as JSON", Siesta::copy_row_json)).item(item("Copy as INSERT", Siesta::copy_row_insert));
+        if self.editable.is_empty() {
+            return menu;
+        }
+        menu.separator().item(item("Set cell to NULL", |this, row, window, cx| this.set_selected(true, row, window, cx))).item(item("Revert cell", |this, row, window, cx| this.set_selected(false, row, window, cx)))
     }
 
     fn cell_text(&self, row: usize, col: usize, _: &App) -> String {

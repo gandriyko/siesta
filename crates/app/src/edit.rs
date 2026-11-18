@@ -112,7 +112,7 @@ pub fn update_sql(d: Dialect, t: &Target, rows: &[Vec<Value>], changes: &Changes
     let mut out = vec![];
     for ((row, ti), sets) in groups {
         let r = rows.get(row).ok_or("the result changed: run it again")?;
-        let set: Vec<String> = sets
+        let assignments: Vec<String> = sets
             .iter()
             .map(|c| {
                 let name = &t.cols[*c].as_ref().expect("editable").1;
@@ -128,18 +128,31 @@ pub fn update_sql(d: Dialect, t: &Target, rows: &[Vec<Value>], changes: &Changes
             }
             cond.push(format!("{} = {}", quote_ident(d, name), literal(&r[k], d)));
         }
-        out.push(format!("UPDATE {} SET {} WHERE {};", qualified(d, table), set.join(", "), cond.join(" AND ")));
+        out.push(format!("UPDATE {}\nSET {}\nWHERE {};", qualified(d, table), assignments.join(",\n    "), cond.join("\n  AND ")));
     }
     Ok(out)
 }
 
-/// The text a cell is edited as: JSON pretty-printed, NULL as `None`.
+/// The text a cell is edited as (in the cell, so JSON is compact), NULL as `None`.
 pub fn edit_text(v: &Value) -> Option<String> {
     match v {
         Value::Null => None,
-        Value::Json(j) => Some(serde_json::to_string_pretty(j).unwrap_or_default()),
         other => Some(other.display()),
     }
+}
+
+/// The cell being edited in place.
+pub struct Inline {
+    /// Display row (the table's) and row of the result.
+    pub row: usize,
+    pub ri: usize,
+    pub col: usize,
+    pub input: Entity<InputState>,
+    /// What the cell held before this edit (a pending change, or the result's value).
+    current: Option<String>,
+    /// The result's own value: editing back to it removes the change.
+    original: Option<String>,
+    _subs: Vec<Subscription>,
 }
 
 pub enum State {
@@ -160,6 +173,7 @@ pub struct Edit {
     /// The last save failed: why.
     pub error: Option<String>,
     pub saving: bool,
+    pub inline: Option<Inline>,
 }
 
 impl Edit {
@@ -273,22 +287,24 @@ impl Siesta {
     pub(crate) fn sync_edit(&mut self, cx: &mut Context<Self>) {
         let key = self.shown_key(cx);
         let id = key.as_ref().and_then(|k| self.store.entries.get(k)).map(|e| e.id);
-        let (mut editable, mut changes) = (vec![], Changes::new());
+        let (mut editable, mut changes, mut editing) = (vec![], Changes::new(), None);
         if let Some(e) = self.ui.edit.as_mut().filter(|e| Some(&e.key) == key.as_ref()) {
             if Some(e.id) != id {
                 e.id = id.unwrap_or(0);
                 e.changes.clear();
                 e.error = None;
+                e.inline = None;
             }
             if let State::Ready(t) = &e.state {
                 editable = t.cols.iter().map(Option::is_some).collect();
             }
             changes = e.changes.clone();
+            editing = e.inline.as_ref().map(|i| (i.row, i.col, i.input.clone()));
         }
         self.ui.table.update(cx, |t, cx| {
             let g = t.delegate_mut();
-            if g.editable != editable || g.changes != changes {
-                (g.editable, g.changes) = (editable, changes);
+            if g.editable != editable || g.changes != changes || g.editing != editing {
+                (g.editable, g.changes, g.editing) = (editable, changes, editing);
                 cx.notify();
             }
         });
@@ -319,7 +335,7 @@ impl Siesta {
         let Some(e) = self.store.entries.get(&key) else { return };
         let Some(done) = e.done.clone() else { return };
         let id = e.id;
-        let mut edit = Edit { key: key.clone(), state: State::Checking, id, changes: Changes::new(), error: None, saving: false };
+        let mut edit = Edit { key: key.clone(), state: State::Checking, id, changes: Changes::new(), error: None, saving: false, inline: None };
         let conn = self.docs.iter().find(|d| *d.path == key.0).and_then(|d| d.conns.connections.get(&done.conn).map(|c| c.with_database(done.database.as_deref())));
         let columns = done.outcome().map(|o| o.columns.clone()).unwrap_or_default();
         edit.state = match conn {
@@ -349,20 +365,81 @@ impl Siesta {
         cx.notify();
     }
 
-    /// Double-click / Enter on a cell in edit mode: the value dialog of an editable cell.
+    /// Double-click / Enter on a cell in edit mode: an editable cell turns into a field in place
+    /// (Enter or leaving the field keeps the value, Esc cancels); multi-line text opens a dialog.
     /// `false`: not in edit mode or the column is read-only (the viewer opens instead).
     pub(crate) fn edit_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(target) = self.shown_edit(cx).and_then(|e| e.target().cloned()) else { return false };
         if target.cols.get(col).is_none_or(Option::is_none) {
             return false;
         }
+        // Another cell is open: it keeps its value first.
+        self.commit_inline(window, cx);
         let g = self.ui.table.read(cx).delegate();
         let (Some(&ri), Some(o)) = (g.order.get(row), g.outcome()) else { return true };
         let column = o.columns[col].clone();
         let original = edit_text(&o.rows[ri][col]);
-        let json = matches!(o.rows[ri][col], Value::Json(_)) || column.type_name.to_ascii_lowercase().contains("json");
         let offset = g.done.as_ref().map_or(0, |d| d.page.offset);
         let current = self.shown_edit(cx).and_then(|e| e.changes.get(&(ri, col)).cloned()).unwrap_or_else(|| original.clone());
+        if current.as_deref().is_some_and(|s| s.contains('\n')) {
+            self.edit_in_dialog(ri, col, &column, offset as usize + row + 1, current, original, window, cx);
+            return true;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current.clone().unwrap_or_default()).placeholder(if current.is_none() { "NULL" } else { "" }));
+        let subs = vec![cx.subscribe_in(&input, window, |_, _, ev: &InputEvent, window, cx| match ev {
+            // Deferred: the field's own event is still being delivered.
+            InputEvent::PressEnter { .. } | InputEvent::Blur => cx.defer_in(window, |this, window, cx| this.commit_inline(window, cx)),
+            _ => {}
+        })];
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.select_all(window, cx);
+        });
+        if let Some(e) = self.ui.edit.as_mut() {
+            e.inline = Some(Inline { row, ri, col, input, current, original, _subs: subs });
+        }
+        cx.notify();
+        true
+    }
+
+    /// Keep the in-place field's value (an untouched NULL stays NULL) and give the table its focus back.
+    pub(crate) fn commit_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.ui.edit.as_mut().and_then(|e| e.inline.take()) else { return };
+        let text = i.input.read(cx).value().to_string();
+        let value = if text.is_empty() && i.current.is_none() { None } else { Some(text) };
+        self.set_change(i.ri, i.col, value, i.original, cx);
+        self.focus_table(window, cx);
+    }
+
+    /// Esc in the field: the cell keeps what it had.
+    pub(crate) fn cancel_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ui.edit.as_mut().and_then(|e| e.inline.take()).is_some() {
+            self.focus_table(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn focus_table(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.ui.table.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+    }
+
+    /// Context menu in edit mode: the selected cell becomes NULL (`null`) or gets its value back.
+    pub(crate) fn set_selected(&mut self, null: bool, _: usize, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.ui.table.read(cx).selected_cell() else { return };
+        if self.shown_edit(cx).and_then(|e| e.target()).is_none_or(|t| t.cols.get(col).is_none_or(Option::is_none)) {
+            return;
+        }
+        let g = self.ui.table.read(cx).delegate();
+        let (Some(&ri), Some(o)) = (g.order.get(row), g.outcome()) else { return };
+        let original = edit_text(&o.rows[ri][col]);
+        let value = if null { None } else { original.clone() };
+        self.set_change(ri, col, value, original, cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn edit_in_dialog(&mut self, ri: usize, col: usize, column: &Column, n: usize, current: Option<String>, original: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let json = column.type_name.to_ascii_lowercase().contains("json");
         let this = cx.entity().downgrade();
         let apply: Apply = Rc::new(move |value, window, cx| {
             window.close_dialog(cx);
@@ -373,7 +450,7 @@ impl Siesta {
             });
         });
         let form = cx.new(|cx| CellEdit::new(current, json, apply.clone(), window, cx));
-        let title = format!("{} · {} · row {}", column.name, column.type_name, offset as usize + row + 1);
+        let title = format!("{} · {} · row {n}", column.name, column.type_name);
         let field = form.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let (apply, read) = (apply.clone(), field.clone());
@@ -390,7 +467,6 @@ impl Siesta {
             )
         });
         CellEdit::focus(&form, window, cx);
-        true
     }
 
     fn set_change(&mut self, row: usize, col: usize, value: Option<String>, original: Option<String>, cx: &mut Context<Self>) {
@@ -435,14 +511,42 @@ impl Siesta {
         } else {
             "They run in one transaction: if any of them does not change exactly one row, nothing is saved."
         };
-        let detail = format!("{}\n\n{tx}", sql.join("\n"));
-        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Update", "Cancel"], cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
-                this.update_in(cx, |this, window, cx| this.save_changes(key, done.conn.clone(), conn, sql, window, cx)).ok();
-            }
-        })
-        .detach();
+        // The statements as they will run, highlighted, in a read-only editor.
+        let viewer = cx.new(|cx| {
+            let mut s = EditorState::new(window, cx).line_number(false).soft_wrap(false).folding(false).searchable(true).replaceable(false);
+            s.set_highlighter(SharedString::from("sql"), cx);
+            s.set_value(sql.join("\n\n"), window, cx);
+            s.set_readonly(true, cx);
+            s
+        });
+        let (prod, this) = (conn.prod, cx.entity().downgrade());
+        let run = Rc::new(move |window: &mut Window, cx: &mut App| {
+            window.close_dialog(cx);
+            let (key, name, conn, sql) = (key.clone(), done.conn.clone(), conn.clone(), sql.clone());
+            this.update(cx, |this, cx| this.save_changes(key, name, conn, sql, window, cx)).ok();
+        });
+        let viewport = window.viewport_size();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let t = cx.theme();
+            let run = run.clone();
+            dialog
+                .title(message.clone())
+                .w((viewport.width * 0.8).min(px(1200.)))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().h(viewport.height * 0.55).border_1().border_color(t.border).rounded_md().child(Editor::new(&viewer).size_full().bordered(false)))
+                        .child(div().text_sm().text_color(if prod { t.danger } else { t.muted_foreground }).child(tx)),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("update-cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(Button::new("update-run").label("Update").map(|b| if prod { b.danger() } else { b.primary() }).on_click(move |_, window, cx| run(window, cx))),
+                )
+        });
     }
 
     fn save_changes(&mut self, key: Key, name: String, conn: db_conn::Connection, sql: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -598,13 +702,13 @@ mod tests {
         assert_eq!(
             sql,
             [
-                r#"UPDATE "public"."t" SET "note" = 'it''s', "j" = NULL WHERE "a" = 1 AND "b" = 2;"#,
+                "UPDATE \"public\".\"t\"\nSET \"note\" = 'it''s',\n    \"j\" = NULL\nWHERE \"a\" = 1\n  AND \"b\" = 2;",
                 // A changed key column: the row is found by its old value.
-                r#"UPDATE "public"."t" SET "a" = '30' WHERE "a" = 3 AND "b" = 4;"#,
+                "UPDATE \"public\".\"t\"\nSET \"a\" = '30'\nWHERE \"a\" = 3\n  AND \"b\" = 4;",
             ]
         );
         let sql = update_sql(Dialect::MySql, &t, &rows, &changes).unwrap();
-        assert_eq!(sql[0], r#"UPDATE `public`.`t` SET `note` = 'it''s', `j` = NULL WHERE `a` = 1 AND `b` = 2;"#);
+        assert_eq!(sql[0], "UPDATE `public`.`t`\nSET `note` = 'it''s',\n    `j` = NULL\nWHERE `a` = 1\n  AND `b` = 2;");
         // A NULL key (outer join): no row to update.
         let rows = vec![vec![Value::Null, Value::Int(2), Value::Null, Value::Null]];
         let mut changes = Changes::new();
@@ -616,6 +720,6 @@ mod tests {
     fn cells_edit_as_text() {
         assert_eq!(edit_text(&Value::Null), None);
         assert_eq!(edit_text(&Value::Int(5)).as_deref(), Some("5"));
-        assert_eq!(edit_text(&Value::Json(serde_json::json!({"a": 1}))).as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert_eq!(edit_text(&Value::Json(serde_json::json!({"a": 1}))).as_deref(), Some("{\"a\":1}"));
     }
 }

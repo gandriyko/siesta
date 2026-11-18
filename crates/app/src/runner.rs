@@ -266,8 +266,8 @@ async fn apply_job(h: Handles, conn: Connection, opts: Opts, stmts: Vec<String>,
     for sql in &stmts {
         let r = s.run(sql, Kind::Other, &none).await;
         failure = match &r {
-            Err(e) => Some(format!("{}: {e}", first_line(sql))),
-            Ok(o) if o.rows_affected != Some(1) => Some(format!("{} changed {} rows, not 1", first_line(sql), o.rows_affected.unwrap_or(0))),
+            Err(e) => Some(format!("{}: {e}", one_line(sql))),
+            Ok(o) if o.rows_affected != Some(1) => Some(format!("{} changed {} rows, not 1", one_line(sql), o.rows_affected.unwrap_or(0))),
             Ok(_) => None,
         };
         ran.push((sql.clone(), r));
@@ -311,6 +311,11 @@ fn close_slot(slot: Slot, finish: Option<&'static str>) -> tokio::task::JoinHand
 /// statement, else its first copy (the file was edited since the run).
 fn statement_start(src: &str, text: &str, range: Option<Range<usize>>) -> Option<usize> {
     range.filter(|r| src.get(r.clone()) == Some(text)).map(|r| r.start).or_else(|| src.find(text))
+}
+
+/// A formatted statement on one line, for a message.
+fn one_line(s: &str) -> String {
+    first_line(&s.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn first_line(s: &str) -> String {
