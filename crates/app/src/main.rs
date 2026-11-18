@@ -10,6 +10,7 @@ mod history_page;
 mod connections_page;
 mod dbtab;
 mod doc;
+mod edit;
 mod format;
 mod highlight;
 mod keymap;

@@ -230,6 +230,63 @@ async fn ddl_job(h: Handles, conn: Connection, opts: Opts, schema: String, table
     g.as_mut().expect("session opened").table_ddl(&schema, &table).await
 }
 
+/// Where the columns of a statement come from (editing a result), on the file's session.
+async fn source_job(h: Handles, conn: Connection, opts: Opts, text: String, token: u64) -> Result<db_exec::Source, DbError> {
+    let mut g = acquire(&h, &conn, opts, token).await?.ok_or_else(cancelled)?;
+    g.as_mut().expect("session opened").source(&text).await
+}
+
+/// What saving edited cells did.
+pub struct Applied {
+    /// Rows updated, or why nothing (or, inside the user's transaction, not everything) was saved.
+    pub result: Result<usize, String>,
+    pub in_tx: bool,
+    /// The UPDATE statements that ran, for the history.
+    pub ran: Vec<(String, Result<Outcome, DbError>)>,
+}
+
+/// The UPDATEs of edited cells: each must change exactly one row. Without an open transaction they
+/// run in their own (`BEGIN` … `COMMIT`, `ROLLBACK` on the first failure); inside the user's
+/// transaction they just run, and committing is the user's.
+async fn apply_job(h: Handles, conn: Connection, opts: Opts, stmts: Vec<String>, token: u64) -> Applied {
+    let fail = |e: DbError| Applied { result: Err(e.to_string()), in_tx: false, ran: vec![] };
+    let mut g = match acquire(&h, &conn, opts, token).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return fail(cancelled()),
+        Err(e) => return fail(e),
+    };
+    let s = g.as_mut().expect("session opened");
+    let none = Page::default();
+    let own = !s.in_transaction();
+    if own && let Err(e) = s.run("BEGIN", Kind::Other, &none).await {
+        return Applied { result: Err(e.to_string()), in_tx: s.in_transaction(), ran: vec![] };
+    }
+    let mut ran = vec![];
+    let mut failure = None;
+    for sql in &stmts {
+        let r = s.run(sql, Kind::Other, &none).await;
+        failure = match &r {
+            Err(e) => Some(format!("{}: {e}", first_line(sql))),
+            Ok(o) if o.rows_affected != Some(1) => Some(format!("{} changed {} rows, not 1", first_line(sql), o.rows_affected.unwrap_or(0))),
+            Ok(_) => None,
+        };
+        ran.push((sql.clone(), r));
+        if failure.is_some() {
+            break;
+        }
+    }
+    let result = match (failure, own) {
+        (Some(f), true) => {
+            let _ = s.run("ROLLBACK", Kind::Other, &none).await;
+            Err(format!("{f}. Rolled back: nothing was saved."))
+        }
+        (Some(f), false) => Err(format!("{f}. The transaction is still open: roll it back, or fix the rest and commit.")),
+        (None, true) => s.run("COMMIT", Kind::Other, &none).await.map(|_| stmts.len()).map_err(|e| format!("COMMIT failed: {e}")),
+        (None, false) => Ok(stmts.len()),
+    };
+    Applied { result, in_tx: s.in_transaction(), ran }
+}
+
 /// Close the session on the runtime; `finish` (`COMMIT` / `ROLLBACK`) runs first. The handle
 /// completes when the session is closed.
 fn close_slot(slot: Slot, finish: Option<&'static str>) -> tokio::task::JoinHandle<()> {
@@ -605,6 +662,25 @@ impl Siesta {
             }
         })
         .detach();
+    }
+
+    /// The session of a result's (file, connection, database), as a job runs on it.
+    fn handles_of(&mut self, path: &Path, name: &str, conn: &Connection) -> (Handles, u64) {
+        let handles = self.slots.entry((path.to_path_buf(), name.to_string(), conn.database.clone())).or_insert_with(Slot::new).handles.clone();
+        let token = handles.token();
+        (handles, token)
+    }
+
+    /// Edit mode: where the columns of `text` come from, on the file's session.
+    pub(crate) fn source_job(&mut self, path: &Path, name: &str, conn: Connection, text: String) -> tokio::task::JoinHandle<Result<db_exec::Source, DbError>> {
+        let (h, token) = self.handles_of(path, name, &conn);
+        RT.spawn(source_job(h, conn, self.opts(), text, token))
+    }
+
+    /// Edit mode: run the confirmed UPDATEs on the file's session.
+    pub(crate) fn apply_job(&mut self, path: &Path, name: &str, conn: Connection, stmts: Vec<String>) -> tokio::task::JoinHandle<Applied> {
+        let (h, token) = self.handles_of(path, name, &conn);
+        RT.spawn(apply_job(h, conn, self.opts(), stmts, token))
     }
 
     /// "Count all": `SELECT count(*)` over the statement and its filters, on demand.
@@ -1004,6 +1080,34 @@ mod tests {
         h.invalidate();
         let r = rt.block_on(batch).unwrap();
         assert_eq!(r.results.len(), 1);
+
+        // Editing a result: the table and key of the columns, then the confirmed UPDATEs in one
+        // transaction, rolled back when one of them misses its row.
+        use super::{apply_job, source_job};
+        let setup = ["DROP TABLE IF EXISTS siesta_edit_t", "CREATE TABLE siesta_edit_t (id int PRIMARY KEY, note text)", "INSERT INTO siesta_edit_t VALUES (1, 'a'), (2, 'b')"];
+        let r = rt.block_on(run_job(h.clone(), conn.clone(), setup.iter().map(|s| stmt(s, Kind::Other)).collect(), opts, h.token()));
+        assert!(r.results.iter().all(Result::is_ok), "{:?}", r.results);
+        let src = rt.block_on(source_job(h.clone(), conn.clone(), opts, "SELECT note, id FROM siesta_edit_t".into(), h.token())).unwrap();
+        let cols = [db_exec::Column { name: "note".into(), type_name: "text".into() }, db_exec::Column { name: "id".into(), type_name: "int4".into() }];
+        let target = crate::edit::plan(&cols, &src).unwrap();
+        let rows = vec![vec![db_exec::Value::Text("a".into()), db_exec::Value::Int(1)], vec![db_exec::Value::Text("b".into()), db_exec::Value::Int(2)]];
+        let mut changes = crate::edit::Changes::new();
+        changes.insert((0, 0), Some("A".into()));
+        changes.insert((1, 0), None);
+        let sql = crate::edit::update_sql(Dialect::Postgres, &target, &rows, &changes).unwrap();
+        let a = rt.block_on(apply_job(h.clone(), conn.clone(), opts, sql, h.token()));
+        assert_eq!((a.result, a.in_tx, a.ran.len()), (Ok(2), false, 2));
+        let notes = |h: &super::Handles| {
+            let r = rt.block_on(run_job(h.clone(), conn.clone(), vec![stmt("SELECT coalesce(note, 'NULL') FROM siesta_edit_t ORDER BY id", Kind::Query)], opts, h.token()));
+            r.results[0].as_ref().unwrap().rows.iter().map(|r| r[0].display()).collect::<Vec<_>>()
+        };
+        assert_eq!(notes(&h), ["A", "NULL"]);
+        // The second UPDATE finds no row: the first is rolled back too.
+        let sql = vec!["UPDATE siesta_edit_t SET note = 'x' WHERE id = 1;".to_string(), "UPDATE siesta_edit_t SET note = 'y' WHERE id = 99;".to_string()];
+        let a = rt.block_on(apply_job(h.clone(), conn.clone(), opts, sql, h.token()));
+        assert!(a.result.as_ref().unwrap_err().contains("changed 0 rows, not 1") && a.result.as_ref().unwrap_err().contains("Rolled back"), "{:?}", a.result);
+        assert!(!a.in_tx);
+        assert_eq!(notes(&h), ["A", "NULL"]);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 pub mod history;
 mod schema;
+mod source;
 mod value;
 mod wrap;
 
@@ -28,6 +29,7 @@ use sqlx::types::chrono;
 use sqlx::{AssertSqlSafe, SqlSafeStr as _, Column as _, ConnectOptions as _, Connection as _, Either, Executor, Row, Statement, TypeInfo, ValueRef};
 
 pub use schema::{ColumnInfo, Index, Schema, is_system_database, SchemaNode, Table, TableKind};
+pub use source::{Source, SourceTable};
 pub use value::Value;
 pub use wrap::{Cond, Op, Page, parse_filter, quote_ident, strip, wrap};
 

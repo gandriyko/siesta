@@ -249,6 +249,10 @@ pub struct Grid {
     row_h: Pixels,
     /// First lines of the pretty-printed JSON per (row in `done`, column); only with the preview on.
     previews: HashMap<(usize, usize), Vec<String>>,
+    /// Edit mode: which columns can be edited (empty: not editing), and the pending values per
+    /// (row in `done`, column).
+    pub editable: Vec<bool>,
+    pub changes: crate::edit::Changes,
 }
 
 impl Grid {
@@ -269,6 +273,8 @@ impl Grid {
             line_h: px(18.),
             row_h: px(30.),
             previews: HashMap::new(),
+            editable: vec![],
+            changes: Default::default(),
         }
     }
 
@@ -349,10 +355,13 @@ impl TableDelegate for Grid {
         let view = self.view.clone();
         let name = col.name.clone();
         let local = self.done.as_ref().is_some_and(|d| !d.paged());
+        // Edit mode: read-only columns are muted.
+        let read_only = !self.editable.is_empty() && self.editable.get(ix) != Some(&true);
         let head = div()
             .id(("th", ix))
             .w_full()
             .cursor_pointer()
+            .when(read_only, |d| d.text_color(t.muted_foreground))
             .on_click(move |ev: &ClickEvent, window, cx| {
                 let shift = ev.modifiers().shift;
                 view.update(cx, |this, cx| this.sort_by(name.clone(), shift, window, cx)).ok();
@@ -383,6 +392,18 @@ impl TableDelegate for Grid {
     fn render_td(&mut self, row: usize, col: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let Some(v) = self.value(row, col) else { return div().into_any_element() };
         let t = cx.theme();
+        // A pending edit: the new value, highlighted, until it is saved or discarded.
+        if let Some(new) = self.order.get(row).and_then(|r| self.changes.get(&(*r, col))) {
+            return div()
+                .w_full()
+                .truncate()
+                .px_1()
+                .rounded_sm()
+                .bg(t.warning.opacity(0.22))
+                .when(new.is_none(), |d| d.italic())
+                .child(new.clone().unwrap_or_else(|| self.null_text.clone()))
+                .into_any_element();
+        }
         // JSON cells: hovering shows the whole document, formatted; the tip stays while the
         // pointer is on it, so it can be scrolled.
         let json_tip = |el: Div| -> AnyElement {
@@ -436,6 +457,8 @@ pub struct Ui {
     pub json_on: Option<bool>,
     pub pinned: Option<Key>,
     pub popup: Option<Entity<crate::value_popup::Popup>>,
+    /// Edit mode of one result (the header's Edit button).
+    pub edit: Option<crate::edit::Edit>,
     _subs: Vec<Subscription>,
 }
 
@@ -453,10 +476,10 @@ impl Ui {
             // A single click only selects (it must be possible to select and copy);
             // a double click, Enter or Space opens the value.
             if let TableEvent::DoubleClickedCell(r, c) = ev {
-                this.open_popup(*r, Some(*c), window, cx);
+                this.open_cell(*r, *c, window, cx);
             }
         })];
-        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, _subs: subs }
+        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, edit: None, _subs: subs }
     }
 }
 
@@ -589,6 +612,7 @@ impl Siesta {
             });
         }
         self.sync_meta(key, window, cx);
+        self.sync_edit(cx);
     }
 
     fn grid_filters(&self, cx: &App) -> Vec<Entity<InputState>> {
@@ -635,6 +659,12 @@ impl Siesta {
         if e.done.is_none() || e.running.is_some() {
             return;
         }
+        // Pending edits belong to the rows on screen: another page would drop them.
+        let n = self.ui.edit.as_ref().filter(|ed| ed.key == key).map_or(0, |ed| ed.changes.len());
+        if n > 0 {
+            return window.push_notification(format!("Save or discard the {n} pending change{} first", if n == 1 { "" } else { "s" }), cx);
+        }
+        let Some(e) = self.store.entries.get_mut(&key) else { return };
         change(e);
         let local = e.done.as_ref().is_some_and(|d| !d.paged());
         if local {
@@ -762,7 +792,15 @@ impl Siesta {
     /// Enter / Space: the selected cell in the popup.
     pub(crate) fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((r, c)) = self.selected(cx) {
-            self.open_popup(r, Some(c), window, cx);
+            self.open_cell(r, c, window, cx);
+        }
+    }
+
+    /// Double-click / Enter / Space: in edit mode an editable cell opens for editing, any other
+    /// cell in the value viewer.
+    fn open_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.edit_cell(row, col, window, cx) {
+            self.open_popup(row, Some(col), window, cx);
         }
     }
 
@@ -871,6 +909,19 @@ impl Siesta {
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_filters(window, cx))),
                 )
                 .child(Button::new("copy-result").icon(IconName::Copy).ghost().xsmall().tooltip("Copy the page as TSV").on_click(cx.listener(|this, _, window, cx| this.copy_result(window, cx))));
+            if done.as_ref().is_some_and(|d| d.kind == Kind::Query) {
+                let editing = self.shown_edit(cx).is_some();
+                actions = actions.child(
+                    Button::new("edit-result")
+                        .icon(icon(include_bytes!("../assets/pencil.svg")))
+                        .label("Edit")
+                        .ghost()
+                        .xsmall()
+                        .selected(editing)
+                        .tooltip(if editing { "Leave edit mode" } else { "Edit cells: finds the table and its primary key, then UPDATEs by key after you confirm" })
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_edit(window, cx))),
+                );
+            }
         }
         if done.is_some() {
             actions = actions.child(Button::new("page-sql").label("Show page SQL").ghost().xsmall().on_click(cx.listener(|this, _, _, cx| {
@@ -939,7 +990,8 @@ impl Siesta {
             },
         };
         let footer = (tab == Tab::Result).then(|| self.footer(key.as_ref(), cx)).flatten();
-        let panel = v_flex().size_full().child(header).children(tabs.map(|t| div().flex_none().px_2().py_1().child(t))).child(body).children(footer);
+        let edit_bar = self.edit_bar(cx);
+        let panel = v_flex().size_full().child(header).children(edit_bar).children(tabs.map(|t| div().flex_none().px_2().py_1().child(t))).child(body).children(footer);
         panel.into_any_element()
     }
 

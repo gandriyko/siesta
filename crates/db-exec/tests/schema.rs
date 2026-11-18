@@ -61,6 +61,21 @@ async fn check(driver: Driver) {
     assert!(s.table_ddl(&db, "siesta_sc_nope").await.is_err());
     // Quotes in names cannot break out of the catalog query.
     assert!(s.table_ddl(&db, "x' OR '1'='1").await.is_err());
+
+    // Where result columns come from (editing): aliases resolve to the real names, expressions
+    // and views have no key, a join names both tables.
+    let src = s.source("SELECT p.note AS n, p.id, upper(p.email) AS e FROM siesta_sc_parent p;").await.expect("source");
+    assert_eq!(src.tables, [db_exec::SourceTable { schema: db.clone(), name: "siesta_sc_parent".into(), primary_key: vec!["id".into()] }]);
+    assert_eq!(src.columns, [Some((0, "note".to_string())), Some((0, "id".to_string())), None]);
+    let src = s.source("SELECT c.b, c.a, p.email FROM siesta_sc_child c JOIN siesta_sc_parent p ON p.id = c.parent_id").await.expect("join source");
+    let child = src.tables.iter().find(|t| t.name == "siesta_sc_child").expect("child");
+    assert_eq!(child.primary_key, ["a", "b"]);
+    assert_eq!(src.tables.len(), 2);
+    let src = s.source("SELECT id FROM siesta_sc_v").await.expect("view source");
+    assert!(src.tables.iter().all(|t| t.primary_key.is_empty()), "{src:?}");
+    let src = s.source("SELECT 1 AS x").await.expect("expression source");
+    assert_eq!((src.columns, src.tables.len()), (vec![None], 0));
+    assert!(s.source("SELECT nope FROM siesta_sc_parent").await.is_err());
 }
 
 #[tokio::test]

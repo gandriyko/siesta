@@ -101,7 +101,7 @@ pub fn row_json(cols: &[Column], row: &[Value]) -> String {
     format!("{{\n{}\n}}", fields.join(",\n"))
 }
 
-fn literal(v: &Value, d: Dialect) -> String {
+pub fn literal(v: &Value, d: Dialect) -> String {
     let quote = |s: &str| {
         let s = s.replace('\'', "''");
         format!("'{}'", if d == Dialect::MySql { s.replace('\\', "\\\\") } else { s })

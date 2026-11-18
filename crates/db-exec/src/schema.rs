@@ -72,7 +72,7 @@ impl Schema {
 
 const MY_SYSTEM: &str = "'mysql','information_schema','performance_schema','sys'";
 
-fn text(v: &Value) -> String {
+pub(crate) fn text(v: &Value) -> String {
     v.display()
 }
 
@@ -92,7 +92,7 @@ fn int(v: &Value) -> u32 {
 }
 
 /// SQL string literal (`'` doubled; MySQL also needs `\` doubled).
-fn lit(d: Dialect, s: &str) -> String {
+pub(crate) fn lit(d: Dialect, s: &str) -> String {
     let s = s.replace('\'', "''");
     format!("'{}'", if d == Dialect::MySql { s.replace('\\', "\\\\") } else { s })
 }
@@ -245,7 +245,7 @@ impl Session {
     }
 
     /// Runs a catalog query without the row cap, returning raw values.
-    async fn catalog(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, DbError> {
+    pub(crate) async fn catalog(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, DbError> {
         let cap = std::mem::replace(&mut self.max_rows, usize::MAX);
         let r = self.run(sql, Kind::Read, &Page::default()).await;
         self.max_rows = cap;
