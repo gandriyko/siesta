@@ -405,10 +405,20 @@ impl TableDelegate for Grid {
                 .rounded_sm()
                 .bg(cx.theme().primary.opacity(0.14))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .capture_key_down(move |ev: &KeyDownEvent, window, cx| {
-                    if ev.keystroke.key == "escape" {
+                .capture_key_down({
+                    let input = input.clone();
+                    move |ev: &KeyDownEvent, window, cx| {
+                        let m = &ev.keystroke.modifiers;
+                        let plain = !(m.shift || m.alt || m.control || m.platform);
+                        let s = input.read(cx);
+                        let (selected, len) = (s.selected_range(), s.value().len());
+                        let Some(action) = crate::edit::move_key(&ev.keystroke.key, m.shift, plain, selected, len) else { return };
                         cx.stop_propagation();
-                        view.update(cx, |this, cx| this.cancel_inline(window, cx)).ok();
+                        view.update(cx, |this, cx| match action {
+                            Some(dir) => this.move_inline(dir, window, cx),
+                            None => this.cancel_inline(window, cx),
+                        })
+                        .ok();
                     }
                 })
                 // Bare text: the selected cell's own frame is the only border.

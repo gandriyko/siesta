@@ -141,6 +141,34 @@ pub fn edit_text(v: &Value) -> Option<String> {
     }
 }
 
+/// Where a key in the in-place field goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Next,
+    Prev,
+    Up,
+    Down,
+}
+
+/// What a key in the in-place field does: `Some(None)` cancels (Esc), `Some(Some(m))` moves,
+/// `None` is the field's own. ← / → move the caret, and leave the cell only from the edge of the
+/// text or when it is all selected (as it is when the field opens).
+pub fn move_key(key: &str, shift: bool, plain: bool, selected: std::ops::Range<usize>, len: usize) -> Option<Option<Move>> {
+    let all = selected.start == 0 && selected.end == len;
+    Some(Some(match key {
+        "escape" => return Some(None),
+        "tab" if shift => Move::Prev,
+        "tab" => Move::Next,
+        "enter" if shift => Move::Up,
+        "enter" => Move::Down,
+        "up" if plain => Move::Up,
+        "down" if plain => Move::Down,
+        "left" if plain && (all || selected.end == 0) => Move::Prev,
+        "right" if plain && (all || selected.start == len) => Move::Next,
+        _ => return None,
+    }))
+}
+
 /// The cell being edited in place.
 pub struct Inline {
     /// Display row (the table's) and row of the result.
@@ -386,10 +414,12 @@ impl Siesta {
             return true;
         }
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current.clone().unwrap_or_default()).placeholder(if current.is_none() { "NULL" } else { "" }));
-        let subs = vec![cx.subscribe_in(&input, window, |_, _, ev: &InputEvent, window, cx| match ev {
-            // Deferred: the field's own event is still being delivered.
-            InputEvent::PressEnter { .. } | InputEvent::Blur => cx.defer_in(window, |this, window, cx| this.commit_inline(window, cx)),
-            _ => {}
+        // Enter, Tab and the arrows are taken by the cell before the field sees them (`move_key`).
+        let subs = vec![cx.subscribe_in(&input, window, |_, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Blur) {
+                // Deferred: the field's own event is still being delivered.
+                cx.defer_in(window, |this, window, cx| this.commit_inline(window, cx));
+            }
         })];
         input.update(cx, |s, cx| {
             s.focus(window, cx);
@@ -409,6 +439,33 @@ impl Siesta {
         let value = if text.is_empty() && i.current.is_none() { None } else { Some(text) };
         self.set_change(i.ri, i.col, value, i.original, cx);
         self.focus_table(window, cx);
+    }
+
+    /// Enter / Tab / an arrow in the field: keep the value and edit the next cell that way. Tab
+    /// walks the editable columns and wraps to the next row; Enter and ↑ / ↓ stay in the column.
+    /// Off the edge of the page the value is kept and editing ends.
+    pub(crate) fn move_inline(&mut self, m: Move, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.shown_edit(cx).and_then(|e| e.inline.as_ref()).map(|i| (i.row, i.col)) else { return };
+        let Some(t) = self.shown_edit(cx).and_then(|e| e.target().cloned()) else { return };
+        self.commit_inline(window, cx);
+        let rows = self.ui.table.read(cx).delegate().order.len();
+        let cols: Vec<usize> = t.cols.iter().enumerate().filter(|(_, c)| c.is_some()).map(|(i, _)| i).collect();
+        let at = cols.iter().position(|&c| c == col).unwrap_or(0);
+        let next = match m {
+            Move::Up => row.checked_sub(1).map(|r| (r, col)),
+            Move::Down => (row + 1 < rows).then_some((row + 1, col)),
+            Move::Next if at + 1 < cols.len() => Some((row, cols[at + 1])),
+            Move::Next => (row + 1 < rows).then(|| (row + 1, cols[0])),
+            Move::Prev if at > 0 => Some((row, cols[at - 1])),
+            Move::Prev => row.checked_sub(1).map(|r| (r, cols[cols.len() - 1])),
+        };
+        let Some((r, c)) = next else { return };
+        self.ui.table.update(cx, |t, cx| {
+            t.set_selected_cell(r, c, cx);
+            t.scroll_to_row(r, cx);
+            t.scroll_to_col(c, cx);
+        });
+        self.edit_cell(r, c, window, cx);
     }
 
     /// Esc in the field: the cell keeps what it had.
@@ -714,6 +771,27 @@ mod tests {
         let mut changes = Changes::new();
         changes.insert((0, 2), Some("x".into()));
         assert!(update_sql(Dialect::Postgres, &t, &rows, &changes).unwrap_err().contains("is NULL"));
+    }
+
+    #[test]
+    fn keys_in_the_cell_field() {
+        use super::{Move, move_key};
+        // "abc": all selected (just opened), caret at start / middle / end.
+        let k = |key, shift, sel: std::ops::Range<usize>| move_key(key, shift, !shift, sel, 3);
+        assert_eq!(k("tab", false, 1..1), Some(Some(Move::Next)));
+        assert_eq!(k("tab", true, 1..1), Some(Some(Move::Prev)));
+        assert_eq!(k("enter", false, 1..1), Some(Some(Move::Down)));
+        assert_eq!(k("enter", true, 1..1), Some(Some(Move::Up)));
+        assert_eq!(k("up", false, 1..1), Some(Some(Move::Up)));
+        assert_eq!(k("escape", false, 1..1), Some(None));
+        assert_eq!(k("left", false, 0..3), Some(Some(Move::Prev)));
+        assert_eq!(k("right", false, 0..3), Some(Some(Move::Next)));
+        assert_eq!(k("left", false, 1..1), None); // the caret moves
+        assert_eq!(k("left", false, 0..0), Some(Some(Move::Prev)));
+        assert_eq!(k("right", false, 3..3), Some(Some(Move::Next)));
+        assert_eq!(k("right", false, 2..2), None);
+        assert_eq!(move_key("left", true, false, 0..0, 3), None); // Shift+← selects
+        assert_eq!(k("a", false, 0..0), None);
     }
 
     #[test]
