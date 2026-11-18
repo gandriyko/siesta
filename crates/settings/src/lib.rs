@@ -59,7 +59,7 @@ pub struct Settings {
     pub split: Split,
     /// The editor's share of the editor + result area, 0.2–0.8.
     pub split_ratio: f32,
-    /// Theme family (`"macOS Classic"` by default, `"Gruvbox"`, …); `"Default"` = gpui-component's built-in.
+    /// Theme family (`"Gruvbox"` by default, `"macOS Classic"`, …); `"Default"` = gpui-component's built-in.
     pub theme: String,
     /// UI text size, px.
     pub ui_font_size: f32,
@@ -125,7 +125,7 @@ impl Default for Settings {
             keymap: Keymap::Default,
             split: Split::Vertical,
             split_ratio: 0.55,
-            theme: "macOS Classic".into(),
+            theme: "Gruvbox".into(),
             ui_font_size: 14.,
             font_family: String::new(),
             font_size: 14.,
