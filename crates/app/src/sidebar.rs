@@ -866,7 +866,15 @@ impl Siesta {
             }))
             .child(Tab::new().label("Files"))
             .child(Tab::new().label("DB"));
-        let header = div().flex_none().h(px(36.)).px_2().flex().items_center().gap_2().child(tabs);
+        // A click anywhere in the navigation panel (tabs, folders, DB tree, empty space) leaves the
+        // History page; the History button itself is outside and toggles it.
+        let leave_history = |this: &mut Self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| {
+            if this.show_history {
+                this.show_history = false;
+                cx.notify();
+            }
+        };
+        let header = div().flex_none().h(px(36.)).px_2().flex().items_center().gap_2().on_mouse_down(MouseButton::Left, cx.listener(leave_history)).child(tabs);
         let body = match self.side_tab {
             SideTab::Files => {
                 let query = self.sidebar_filter.read(cx).value().trim().to_lowercase();
@@ -890,6 +898,7 @@ impl Siesta {
             }
             SideTab::Db => self.db_body(cx),
         };
+        let body = div().flex_1().min_h_0().flex().flex_col().on_mouse_down(MouseButton::Left, cx.listener(leave_history)).child(body);
         let item = |id: &'static str, icon: Icon, label: &'static str| {
             div()
                 .id(id)
