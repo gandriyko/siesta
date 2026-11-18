@@ -55,8 +55,14 @@ actions!(
     ]
 );
 
-/// Shown in an empty workspace (not written until saved).
-const SAMPLE: &str = "-- @connection local\nSELECT 1;\n";
+/// Shown in an empty workspace (not written until saved): it names the first existing connection,
+/// and without any connection it has no `@connection` line.
+fn sample(conns: &Connections) -> String {
+    match conns.names().first() {
+        Some(name) => format!("-- @connection {name}\nSELECT 1;\n"),
+        None => "SELECT 1;\n".into(),
+    }
+}
 #[cfg(target_os = "macos")]
 const RUN_KEY: &str = "Cmd+Enter";
 #[cfg(not(target_os = "macos"))]
@@ -342,7 +348,7 @@ impl Siesta {
                 let first = self.files.iter().find(|f| siesta_workspace::is_sql(f)).cloned();
                 match first {
                     Some(path) => self.open(path, None, window, cx),
-                    None => self.open(self.folder().join("untitled.sql"), Some(SAMPLE.into()), window, cx),
+                    None => self.open(self.folder().join("untitled.sql"), Some(sample(&self.conns)), window, cx),
                 };
             }
             None => {}
