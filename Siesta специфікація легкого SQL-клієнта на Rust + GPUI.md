@@ -1,567 +1,161 @@
-# Siesta: специфікація легкого SQL-клієнта на Rust + GPUI
+# Siesta: specification of a lightweight SQL client in Rust + GPUI
+
+This file records principles and decisions. It is updated only when a principle or a decision changes — not for every feature or tweak;
+behaviour details live in the code, tests, README.md and skills/siesta/SKILL.md.
+
+## Purpose and non-goals
+
+A desktop SQL client (Postgres, MySQL / MariaDB) in Rust + GPUI where queries are plain text in `.sql` files. Not DBeaver with a hundred dialogs, but an editor in the spirit of DBCode for VS Code: write SQL, press Cmd+Enter, see the result table on the right. It is the twin of Respite (same shell, databases instead of HTTP).
+
+- One file holds many statements separated by `;`; Cmd+Enter runs the one under the cursor.
+- Native speed: cold start under 300 ms, the first result page shows without noticeable delay beyond the query itself, scrolling does not depend on result size.
+- The connection is always visible at the top right (like the environment picker in Respite).
+
+**Siesta deliberately is not:**
+
+- a visual query builder, an ER-diagram tool, a schema-diff or migration tool;
+- a row insert / delete grid (cell editing exists, see below);
+- a client for SQLite, MSSQL, Oracle, ClickHouse or NoSQL (considered later);
+- a place where project files configure connections or settings.
+
+## Shell shared with Respite
+
+Respite (`/Users/andrew/Projects/respite`) is the reference implementation. Siesta has the same shell: a workspace of files with a sidebar tree, editor with an active statement, result panel on the right, global settings, themes, state restore, `.app` bundle, CLI, agent skill (`skills/siesta/SKILL.md`).
+
+- **The shell is copied from Respite, not shared as a crate.** Two products evolve independently; a shared crate is extracted only when a third place wants the same code. Same pinned `gpui` / `gpui-component` versions, no patches to third-party crates.
+- **The editor stays plain text:** no CodeLens, no inline statuses in lines. The only button is the gutter ▶ next to the line number. Status lives in the result header and the sidebar tree.
+- **Settings are global only** (`~/.config/siesta/settings.json`, snake_case); there is no per-project layer. The Settings page, `settings.json` and README list the keys; the defaults for shortcuts live in the keymap file, overridable in `keymap.json`.
+- **Two folders, one role each, nothing is written to both.** `~/.config/siesta/` holds only what the user writes (settings, keymap, `connections/`, `collections/`) and can live in dotfiles. `~/.siesta/` holds only what Siesta writes itself (state, added-files list, history, schema cache, password key) and never goes to dotfiles: it contains the key, the full text of executed SQL and database structure. `SIESTA_CONFIG_DIR` / `SIESTA_DATA_DIR` override them (tests, sandboxes). Siesta keeps nothing inside projects.
+- **The sidebar shows only `.sql` files and folders.** COLLECTIONS is the central folder `~/.config/siesta/collections`; FILES lists `.sql` files added from anywhere (added files are only referenced; removing one from the list keeps the file, tab and history). The sidebar file list updates by polling mtimes (files, settings, keymap, connections) once a second.
+- **Nothing is ever overwritten.** Import skips existing names, New File only opens an existing file, rename is refused if the target exists (except a case-only rename of the same file), delete goes to the system Trash. A rename is also refused while a transaction is open or a statement runs in an affected tab; after it, tabs, results, history entries and added files follow the new path.
+- **Restore:** open tabs, cursors and the active tab are saved in `state.json`. The connection and database of a file are not in state (see directives).
+- **`siesta [file[:line]]`** opens a file in the GUI; the same binary is the CLI and the MCP server (`siesta mcp`) over one core.
+
+## `.sql` format and statements
+
+- **Plain SQL, no custom syntax.** A file must run in `psql` / `mysql` unchanged. UTF-8, LF or CRLF.
+- **Statements are split by a hand-written token lexer, not a parser,** with dialect rules: quotes and escapes per dialect, `--` / `#` / `/* */` comments, Postgres dollar-quoting, MySQL `DELIMITER` (never sent to the server). The dialect comes from the file's connection (Postgres when none). One lexer serves splitting, classification and every safety check, so they cannot disagree.
+- **What is sent** is the text from the first token to the delimiter; leading and trailing comments (with directives) are not sent. The cursor between statements belongs to the previous one. An unclosed string / comment / `$tag$` is a diagnostic, the rest of the file is one statement.
+- **Classification by first word:** a *query* (`SELECT`, `TABLE`, `VALUES`, `WITH … SELECT`) is wrapped for paging; a *read* (`SHOW`, `EXPLAIN`, `DESCRIBE`) is not wrapped; everything else is DML / DDL ("other"). `SELECT … INTO`, `FOR UPDATE / SHARE` and `WITH` with DML inside are "other" and not wrapped. **`EXPLAIN ANALYZE <stmt>` is classified by the inner statement** because it really executes it. Plain `EXPLAIN` stays a read.
+- **Directives** are comments `-- @word value`: `@connection`, `@database` (file level), `@name`, `@page-size`, `@confirm` (statement level); the list and exact syntax are in the skill file.
+  - **`@connection` / `@database` apply only at the top of the file** (before the first statement), so a stray comment deep in a script can never silently switch the server. A directive below, an unknown one or a bad value is a warning; directives inside a statement are ignored.
+  - **A file's connection is the `-- @connection` line in the file itself,** so it travels with git, rename and other machines, and the CLI sees the same connection. Picking a connection in the GUI is just a normal undoable edit of that line (the file becomes dirty); nothing is stored separately and the picker never blocks. A name that does not exist shows a red picker, nothing is rewritten behind the user's back.
+  - **`@database`** picks a database on the connection's server, same mechanism. Changing the connection removes it (the database belonged to the old server). Effective database: `@database` → connection's `database` → server default (CLI: flag first).
 
-Nov 16, 2026 · @Andrew
+## Connections
 
-## Огляд і цілі
+- **Connections live only in the user's config dir** (`~/.config/siesta/connections/<name>.json`, one file per connection), never in the project. A project may be shared or public; credentials and hosts are personal. No project connection files, no folder chain, no `${dotenv:}`, no keychain markers. The file format is strict JSON; its keys are documented in the Connections page / README.
+- **Connection names are lowercase ASCII slugs** (`[a-z0-9][a-z0-9_-]*`, max 64) because a name is at once a file name, a `-- @connection` value and a CLI argument. The form normalises input as the user types (transliterating non-ASCII). **Old names migrate automatically** (on start, on a change in `connections/`, on every CLI run): file renamed, password re-encrypted under the new name, `-- @connection` lines rewritten in the collections and added files (open tabs via an undoable edit), one notification. If migration is impossible (read-only dir), the old name still loads with a warning. The same rewrite happens on a rename in the form.
+- **Passwords are only stored encrypted in the connection file** (`password_enc`, XChaCha20-Poly1305, AAD = connection name so a copied ciphertext does not decrypt elsewhere), with a random local key in `~/.siesta/key` (0600, created on first need, not next to the connection files so the config dir can go into dotfiles). Protects against leaks as plain text (screenshots, `grep`, backups, synced files without the key); does not protect against malicious code running as the user. The system keychain was rejected: signing dev builds and permission prompts are not worth protection from what is readable by the user anyway. A plain `password` key is ignored with a warning.
+- **Decryption is lazy:** only when a session opens. No `password_enc` means a passwordless connection (some local databases need none); a server rejection then says how to set a password. Failing to encrypt on save does not lose the rest of the connection: it saves, the form stays open with the error.
+- Values may contain `${env:NAME}` (for CI); other `${…}` is an error. A connection that fails to build goes to errors, a bad file to warnings; the rest still loads.
+- **Unix sockets** are an explicit option (`socket`: true = auto-detect usual paths, or a path); an old `host` starting with `/` still works. Postgres without a user takes the OS user, like libpq.
+- **The connection form is one simple dialog** (name, driver, URL that is parsed into fields and never written to the file, host / port / database / user, password, SSL, `schema` (Postgres only), `init_sql`, Read only, Production, colour). Hints follow the driver. Test never saves anything; closing the dialog aborts a running Test. The Connections page lists everything flat; its actions never touch any file (a deleted connection leaves red pickers, not rewrites).
+- **A connection timeout wraps the whole establishment** (TLS, handshake, init) because sqlx has none; the typical case is the wrong driver on a port where both sides wait silently, so the error names host, port and likely cause.
+- **Nothing is selected automatically.** A new file has no connection; a connection created from the form is selected only for the file the form was opened from.
+- **The database list is read in the background** (a throwaway session) and cached per connection; only accessible databases are listed, system ones last.
 
-Десктопний SQL-клієнт на Rust і GPUI, у якому запити живуть як звичайний текст у файлах `.sql`. Це не DBeaver із сотнею діалогів, а редактор у дусі [DBCode для VS Code](https://marketplace.visualstudio.com/items?itemName=dbcode.dbcode): написав SQL → Cmd+Enter → бачиш таблицю результату праворуч. Брат-близнюк Respite: той самий каркас (робоча тека, бокова панель, редактор, панель результату, CLI), лише замість HTTP — бази даних.
+## Sessions and safety
+
+- **One session per (file, connection, database)** while the file is open, so `SET`, temp tables and `BEGIN … COMMIT` work across separate Cmd+Enter runs like in `psql`. Switching the database is a new session (same for both drivers); an open transaction in the old one asks Commit / Rollback / Cancel first. A different file runs in parallel, one session runs strictly in order.
+- **Autocommit by default** (open question below). An open transaction is shown in the result header; closing the file, disconnecting and quitting each ask Commit / Rollback / Cancel (one dialog for all files on quit). Transaction state is tracked by us from executed statements, because sqlx does not expose it.
+- **`prod` flag (not a name pattern) marks production.** The colour is red by default and a plate marks the editor. On `prod` every statement that is not a read asks for confirmation (the same rule in GUI and CLI); reads run freely. `-- @confirm` always asks; `run.confirm_destructive = always` also asks for `UPDATE` / `DELETE` without `WHERE`, `DROP`, `TRUNCATE`, `ALTER` on other connections. A batch asks once, up front, so it never runs half-confirmed. Re-running the same result (page, sort, filter) does not ask again. Destructiveness is judged on top-level tokens (also through `WITH … DELETE` and `EXPLAIN ANALYZE`), not a parser; `UPDATE` / `DELETE` without `WHERE` also gets a yellow warning in the editor.
+- **`read_only` is two layers.** The server session is set read-only, and the client refuses everything that writes before sending (CLI exit code 4, `read_only_refused`) — in `db-exec`, so GUI, CLI and MCP share it. It is a safe default, not a security boundary: a session can switch itself back, and functions that write inside `SELECT` are only stopped by the server. A cheap guard refuses the obvious switches to read-write. For real protection use a database user with read-only privileges. Plain `read_only` shows a neutral badge, not the red `prod` plate.
+- **Cancellation** (Esc): sqlx cannot cancel on the server, so the backend id is remembered at open and a separate service connection sends `pg_cancel_backend` / `KILL QUERY`; the session stays alive. Runs queued behind another one are not executed after a cancel or file close ("generations").
+- **Lost connection** reopens on the next run. Reads are retried once with a notice that session state is lost; anything else is never retried automatically because it may already have run (the error says "may or may not have run").
+- **Multiple result sets** in one statement: only the first with rows is shown, the notice says how many were not.
+- **Statement timeout** is applied per dialect on open, on setting change and after a reopen.
+- **Colour:** the connection's colour marks the picker dot, the editor frame and the tab of each file, so the active server is hard to confuse.
+
+## Running queries
+
+- **Run modes:** the statement under the cursor, the exact selection (may be several statements), all statements of the file, repeat last, cancel. Batches show one result tab per statement with rows and a summary; the first error stops the batch (`run.stop_on_error`).
+- **Pipeline:** find statement → confirm if needed → take the session (open, `init_sql`) → classify → execute (queries are wrapped for paging, the rest runs as is) → accept result (columns with types, first page, server messages) → record in history. A server error shows in the result panel (SQLSTATE, message, DETAIL, HINT) with the position underlined in the editor.
+- **A long query never blocks the UI.** `sqlx` needs tokio: a separate thread with a tokio runtime, the GUI sends tasks over a channel and receives events via `cx.spawn` (the Respite pattern). Paging, sorting and filtering are a new query in the same session while the previous page stays visible.
+- **History** (`~/.siesta/history/`, one file per execution, newest first, 500 kept): file, statement text, connection, database, time, duration, row count or error. Result data is never stored (large and sensitive). Only user-initiated runs are recorded, not page / sort / filter / count. Currently the GUI only; the CLI does not write history. **Insert** and **Run again** operate on the file where the statement was recorded, so the statement runs under that file's connection; if it differs from the recorded one, the user is told.
+
+## Result panel
+
+- **Pagination, sorting and filters wrap the statement on the server** (`SELECT * FROM (<query>) AS q … LIMIT n+1 OFFSET m`); the client never holds the whole result. The extra row only tells whether another page exists, avoiding a costly `count(*)` (available on demand). Filter values go only as bind parameters, never concatenated. Sorting covers the whole result, not just the visible page.
+- **Cases where wrapping is impossible or unsafe fall back,** visibly: statements that cannot be wrapped (`SHOW`, `EXPLAIN`, `CALL`, DML with `RETURNING`) are streamed and cut at `results.max_rows` with a warning, sorting becomes local (marked "local"), filters are off; duplicate column names (a join with `id` on both sides) do the same; MySQL / MariaDB with a plain page and no top-level `LIMIT` gets `LIMIT n OFFSET m` appended instead of a wrapper, because MariaDB drops a subquery's `ORDER BY` without `LIMIT`.
+- **Types:** everything from the database becomes one value enum used by table, CLI and popup; unknown types (PostGIS, enum, `inet`…) come as server text so nothing crashes. Postgres is read over the simple protocol as text and parsed by type name; for filtered pages (bind parameters need the extended protocol) every column is cast to text. MariaDB's `JSON` arrives as `LONGTEXT` with a binary collation; text that parses as a JSON object / array is treated as JSON.
+- **Large values:** the row arrives whole, the table paints only a preview prefix (`results.cell_preview_kb`); the popup takes the full value from the already fetched row without another query. JSON cells can show a multi-line preview and a formatted, highlighted tooltip with the whole document.
+- **Full value popup** is the main feature for JSON columns: formatted, highlighted, foldable, with a JSONPath filter; other text as is; binary as a hex dump with save-to-file; a row can be shown as a JSON object. A single click only selects (so cells can be copied); double click / Enter / Space opens.
+- **Copy and export:** TSV copy, copy as JSON / INSERT; export to CSV / TSV / JSON / Markdown / INSERT (the whole result re-runs without paging and streams to a file) is specified but not implemented yet.
+- **Cell editing** is a separate Edit mode on `SELECT`-like results:
+  - **The server, not a parser, says where columns come from:** the statement is prepared (not executed) on the file's session and the row description names table and column per field, then primary keys are read from the catalog. So aliases and joins work; expressions and aggregates are read-only.
+  - A table is editable only if its whole primary key is in the result; otherwise the strip says why ("can't edit: …") instead of guessing.
+  - Changes are never sent at once: they are highlighted, then **Save…** generates readable `UPDATE … WHERE <key> = <old value>` statements, shown in a confirmation (red on `prod`) before running.
+  - Without a user transaction the updates run in their own transaction, and each must change exactly one row, otherwise everything is rolled back and nothing is saved. In the user's transaction they just run, the user commits.
+  - Pending changes belong to the rows on screen: paging, sort and filter are blocked until saved or discarded; a new run drops them. Edits go to history.
+  - An open cell field closes only on Enter / Esc / click elsewhere, so keys never leave the cell by accident. Large values (JSON, memo, blob) are edited in a separate window; JSON is compared by content, so reformatting is not a change.
+
+## Editor and navigation
+
+- **Highlighting** by `tree-sitter-sql` with the same themes as Respite (Zed-style JSON, light and dark); `-- @…` directives are highlighted apart from ordinary comments.
+- **Completion** is a pure function over the statement under the cursor (token scan, not a parser; works even when `FROM` comes after the cursor), fuzzy, keywords / tables / columns / directives by context. **The schema is loaded eagerly in the background as soon as a connection is chosen for a file** (also on restore), cached in memory and on disk per connection (the key includes a fingerprint of the effective connection, so a connection recreated under the same name against another server does not pick up a stale schema), and re-read after a successful schema-changing statement. The old cache stays visible while a new one loads. Schema comes from the chosen database and from `information_schema`, so it shows only objects the user may see.
+- **Diagnostics:** server error position, unclosed string / comment, destructive statement without `WHERE`. A full SQL linter is not a goal: the server checks syntax.
+- **Formatting** of the statement under the cursor with `sqlformat`.
+- **DB tab** of the sidebar: the active connection's schemas → tables / views → columns, indexes; double click inserts `SELECT *` (or adds a column to the select list), Copy DDL, search. **Statement navigation:** statements of a file are listed in the tree (jump, double click = jump and run); search in file and in the whole folder; previous / next statement.
+- **Where state lives:** a database / connection switch is always a file edit, never a hidden UI setting.
+
+## CLI and agent
 
-**Цілі**
+One binary: GUI, CLI and MCP over one core. Commands: `list`, `run`, `exec`, `connections` (list, test, databases, set-password), `schema`, `mcp`; the skill file `skills/siesta/SKILL.md` is the reference and is updated with every CLI change (a test fails if the skill misses a command, long flag, directive or exit code).
 
-- Один файл `.sql` тримає багато запитів, розділених `;`. Cmd+Enter виконує запит під курсором.
-- Postgres і MySQL / MariaDB з першої версії.
-- Розділений екран: редактор із підсвіткою зліва, результат справа.
-- Таблиця результату: пагінація, сортування, фільтр по колонках; клік по комірці — повне значення (JSON із підсвіткою) у попапі.
-- Вибір підключення завжди на виду вгорі праворуч (як вибір середовища в Respite).
-- Нативна швидкість: холодний старт < 300 мс, перша сторінка результату на 100 рядків — без помітної затримки понад час самого запиту, прокрутка не залежить від розміру.
+- **Connections come from the user config dir, not the current directory.** Selection: `-c` > `-- @connection` in the file > error. Database: flag > `-- @database` > connection's `database` > server default.
+- **Output is JSON when piped, a table in a terminal** (`json`, `jsonl`, `csv` on request); JSON values stay nested JSON, not strings; versioned `schema` field in output. stdout stays clean data; notices go to stderr.
+- **Safety is the same as in the GUI** (`prod` confirmation, `read_only` refusal), checked for the whole batch before anything runs, never half-way. Without a terminal the CLI never asks: it exits 4 unless `--yes`. `--read-only` forces the server-side guard.
+- **Exit codes:** 0 success; 2 connection error (connect, auth, lost); 3 parse / unknown connection, statement or table / no connection / bad arguments; 4 refusal (confirmation needed, `read_only`, `prod_refused`); 5 SQL error on the server. With several statements the first error stops the run and sets the code (also when `stop_on_error` is off).
+- **MCP (`siesta mcp`, stdio)** has tools `connections`, `schema`, `list_statements`, `run_sql`, each a CLI call with JSON output. **The agent can never confirm:** `run_sql` never passes `--yes` and stdin is closed. On `read_only` writes are refused; on `prod` an agent may run only reads and `UPDATE` with a top-level `WHERE`, everything else is `prod_refused` before execution; anything needing confirmation is `confirmation_required`. The CLI detects MCP through `SIESTA_MCP`, set by `siesta mcp` for its child commands. These are rules for agents separate from the human GUI / CLI rules, and still rest on `read_only`, not on a promise that parsing is perfect.
 
-**Не-цілі (у першій версії)**
+## Architecture
 
-- Додавання / видалення рядків у таблиці (зміна значень комірок є, див. «Редагування комірок»).
-- Візуальний конструктор запитів, ER-діаграми, порівняння схем, міграції.
-- SQLite, MSSQL, Oracle, ClickHouse, NoSQL: розглядаються після фази 2.
-- SSH-тунелі: фаза 2 (шифрування паролів уже є, див. «Файли підключень»).
+A Cargo workspace; the core does not depend on the GUI.
 
-**Терміни**
+- `sql-split` — lexer, statements with positions, dialects, directives, classification, safety token checks. No dependencies on the rest.
+- `db-conn` — connection files, `${env:}`, encrypted passwords, secret masking.
+- `db-exec` — sessions, execution, page / sort / filter wrapper, cancellation, type conversion, history, schema cache and source-column discovery. `sqlx` 0.9 (Postgres, MySQL, rustls; no `uuid` / `rust_decimal`: Postgres is read as text) and `tokio`.
+- `workspace` — central folder scan (`.gitignore` aware), added files, saved UI state. No GUI.
+- `settings` — global settings, config / data dir helpers; a separate crate because both `app` and `cli` need it.
+- `app` — GPUI window, sidebar, editor, result panel, popups (`gpui`, `gpui-component`).
+- `cli` — commands, output, exit codes (`clap`).
 
-- *Робоча тека* — коренева директорія проєкту, яку відкриває користувач.
-- *Файл запитів* — файл `.sql`.
-- *Інструкція* (statement) — фрагмент файлу між двома `;` (з урахуванням рядків, коментарів і `$$`).
-- *Підключення* — іменований набір параметрів доступу до бази (`dev-pg`, `prod-mysql`).
-- *Сесія* — живе з'єднання з базою, прив'язане до пари файл + підключення.
+Data flow: `app` / `cli` → `sql-split` (what to run) → `db-conn` (where) → `db-exec` (run, return values) → table / popup / JSON. State in the GUI is held in GPUI entities: workspace, buffer per file, session store, result store (result per file + statement text: changed text is a new statement; closing a file forgets its results and sessions), schema cache shared by all editors.
 
-## Макет інтерфейсу
+**Driver: `sqlx`.** One API for Postgres and MySQL / MariaDB, pure Rust, rustls. Its missing cancellation is covered by `pg_cancel_backend` / `KILL QUERY` from a separate connection.
 
-```text
-┌──────────────┬───────────────────────────────┬──────────────── [● dev-pg ▾] ┐
-│ Files | DB   │ reports.sql                   │ ▶ Run   12 rows · 38 ms     │
-│ ▸ reports    │ SELECT id, payload            │ ┌────┬──────────────────┐   │
-│   reports.sql│   FROM events                 │ │ id │ payload          │   │
-│ ▸ adhoc.sql  │  WHERE kind = 'login';  ← акт.│ ├────┼──────────────────┤   │
-│              │                               │ │ 1  │ {"ip":"10.0.…    │   │
-│              │ UPDATE users SET …;           │ └────┴──────────────────┘   │
-│              │                               │ ‹ 1 / 3 ›  100 на сторінку  │
-└──────────────┴───────────────────────────────┴─────────────────────────────┘
-```
+### Testing
 
-Ліворуч — бокова панель із двома вкладками: *Files* (дерево `.sql` робочої теки, файл розгортається у список своїх інструкцій) і *DB* (схема активного підключення). Посередині — редактор із виділеним фоном активною інструкцією (лише текст, без кнопок і статусів у рядках — як у Respite). Праворуч — результат інструкції під курсором. Вибір підключення — у верхньому правому куті. Бокову панель і панель результату можна сховати (Cmd+B, Cmd+J), роздільники перетягуються.
+- `sql-split`: table of cases with `assert_eq!` (strings, comments, `$$`, `DELIMITER`, CRLF), no snapshot libraries (as in Respite).
+- `db-exec` and `cli`: unit tests of pure parts (wrapper, filter syntax, type parsing, statement addressing, output formats, exit codes, safety checks) plus `#[ignore]` integration tests against Postgres 17 and MariaDB 11 in Docker (`scripts/test-db.sh`; URLs in `SIESTA_TEST_PG_URL` / `SIESTA_TEST_MYSQL_URL`). MySQL 8 is not tested in CI (the difference is only `JSON`).
+- Tests use temporary `SIESTA_CONFIG_DIR` / `SIESTA_DATA_DIR` with their own key and never touch the real `~/.config/siesta` or `~/.siesta`.
+- GUI: `#[gpui::test]` for navigation, table and popup.
 
-## Формат файлу .sql
+## Roadmap
 
-Звичайний SQL, без власного синтаксису: файл має відкриватися й виконуватися в `psql` / `mysql` без змін. Кодування UTF-8, кінці рядків LF або CRLF.
+**Phase 1 — MVP (done except export):** statement splitting, connections with `read_only` / `prod` and the form, execution on `sqlx` with sessions and cancel, GUI shell from Respite, result table (types, paging, sort, column filters, copy), full-value popup, DB tab and completion, CLI and skill, history. Open: result export.
 
-### Розбиття на інструкції
+**Phase 2:** MCP server (done); passwords encrypted with a local key (done). Open: SSH tunnel, streamed export of large results and `EXPLAIN` as a tree, query parameters (`:name` / `{{var}}` with a prompt).
 
-1. **Роздільник.** `;` поза рядками, ідентифікаторами в лапках і коментарями.
-2. **Рядки й лапки.** `'…'` (з `''`), `"…"` (Postgres), `` `…` `` (MySQL), `E'…'` (Postgres з `\`-екрануванням). У MySQL `'…'` і `"…"` — рядки з `\`-екрануванням, як у сервері за замовчуванням (`NO_BACKSLASH_ESCAPES` не враховується).
-3. **Коментарі.** `-- …` (у MySQL — лише з пробілом після `--`), `# …` (лише MySQL), `/* … */` (у Postgres — вкладені).
-4. **Dollar-quoting Postgres.** `$$ … $$` і `$tag$ … $tag$` — тіла функцій з `;` усередині лишаються однією інструкцією.
-5. **`DELIMITER` MySQL.** Рядок `DELIMITER //` міняє роздільник до наступного `DELIMITER ;` (для `CREATE PROCEDURE`). Сама команда не відправляється на сервер — як у клієнті `mysql`.
-6. **Остання інструкція** може бути без `;`.
-7. Діалект для розбиття береться з активного підключення; без підключення — Postgres.
+**Phase 3:** cell editing with `UPDATE` by primary key (done). Open: SQLite, ClickHouse, MSSQL.
 
-Курсор між інструкціями (на порожньому рядку чи в коментарі) відноситься до найближчої попередньої, курсор перед першою — до першої. Порожні інструкції пропускаються. На сервер іде текст від першого токена до роздільника: провідні й кінцеві коментарі (разом із директивами) не відправляються. Незакритий рядок / коментар / `$tag$` — помилка в діагностиці, решта файлу — одна інструкція.
+## Decisions and open questions
 
-Класифікація за першим словом: `SELECT` / `TABLE` / `VALUES` / `WITH … SELECT` — *запит* (загортається для сторінки); `SELECT … INTO`, `… FOR UPDATE / SHARE` і `WITH` з DML усередині — не загортаються. `SHOW` / `EXPLAIN` / `DESCRIBE` — *читальні*, але не загортаються. Решта — DML / DDL. Виняток: `EXPLAIN ANALYZE <інструкція>` (також `EXPLAIN (ANALYZE …)`) справді виконує внутрішню інструкцію, тож якщо вона не `SELECT`-подібна (DML, DDL), то це не читальна, а «інша»: підтвердження, як для самої інструкції (`destructive_reason` дивиться крізь `EXPLAIN [ANALYZE]` і MariaDB `ANALYZE <інструкція>`), і без автоповтору після обриву з'єднання. Звичайний `EXPLAIN` лише планує й лишається читальним.
+- **Connections are files in the config dir, passwords only encrypted in them** (see Connections).
+- **Pagination, sorting and filters on the server** through a wrapper; the client never holds the whole result.
+- **Session per file + connection + database**, so `SET` and transactions behave like in a console client.
+- **The editor is clean**, as in Respite: no statuses in lines, the only button is the gutter ▶.
+- **Result is shown per statement under the cursor;** a fresh run starts at page one without sort and filters; filters apply on Enter (a query per keystroke would be wasteful); a batch shows a tab strip and a new single run drops it.
+- **The shell is copied from Respite** instead of a shared crate (for now).
+- **The agent skill and the CLI change together.**
+- **License: MIT.**
+- **Name: Siesta.** A pair to Respite (both about rest). Binary `siesta`; the name is taken on crates.io, so crates are prefixed (`siesta-cli`, `siesta-settings`, …), as in Respite; Homebrew is free.
 
-Лексер один: `destructive_reason` / `top_level` використовують той самий прохід, що й розбиття (рядки `E'…'` Postgres, `\"` у рядках MySQL, `$tag$`, коментарі), а не окремий сканер.
+**Still open**
 
-### Директиви
-
-Коментар виду `-- @слово значення` перед інструкцією або на початку файлу. Решта коментарів — звичайні.
-
-| Директива | Де | Дія |
-| --- | --- | --- |
-| `-- @connection <ім'я>` | початок файлу | Підключення файлу (його ж пише випадайка підключення; CLI бере його без `--connection`) |
-| `-- @database <ім'я>` | початок файлу | База даних файлу на сервері його підключення (перекриває вибір у другій випадайці; CLI бере її без `--database`; див. «Вибір бази даних») |
-| `-- @name <id>` | перед інструкцією | Назва в дереві, пошуку й CLI (`siesta run file.sql users_by_day`) |
-| `-- @page-size <n>` | перед інструкцією | Розмір сторінки результату для цієї інструкції |
-| `-- @confirm` | перед інструкцією | Завжди питати підтвердження перед виконанням |
-
-Без `@name` інструкція в дереві показується першим рядком (`SELECT id, payload FROM events…`). `@connection` і `@database` діють лише перед першою інструкцією (розбір однаковий, `SqlFile.database` / `database_at`; зміна значення чи видалення рядка — `sql_split::rewrite_connection` / `rewrite_database` з спільного помічника, зберігає решту рядка й CRLF); невідома директива, `@connection` / `@database` нижче чи `@page-size` не числом — попередження. Директиви всередині інструкції ігноруються.
-
-## Підключення
-
-### Файли підключень
-
-Unix-сокет — явний ключ `socket`: `true` (сокет локального сервера шукається при підключенні: `db_conn::detect_socket` — Postgres: перша тека з `/tmp`, `/private/tmp`, `/var/run/postgresql`, `/run/postgresql`, `/opt/homebrew/var/run/postgresql`, `/usr/local/var/run/postgresql`, де є `.s.PGSQL.<port або 5432>`; MySQL / MariaDB: перший наявний файл із `/tmp/mysql.sock`, `/tmp/mysqld.sock`, `/var/run/mysqld/mysqld.sock`, `/run/mysqld/mysqld.sock`, `/var/lib/mysql/mysql.sock`, `/opt/homebrew/var/mysql/mysql.sock`, `/usr/local/var/mysql/mysql.sock`; якщо нічого нема — помилка «No Unix socket found for <driver> (looked in …); type its path in the connection form») або рядок-шлях (Postgres — тека сокета, `<dir>/.s.PGSQL.<port>`; MySQL — файл сокета). З `socket` ключ `host` ігнорується (форма його не пише). Старий `host`, що починається з `/`, і далі працює (форма показує його як сокет). URL розуміє (і форма ставить прапорець Unix socket зі шляхом) `postgres:///db?host=/tmp`, `postgres://user@%2Ftmp/db` і `mysql://user@localhost/db?socket=/tmp/mysql.sock`. Без `user` Postgres бере користувача ОС (`USER`, `LOGNAME`, інакше `postgres`), як libpq. `Session::databases` для Postgres у `list_databases` має запасні бази `postgres` / `template1`.
-
-Підключення живуть **лише в теці конфігурації користувача**: один JSON-файл на підключення, `~/.config/siesta/connections/<ім'я>.json` (тека підміняється змінною `SIESTA_CONFIG_DIR` — для тестів і пісочниць). Ім'я файлу (без `.json`) — ім'я підключення; ім'я — `[a-z0-9][a-z0-9_-]*`, до 64 символів, лише ASCII і нижній регістр (`db_conn::valid_name`; це файл, значення `-- @connection` і аргумент CLI). Поле Name у формі нормалізує ввід на льоту (`db_conn::normalize_name`): не-ASCII транслітерується в латиницю (крейт `deunicode`: `Größe` → `grosse`), нижній регістр, пробіли → `-`, решта недозволених символів (лапки, `@`, `#`, `.`, `/` …) і початкові `-`/`_` відкидаються; кінцевий `-` лишається (щоб `my ` + `db` дало `my-db`), повторні `-` не стискаються; функція ідемпотентна. **Міграція старих імен**: файли з іменем, що порушує правила (`My DB.json`, `ключ.json`), автоматично перейменовуються на `normalize_name(старе)` (порожнє → `connection`; зайняте → `-2`, `-3` …) при старті застосунку, при зміні теки `connections/` на диску та в кожному запуску CLI (`db_conn::migrate_names`); `password_enc` перешифровується під нове ім'я (якщо не вдалося — файл усе одно перейменовується без пароля, попередження «set it again»). Рядки `-- @connection старе` переписуються в `.sql` центральної теки та доданих файлів (`siesta_workspace::rewrite_connection_refs` на диску; відкриті вкладки — правкою з undo), один раз з'являється сповіщення «Connections renamed to the new name rules: My DB → my-db, …» (CLI пише рядок у stderr, stdout лишається чистим JSON). Якщо міграція неможлива (тека лише для читання), старе ім'я й далі завантажується (розбір `-- @connection` читає решту рядка без змін; перевірка `valid_file_name` м'яка: без `/`, `\`, початкової крапки, керівних символів), а `Connections.warnings` на сторінці Connections каже: `connection 'My DB': names are lowercase latin letters, digits, - and _; open it and save to rename it to 'my-db'`. Файлів підключень у проєкті (`siesta.json` тощо) немає: бокова панель показує лише `.sql`.
-
-```json
-// ~/.config/siesta/connections/dev-pg.json
-{ "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" }
-```
-
-```json
-// ~/.config/siesta/connections/prod-mysql.json
-{ "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop",
-  "read_only": true, "prod": true, "ssl": { "mode": "verify-full", "ca": "./certs/ca.pem" } }
-```
-
-- Ключі: `driver` (`postgres` | `mysql`; MariaDB — це `mysql`), або `url`, або `host` (чи `socket`) / `port` / `database` / `user`; `ssl.mode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`), `ssl.ca`, `ssl.cert`, `ssl.key`; `read_only`; `prod` (`true` — продакшн, див. «Вибір підключення» і «Конвеєр виконання»; типово `false`); `schema` (Postgres `search_path`); `init_sql` (виконати при відкритті сесії, напр. `SET time_zone = '+00:00'`); `color` (смужка в шапці й у випадайці; без `color` у `prod`-підключення вона червона): одна з 16 назв палітри — `red`, `orange`, `amber`, `yellow`, `lime`, `green`, `emerald`, `teal`, `cyan`, `sky`, `blue`, `indigo`, `purple`, `fuchsia`, `pink`, `gray` (`format::COLORS`; відтінок залежить від теми: світліший на темній, насиченіший на світлій) — або `#rrggbb`, вписаний вручну. Ключа `password` немає: він ігнорується з попередженням.
-- Значення можуть містити `${env:ІМ'Я}` — підставляється з оточення ОС (потрібно для CI); інші `${…}` — помилка підключення. Відносні шляхи `ssl.ca/cert/key` рахуються від теки `connections/`.
-- **Пароль — лише зашифрованим у файлі підключення**, ключ `"password_enc": "v1:<base64(nonce‖ciphertext)>"`. Шифр — XChaCha20-Poly1305 (RustCrypto `chacha20poly1305`), випадковий 24-байтовий nonce на кожне шифрування, AAD = ім'я підключення (шифртекст, скопійований в інше підключення, не розшифрується). Ключ — `~/.siesta/key` (поважає `SIESTA_DATA_DIR`): його пише застосунок, тож він у теці даних, а не поруч із файлами підключень — теку конфігурації можна класти в dotfiles без ключа. Ключ зі старого місця `~/.config/siesta/key` при запуску (GUI і CLI) один раз переноситься в `~/.siesta/key`, якщо там ключа ще немає (`crypto::adopt_old_key`). 32 випадкові байти (`getrandom`), створюється при першій потребі (збереження пароля) з режимом 0600, атомарно (тимчасовий файл + жорстке посилання, тож паралельний процес не перезапише вже створений ключ); файл, який не читається чи має не 32 байти, — зрозуміла помилка. **Що це захищає:** від витоку пароля відкритим текстом через скриншоти, `grep`, бекапи та синхронізацію файлів підключень без ключа. **Чого не захищає:** від шкідливого коду з правами користувача (він читає й ключ). Системне сховище (Keychain / Secret Service) не використовується. **Розшифрування ліниве:** завантаження списку не розшифровує, пароль розшифровується в `Connection::resolve_password()` рівно в момент відкриття сесії (`Session::open`: GUI-виконавець, Test у формі, CLI, перепідключення) і лише якщо пароля ще немає (немає в `url`). Немає `password_enc` — підключення без пароля: деяким локальним базам він не потрібен. Якщо сервер після цього відхиляє вхід (SQLSTATE `28…`), помилка додає: «No password is stored for `dev-pg`: set it in the connection form or with `siesta connections set-password dev-pg`». Якщо розшифрувати не вдалося (ключа немає, він інший, шифртекст пошкоджено) — помилка «Can't decrypt the password of `dev-pg` (the key in ~/.siesta/key is missing or different). Set the password again in the connection form.» (CLI — код 2). Пароль задається у формі або командою `siesta connections set-password <ім'я>`. Уся крипто-частина — модуль `db_conn::crypto` (`encrypt` / `decrypt` / `key_path` / `adopt_old_key`) і `db_conn::{set_password, has_password}`; функції приймають теку файлів (`config`) і теку ключа (`keys`) параметрами, а тести працюють у тимчасових `SIESTA_CONFIG_DIR` / `SIESTA_DATA_DIR` зі власним ключем і ніколи не торкаються справжніх `~/.config/siesta` / `~/.siesta`. `password_enc` у виводі `masked` показується як `"***"`, у попередженнях про невідомі ключі не фігурує.
-- Файли — строгий JSON (без коментарів; `//` у прикладах вище лише пояснення). Підключення, яке не збудувалося (нерозв'язана `${env:…}`, немає `driver`, неправильне значення), потрапляє в `Connections::errors`, невалідний JSON чи невідомий ключ — у `warnings`; решта підключень завантажується. `Connections::load(тека_конфігурації)` приймає теку параметром, тож тести не торкаються справжнього `$HOME`.
-- Старий формат `connections.json` / `connections.private.json` більше не читається (міграцію прибрано).
-- Корінь робочої теки — тека (чи файл), відкрита в застосунку; він потрібен для збереженого стану й історії, не для підключень і не для налаштувань (налаштування лише глобальні).
-
-### Вибір підключення
-
-- Випадайка у верхньому правому куті: список підключень, крапка і пункт «Без підключення». Крапка на кнопці має колір підключення (`color`, для `prod` без нього — червоний): приглушена — не з'єднано, повна — сесія жива, червона `danger` — помилка; без кольору — сіра / зелена / червона. Окремої смужки кольору немає. Рамка картки редактора теж має колір підключення файлу (без фокусу — приглушений), а вкладка кожного файлу залита кольором свого підключення (поточна — сильніше і з рамкою цього кольору).
-- **Жодного підключення ще немає** (перший запуск): замість випадайки — помітна кнопка **«+ Add connection»**, а вкладка DB пояснює, що підключень немає, і показує ту саму кнопку; обидві відкривають форму (нове підключення обирається для поточного `.sql`-файлу, якщо він відкритий). Файл із `-- @connection` на невідоме ім'я все одно показує червону випадайку.
-- **Вибір — це рядок `-- @connection <ім'я>` у самому файлі**, як `# @env` у Respite (`sql_split::set_connection`): вибір у випадайці (чи Cmd+Alt+E, палітра) вставляє його першим рядком, міняє значення наявного або, для «Без підключення», прибирає рядок — без запитань, звичайною правкою з undo (файл стає dirty, без автозбереження). Тож вибір їде з файлом (git, перейменування, інша машина) і CLI бачить той самий. Окремо вибір ніде не зберігається (у `state.json` його немає), пікер не блокується: директива і є вибором. Вписаний вручну рядок діє так само. Підключення, якого немає, — червона випадайка з підказкою «Unknown connection `x` (from `-- @connection`)». Вибір іншого підключення прибирає й `-- @database` (база належала старому серверу).
-- Cmd+Alt+E — вибір підключення з клавіатури: діалог пошуку (як Cmd+P) зі списком «Без підключення» і підключень (випадайку GPUI не відкрити програмно).
-- До запуску сесій крапка стану завжди сіра, а «Перевірити підключення» / «Розірвати сесію» вимкнені. Помилки й попередження файлів підключень показуються сповіщеннями, як помилки env-файлів у Respite. Зміна файлів у `connections/` (mtime, опитування разом із відкритими файлами) перечитує підключення.
-- Діалект розбиття береться з драйвера підключення (`@connection` має пріоритет); без підключення — Postgres.
-- Ключ `database` підключення — лише **база за замовчуванням** (необов'язкова); файл може вибрати будь-яку базу, доступну цим обліковим даним (див. нижче).
-- **Продакшн — це прапорець `prod: true` у підключенні** (шаблон за іменем `connections.prod_pattern` прибрано). `prod`-підключення: колір за замовчуванням червоний (коли `color` не задано), червона крапка / смужка кольору в випадайці й у шапці результату, червона плашка «Production» над редактором. `read_only` саме по собі дає нейтральний бейдж «Read only», а не червону плашку.
-- **Нічого не вибирається автоматично:** файл без вибору — «Без підключення». Нове підключення, створене формою, обирається лише для файлу, з якого форму відкрито (навіть якщо до «Save» користувач перейшов в інший файл); решта файлів його лише бачать у списку.
-- «Перевірити підключення» і «Розірвати сесію» — у тій самій випадайці.
-
-#### Форма «New / Edit connection»
-
-Пункт «New connection…» і олівець навпроти кожного підключення у випадайці (олівець редагує, не вибираючи підключення; а також кнопки у вкладці DB і Edit / Duplicate на сторінці «Connections», де окремого Test немає — він у формі) відкривають діалог (`conn_form.rs`) — одну просту форму для будь-якого підключення, одразу в режимі редагування: ім'я, драйвер (Postgres / MySQL), поле URL (підказка-приклад за драйвером — `postgres://…:5432/db` чи `mysql://…:3306/db`; введений чи вставлений URL розбирається при кожній зміні — `db_conn::parse_url`; схеми `postgres` / `postgresql` / `mysql` / `mariadb`, а також як їх пишуть конфіги застосунків: SQLAlchemy `mysql+pymysql://`, сама назва драйвера (`pymysql://`, `psycopg2://`, `asyncpg://` тощо) і префікс `jdbc:` — і заповнює драйвер, user, пароль, host, port, database та SSL mode (`sslmode=` / `ssl-mode=`); лише повністю розібраний URL застосовується, інакше поля не змінюються, а під полем муте-причина — «Unsupported scheme», «Missing host», «Ignored: <невідомі параметри>»; ключ `url` у файл **не пишеться** — при збереженні лишаються тільки поля, пароль іде зашифрованим у `password_enc`; наявний файл із ключем `url` відкривається розібраним на поля й перезаписується без нього; `db-conn` і далі читає `url` з файлів, написаних вручну), host / port / database / user (під рядком Host / Port — прапорець **Unix socket** з підказкою: коли він увімкнений, поле Host стає «Socket» зі шляхом сокета — порожнє означає автовизначення, а підказка-плейсхолдер показує знайдений шлях `<path> (detected)` чи `not found: type the socket path` і перераховується при зміні драйвера, порту й прапорця; введені host і шлях сокета зберігаються окремо, тож перемикання нічого не губить; порт у MySQL з сокетом сховано; збереження: прапорець + порожнє поле → `"socket": true`, + шлях → `"socket": "<path>"`, без прапорця → `host`), пароль (маскований ввід), SSL mode, `schema` (лише для Postgres: у MySQL поле сховане, значення лишається у файлі), `init_sql`, прапорці **Read only** і **Production**, колір. У полі Database кнопка ↻ підключається зі значеннями форми (введена база пробується першою; для Postgres, якщо її немає — SQLSTATE `3D000`, — далі `postgres`, потім `template1`, тож хибне ім'я не заважає) і читає бази, до яких можна підключитися (`db_exec::list_databases`, її ж використовують пікер бази й `siesta connections databases`); після неї з'являється стрілка зі списком і пунктом «(none)» — порожнє поле, база сервера за замовчуванням; помилка («Can't list databases: <перший рядок>») чи «Loading…» — муте під усім рядком Database / User, на всю ширину, в один рядок з трикрапкою; повний текст — у підказці при наведенні; ручний ввід лишається. Підказки полів залежать від драйвера (`conn_form::driver_hints`): Port — `5432` / `3306`, Host — `localhost`, User — справжній типовий користувач Postgres (користувач ОС, `db_conn::os_user`: `USER`, `LOGNAME`, інакше `postgres`; підказка «<user> (your OS user)») / `root`, Init SQL — `SET TIME ZONE 'UTC'` / `SET time_zone = '+00:00'`; при перемиканні драйвера порт, що дорівнює типовому порту іншого драйвера, змінюється на типовий нового (власний порт не чіпається). Колір — випадайка: «None» і 16 кольорів палітри зі зразками. Кнопки: **Test**, **Save**, **Cancel**, для наявного підключення — **Delete** (єдине підтвердження). Інших діалогів і запитань немає.
-
-- **Пароль.** Якщо у файлі є `password_enc`, поле показує підказку «•••••••• (unchanged)» (саме значення не розшифровується у форму); порожнє поле при Save = лишити збережений пароль, введене значення — зашифрувати й перезаписати. **Test** використовує введений пароль, інакше збережений (`ConnectionForm::to_connection(тека, оригінал)`); нічого не зберігає й показує успіх / помилку в самій формі. Перейменування переносить файл і перешифровує пароль під нове ім'я (AAD); Delete просто видаляє файл.
-- **Збереження** (`db_conn::save`): `<ім'я>.json` пишеться атомарно (тимчасовий файл + `rename`), ключі відсортовані, невідомі ключі файлу зберігаються. Якщо пароль зашифрувати не вдалося (ключ не читається, старий пароль не розшифрувати при перейменуванні), він не зберігається: решта підключення **зберігається**, а форма лишається відкритою з помилкою «Saved, but the password was not: …» (повторний Save — уже правка збереженого файлу). Читання — `read_form` (`ConnectionForm::has_password` = у файлі є `password_enc`), видалення — `delete`, список — `names`.
-- Валідація: ім'я обов'язкове, допустиме (див. вище) й унікальне, порт — число, драйвер обов'язковий. Після успішного «Save» підключення перечитуються, живі сесії цього підключення закриваються (наступний запуск перепідключається з новими значеннями й паролем), нове обирається для поточного файлу.
-- **Перейменування** (`Siesta::rename_references`): файли з `-- @connection <старе>` — відкриті вкладки та `.sql` робочої папки — переписуються **автоматично**, без запитань (у відкритих — звичайною правкою з undo, у закритих — на диску); потім сповіщення «Updated `-- @connection` in N files» (файли, які не вдалося записати, — окремим сповіщенням з помилками).
-- **Закриття** діалогу будь-яким способом (Close, Esc, ×, клік поза ним) перериває запущений Test: `Siesta` тримає форму лише слабким посиланням, тож діалог звільняє її разом із підключенням, що встановлюється.
-
-Інший `-- @connection` чи `-- @database` (вписаний вручну чи записаний випадайкою) завантажує схему й список баз нового підключення.
-
-#### Сторінка «Connections»
-
-Окреме вікно (як Налаштування; `connections_page.rs`) зі **плоским** списком усіх підключень, відсортованим за ім'ям. Рядок: кольорова крапка, ім'я, драйвер, `host:port/database` (або URL із замаскованим паролем), значки **Production** (червоний) і **Read only**, позначка «password set» / «no password» і «used by this file» для підключення поточного файлу; підключення з помилкою показує її текст. Дії: **Edit**, **Duplicate** (нова форма з ім'ям `<ім'я>-copy` і без пароля), **Delete** (з підтвердженням; видаляє файл разом із зашифрованим паролем). Наявність пароля — це наявність `password_enc` (без розшифрування). Угорі — поле фільтра, кнопка «New connection…» та попередження завантаження. Сторінка сама оновлюється після збереження чи видалення у формі.
-
-- Дії зі сторінки **не змінюють жодного файлу** (форма відкривається без цільового файлу). Після Delete файли з `-- @connection` на видалене підключення лишаються як є і показують червону випадайку (нічого не переписується за спиною).
-- Входи: пункт палітри «Connections», пункт «Connections…» у меню застосунку, «Manage connections…» у випадайці вибору підключення, кнопка у вкладці DB. Порожній список у випадайці показує дієвий пункт «New connection…».
-
-### Вибір бази даних
-
-- Друга випадайка справа від вибору підключення: `[● dev-pg ▾] [app ▾]`. Підпис — ефективна база файлу, а коли її не відомо — «(default)» (Postgres: база сервера за замовчуванням, тобто з іменем користувача; MySQL: жодна база не вибрана). Є лише коли в файлі вибрано підключення.
-- **Ефективна база файлу:** `-- @database <ім'я>` → `database` підключення → нічого (за замовчуванням сервера). У CLI: `--database` → `-- @database` → `database` підключення. Рядок «Default (<база підключення>)» у меню прибирає рядок `-- @database`.
-- Список баз читається з сервера **у фоні** (одноразова сесія підключення, не сесія файлу) і кешується на підключення (`schema_cache::key`) до кінця роботи застосунку; пункт «Refresh» читає знову. Читається, коли відкрито меню, а також одразу, щойно для файлу вибрано чи відновлено підключення (тому зазвичай список уже є до відкриття; поки його немає — «Loading…», а збій показується в меню текстом помилки). Лише доступні: Postgres — `SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY 1`; MySQL / MariaDB — `SHOW DATABASES`, системні (`information_schema`, `mysql`, `performance_schema`, `sys`) — в кінці, приглушені (`Session::databases()`, `db_exec::is_system_database`).
-- **Вибір бази — рядок `-- @database <ім'я>`** (`sql_split::set_database`): випадайка вставляє його одразу після `-- @connection` (інакше першим), міняє значення або, для «Default», прибирає — без запитань, правкою з undo. Зміна підключення у випадайці прибирає цей рядок; вписаний вручну `-- @connection` його не чіпає. У `state.json` вибору немає.
-- **Перемикання бази — нова сесія** (для обох драйверів, однаково): сесії ключуються `(файл, підключення, база)`, ключ — ефективна база; після перемикання сесії того ж файлу й підключення з іншою базою закриваються, а якщо в такій сесії відкрита транзакція — спершу питання «Commit / Rollback / Cancel». У `db-exec` нового API немає: `Connection::with_database(Some(база))` дає копію підключення з підміненою `database`, і `Session::open` відкриває її як завжди.
-- Схема (вкладка DB, автодоповнення) береться з вибраної бази: ключ кешу схеми — `Connection::fingerprint` копії з підміненою базою, тож у ключ входить база. Шапка вкладки DB — `підключення · база`, шапка результату — теж (`Done.database`). Смужка prod / read-only та їхні правила не змінюються.
-
-### Сесії
-
-- Одна сесія на трійку файл + підключення + база, живе, доки файл відкритий. Тому `SET`, тимчасові таблиці, `BEGIN … COMMIT` працюють між окремими Cmd+Enter, як у `psql`.
-- Режим autocommit за замовчуванням. Відкрита транзакція видно в шапці панелі (`TX ●`); закриття файлу, «Disconnect» і вихід із застосунку (Cmd+Q, кнопка закриття вікна) з відкритою транзакцією питають «Commit / Rollback / Cancel» (при виході — один діалог на всі файли; застосунок виходить після того, як `COMMIT` / `ROLLBACK` дійшов до сервера). Закриття файлу з незбереженими змінами й відкритою транзакцією — один потік: спершу друге закриття підтверджує відкидання змін, потім питання про транзакцію, і відповідь Commit / Rollback закриває файл (Cancel лишає його відкритим).
-- `read_only`: Postgres — `SET default_transaction_read_only = on`, MySQL — `SET SESSION TRANSACTION READ ONLY`. Захист робить сервер, а не наш парсер. **Крім того, на `read_only`-підключенні нічого, що пише, не виконується взагалі: клієнт відмовляє до відправки** (`DbError.refused`, CLI — код 4, `read_only_refused`, повідомлення на кшталт «Read-only connection: UPDATE is not allowed.»). Перевірка — по тексту інструкції (`sql_split::read_only_violation`, токени верхнього рівня, не парсер) у тому самому запобіжнику `db-exec`, тож її поділяють GUI, CLI і майбутній MCP. Дозволено: `Kind::Query` / `Kind::Read` (SELECT, WITH…SELECT, TABLE, VALUES, SHOW, DESCRIBE, EXPLAIN без ANALYZE від DML) і безпечні сесійні / транзакційні (`SET` крім `PASSWORD` / `GLOBAL` / `PERSIST`, `RESET`, `BEGIN` / `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`, `USE`, `LISTEN` / `UNLISTEN`). Відмовляє: `SELECT … INTO`, `SELECT … FOR UPDATE/SHARE`, WITH з DML, `EXPLAIN ANALYZE <DML>`, INSERT / UPDATE / DELETE / MERGE / REPLACE, DDL, GRANT / REVOKE, CALL, DO, COPY, LOAD DATA, LOCK, VACUUM / ANALYZE, REFRESH, PREPARE / EXECUTE, `DISCARD`, невідомі перші слова. Функції, що пишуть усередині SELECT, ця перевірка не бачить — їх зупиняє read-only сесія сервера. Це **безпечне значення за замовчуванням сесії, а не межа безпеки**: сесія може сама повернути запис. Дешевий запобіжник у `db-exec` відмовляє (`DbError.refused`, CLI — код 4, `read_only_refused`) на інструкціях, що вмикають read-write: `BEGIN` / `START TRANSACTION … READ WRITE`, `SET [SESSION] TRANSACTION … READ WRITE`, `SET [default_]transaction_read_only` / `tx_read_only`, `SET SESSION CHARACTERISTICS … READ WRITE`, `RESET ALL`, `DISCARD ALL`, `set_config('…transaction_read_only', …)`; це не повний захист (напр. `DO`-блок або функція все ще можуть). Для справжнього захисту — користувач БД лише з правами читання.
-- Таймаут з'єднання (`run.connect_timeout_ms`, типово 10 с) обмежує все встановлення з'єднання (TLS, рукостискання, `search_path` / `read_only` / `init_sql`) зовнішнім `tokio::time::timeout` у `Session::open_with` (`Session::open` бере 10 с); його ж використовують з'єднання скасування (`CancelHandle`) і автоматичне перевідкриття. sqlx 0.9 не має власного connect-таймауту в опціях Postgres / MySQL. Без відповіді — `DbError` з `connection_lost` (CLI код `2`) і текстом «No response from <host>:<port> within 10 s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306).» (для unix-сокета — «the server»). Типовий випадок — драйвер MySQL на порту Postgres: обидві сторони мовчки чекають одна одну. Драйвер Postgres на порту MariaDB падає одразу з помилкою sqlx («unexpected response from SSLRequest»). У формі підключення під час Test кнопка стає «Cancel» (перериває спробу, статус «Cancelled»); закриття діалогу теж перериває її.
-- Таймаут інструкції (`run.statement_timeout_ms`) тримає `Session::set_statement_timeout`: Postgres — `SET statement_timeout`, MySQL — `SET SESSION max_execution_time` (мс, лише `SELECT`), MariaDB (розпізнається з `SELECT VERSION()`) — `SET SESSION max_statement_time` (секунди, дробові). Застосовується при відкритті, при зміні налаштування й заново після автоматичного перевідкриття з'єднання.
-- Кілька результатів в одній інструкції (`CALL p()` у MySQL, кілька інструкцій в одному запуску Postgres): показується лише перший набір з рядками, у `notices` — «N more result sets not shown» (колонки й типи наступних наборів інші, тож їх не змішуємо).
-- Обірване з'єднання (I/O-помилка, `57P01`, `KILL CONNECTION`) перевідкривається автоматично при наступному запуску. Читальні інструкції (`Query` / `Read`) виконуються повторно один раз, у `notices` — повідомлення, що стан сесії втрачено. Інші (DML, DDL, `CALL`…) автоматично не повторюються, бо могли вже виконатися: повертається `DbError` з `connection_lost = true` («Connection was lost and reopened … may or may not have run»), а сесія вже відкрита для наступного запуску.
-- Стан транзакції sqlx назовні не віддає, тому `in_transaction` ведеться за виконаними `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` (у MySQL ще й DDL, що неявно комітить). Помилка всередині транзакції її не закриває. MySQL `SET autocommit = 0` теж рахується відкритою транзакцією (прапорець ведеться окремо; `SET autocommit = 1` його знімає).
-- Скасування (Esc) і закриття файлу мають «покоління» сесії: запуски, що стоять у черзі за іншим, не виконуються після Esc чи закриття файлу, а завершуються як «Cancelled». Хендл скасування належить сесії й після автоперевідкриття вказує на новий backend id (поки з'єднання перевідкривається, скасування нічого не робить: старий id міг бути перевикористаний).
-
-## Виконання запитів
-
-### Способи запуску
-
-| Дія | Що виконується |
-| --- | --- |
-| Cmd+Enter | Інструкція під курсором |
-| Cmd+Enter з виділенням | Рівно виділений текст (може бути кілька інструкцій) |
-| Кнопка «▶ Run» у шапці панелі результату | Інструкція під курсором |
-| Зелена ▶ у gutter біля першого рядка інструкції (як у Respite; червоний ■ — поки виконується, клік зупиняє) | Ця інструкція (курсор переходить на неї) |
-| Cmd+Shift+Enter | Усі інструкції файлу по черзі |
-| Cmd+Alt+L | Повторити останню |
-| Esc / Cmd+. | Скасувати активний запит |
-
-### Конвеєр виконання
-
-1. **Визначити інструкцію** за позицією курсора в останньому розбитті файлу.
-2. **Підтвердження**, якщо потрібно (інструкція, яку відмовляє запобіжник `read_only`, про підтвердження не питає — вона одразу падає помилкою в панелі результату, а пакет зупиняється за `run.stop_on_error`): на `prod`-підключенні питає кожна інструкція, що не є читанням (`Kind::Other` у `sql-split`: DML, DDL, `SELECT … INTO`, `FOR UPDATE`, `WITH` з DML, `EXPLAIN ANALYZE <DML>`, `SET`, `BEGIN`, `CALL`…; єдина функція `Kind::needs_prod_confirm`, спільна для GUI і CLI), а `SELECT` / `WITH … SELECT` / `TABLE` / `VALUES` / `SHOW` / `DESCRIBE` / `EXPLAIN` без `ANALYZE` виконуються без питання (діалог з текстом інструкції; для пакета чи виділення з кількох інструкцій — один діалог лише зі списком тих, що потребують підтвердження; якщо таких немає — діалогу немає; `-- @confirm` питає завжди). Повторне виконання того самого результату (сторінка, сортування, фільтр, «Count all») не питає знову. На не-prod підключенні: `-- @confirm`, а за `run.confirm_destructive = always` — ще `UPDATE` / `DELETE` без `WHERE`, `DROP`, `TRUNCATE`, `ALTER`. Підтвердження на prod — правило GUI і CLI; MCP-сервер матиме власні правила (рішення окреме), а спиратиметься на `read_only`.
-3. **Взяти сесію** (відкрити, якщо немає; виконати `init_sql`).
-4. **Класифікувати**: читальна інструкція (`SELECT`, `WITH … SELECT`, `TABLE`, `VALUES`, `SHOW`, `EXPLAIN`) чи ні.
-5. **Виконати**:
-   - читальна `SELECT`-подібна — загорнути для сторінки (див. «Пагінація»);
-   - решта — як є; результат — `N rows affected` або набір рядків, якщо інструкція його повертає (`RETURNING`, `SHOW`, `CALL`).
-6. **Прийняти результат**: колонки з типами, рядки першої сторінки, повідомлення сервера (`NOTICE`, warnings MySQL).
-7. **Зберегти** в історію.
-
-Помилка сервера показується в панелі результату (код SQLSTATE, повідомлення, `DETAIL`, `HINT`), а позиція помилки (Postgres повертає її) — підкресленням у редакторі.
-
-### Скасування
-
-sqlx не скасовує запит на сервері, тому при відкритті сесії запам'ятовується її id (`pg_backend_pid()` / `CONNECTION_ID()`), а Esc відправляє з окремого службового з'єднання `pg_cancel_backend(pid)` / `KILL QUERY id`. Сесія лишається живою.
-
-### Стан у редакторі
-
-- Редактор лишається чистим текстом: ні кнопок запуску, ні статусів у рядках (рішення з Respite).
-- Активна інструкція ледь виділена фоном і позначена смужкою в gutter.
-- Стан — у шапці панелі результату (`Running… 3.2 s`, «▶ Run» стає «◼ Stop») і біля інструкції в дереві сайдбару (кількість рядків або ✕).
-- Довгий запит не блокує UI; інший файл може виконувати свій запит паралельно. В одній сесії — по черзі.
-
-### Пакетне виконання
-
-Cmd+Shift+Enter і виділення з кількох інструкцій дають список результатів у панелі: по вкладці на кожну інструкцію з рядками (`Result 1`, `Result 2`, …) і зведення `N statements · M rows affected`. Перша помилка зупиняє пакет (налаштування `run.stop_on_error`).
-
-### Історія
-
-- Кожне виконання — в одній теці `~/.siesta/history/`, як у Respite: файл (абсолютний шлях), текст інструкції, підключення, база, час, тривалість, кількість рядків або змінених рядків або помилка. Самі дані результату не зберігаються (можуть бути великими й чутливими).
-  - Реалізація — `db_exec::history`, зроблена за зразком сховища історії Respite. На кожну інструкцію — свій файл `<id>.json`, де `id` — мітка часу UTC з наносекундами, тож сортування за іменем дає хронологію.
-  - Сторінка історії показує всі записи; файл — відносно центральної теки, а поза нею — лише ім'я.
-  - Зберігається `history.total` записів (500). Старіші видаляються під час запису, без читання самих записів.
-  - Записуються лише запуски, які зробив користувач (Cmd+Enter, Run all, Repeat last, Run з історії). Перехід між сторінками, сортування, фільтри й «Count all» не пишуться. Запуск, скасований до початку, теж не пишеться.
-  - Пишеться у фоні. `line` — рядок інструкції у файлі на момент запуску.
-  - **Поки лише GUI.** `siesta run` / `exec` в історію не пишуть (перевизначення `~/.siesta` для тестів уже є: `SIESTA_DATA_DIR`).
-- Сторінка історії (Cmd+Y, кнопка «History» поруч із «Settings» унизу бічної панелі, меню View → History, палітра «History») займає місце редактора, як у Respite; ще раз Cmd+Y або Close її закривають. Відкриття будь-якого файлу теж закриває сторінку.
-  - Колонки: час, підключення (і база), інструкція (перший рядок, пробіли стиснені), `файл:рядок`, результат (`N rows` / `N affected` / перший рядок помилки червоним), мс.
-  - Фільтр — усі слова мають знайтися в SQL, підключенні, базі, файлі чи результаті. Порядок — найновіші вгорі; сортування колонок немає.
-  - **Insert** (кнопка «+» або подвійний клік) відкриває **файл, де інструкцію записано**, — тож вона потрапляє під з'єднання того файлу, а не активної вкладки. Вставляє інструкцію з `;` після порожнього рядка під інструкцією під курсором цього файлу й ставить туди курсор; сторінка закривається.
-    - Якщо файлу вже немає, вставляє в поточний `.sql`-файл. Коли в того інше з'єднання, з'являється повідомлення «`<file>` is gone; inserted here. Recorded on `x`, this file uses `y`».
-    - Порожній рядок перед вставленим (і в «Insert SELECT» вкладки DB — вставка спільна, `insert_statement`) відділяє його від інструкції вище.
-  - **Run again** (▶) відкриває записаний файл і, якщо інструкція там ще є (той самий текст), ставить на неї курсор і виконує. Інакше вставляє її, як Insert, і виконує там. Підключення — як у будь-якого запуску: те, що зараз у файлу. Якщо воно інше, ніж записане, з'являється повідомлення «Recorded on `x`; runs on this file's connection `y`». Підтвердження для prod діють як завжди.
-
-## Панель результату
-
-Праворуч результат інструкції під курсором («Закріпити» фіксує один результат). Якщо інструкція ще не виконувалась — підказка «Cmd+Enter — виконати».
-
-### Шапка
-
-`12 rows` / `3 rows affected` · час · підключення (кольорова смужка `color`) · `TX ●`, якщо транзакція відкрита. Праворуч — «Копіювати», «Експорт», «Показати SQL сторінки» (фактично виконаний загорнутий запит).
-
-### Вкладки
-
-| Вкладка | Вміст |
-| --- | --- |
-| Result | Таблиця рядків (або `N rows affected`) |
-| Messages | `NOTICE` / warnings, помилка з `DETAIL` і `HINT` |
-| Query | Фактично відправлений SQL (з обгорткою сторінки, сортування, фільтрів) |
-
-### Таблиця
-
-- `DataTable` з `gpui-component`: віртуалізовані рядки й колонки, змінна ширина колонок, закріплений заголовок.
-- Заголовок колонки: лише назва; тип (`int8`, `jsonb`, `varchar(255)`) — у підказці при наведенні на заголовок і в заголовку попапу значення.
-- `NULL` — сірим курсивом, щоб не плутати з рядком `'NULL'`; числа вирівняні праворуч; довгий текст обрізається з `…`; JSON — компактно в один рядок; `bytea` / `BLOB` — `<1.2 KB binary>`; дати — ISO 8601 як повертає сервер.
-- **Перегляд JSON у рядках:** налаштування `results.json_preview_lines` (типово 0 — вимкнено: JSON-комірки однорядкові, як решта; N > 0 — увімкнено з N рядками) і кнопка `{ }` у шапці результату (на рівні сесії, не зберігається; початковий стан — з налаштування; при 0 кнопка вмикає 4 рядки; з'являється, лише коли в результаті є JSON-колонка або текстові комірки, що розбираються як JSON-об'єкт / масив). Коли ввімкнено, рядки таблиці стають достатньо високими на N рядків, а JSON-комірки малюють перші N рядків форматованого JSON моноширинним шрифтом (обрізані — з `…` в кінці останнього рядка); решта комірок лишаються однорядковими, вирівняними догори. Висоту рядка `DataTable` бере з елемента рядка (`TableDelegate::render_tr`) і міряє по першому рядку списку, тож публічного API досить, без патчів. Обрізання — чиста функція `format::json_preview`. JSON шукається в перших 200 рядках сторінки.
-- **JSON при наведенні:** наведення на JSON-комірку (тобто такі ж комірки, як вище) показує підказку з усім документом, відформатованим і підсвіченим (моноширинний шрифт, рядки не переносяться).
-  - Кольори беруться з теми редактора: ключі — `property`, рядки — `string`, числа — `number`, `true` / `false` — `boolean`, `null` — `constant`; розділові знаки без кольору. Розмічає рядки чиста функція `results::json_tokens`.
-  - Підказка до 640×420 px і прокручується в обидва боки.
-  - Вона лишається, поки курсор на ній (`hoverable_tooltip` з GPUI), тож її можна гортати.
-  - Подвійний клік (вікно значення) прибирає її одразу. Таку підказку GPUI від кліку не ховає, тож вона просто нічого не малює, поки відкритий будь-який діалог.
-  - Обмеження: показується до 2000 рядків, далі — рядок «… N more lines: double-click the cell for the whole value»; рядок довший за 4000 символів обрізається з `…`.
-  - Повний документ — у вікні значення (подвійний клік, Enter, Space).
-- Виділення комірок мишею й клавіатурою; Cmd+C копіює як TSV (вставляється в таблиці), «Копіювати як JSON» / «як INSERT» — у контекстному меню.
-
-### Повне значення в попапі
-
-Головна фіча для JSON-колонок. Клік (або Enter / Space) по комірці відкриває діалог:
-
-- JSON / JSONB / MySQL `JSON` і текст, що розбирається як JSON, — форматований, з підсвіткою та згортанням вузлів (той самий read-only редактор, що й тіло відповіді в Respite), фільтр JSONPath внизу (`$.items[*].id`).
-- Інший текст — як є, з переносом рядків; XML — з підсвіткою.
-- Бінарне — hex-дамп перших 4 КБ і «Зберегти у файл».
-- Заголовок попапу: `колонка · тип · рядок N`; кнопки «Копіювати», «Наступна / попередня комірка» (↑ / ↓ проходять по колонці).
-- Cmd+Shift+Enter у таблиці — увесь рядок як JSON-об'єкт у тому самому попапі.
-- Esc закриває; позиція в таблиці зберігається.
-
-### Пагінація
-
-- Розмір сторінки за замовчуванням 100 (`results.page_size`, `-- @page-size`).
-- Читальна інструкція загортається на сервері: `SELECT * FROM (<запит>) AS q LIMIT 101 OFFSET n` — сто перший рядок лише показує, що є наступна сторінка, без дорогого `count(*)`.
-- Знизу: `‹ 1 / ? ›`, вибір розміру сторінки, «Порахувати всього» (окремий `SELECT count(*) FROM (<запит>) AS q`, на вимогу).
-- Інструкції, які не можна загорнути (`SHOW`, `EXPLAIN`, `CALL`, DML з `RETURNING`), читаються потоком і обрізаються після `results.max_rows` (10 000) з попередженням.
-- Якщо в запиті вже є власний `LIMIT`, обгортка його поважає (зовнішній `LIMIT` діє всередині внутрішнього).
-- MySQL / MariaDB, проста сторінка (без фільтрів і сортування) і без `LIMIT` / `OFFSET` / `FETCH` верхнього рівня: обгортки немає, до самої інструкції дописується `LIMIT n OFFSET m` — MariaDB викидає `ORDER BY` підзапиту без `LIMIT`, і сторінки `SELECT … ORDER BY x DESC` приходили б невпорядкованими. (Верхній рівень визначається по токенах `sql-split`, тож рядки, коментарі й підзапити не плутають.) Коли обгортка неминуча (фільтри, чи власний `LIMIT`): із фільтрами, але без сортування користувача, внутрішній `ORDER BY` без `LIMIT` отримує ідіому `LIMIT 18446744073709551615`; сортування користувача зовні й так визначає порядок.
-- Колонки з однаковими іменами (`SELECT * FROM a JOIN b` з `id` в обох): у MySQL підзапит у `FROM` дає `42S21 Duplicate column name`, а фільтр / сортування за такою колонкою в Postgres — «ambiguous». Тому, коли обгортка потрібна (MySQL: завжди, коли її не можна замінити дописаним `LIMIT`; Postgres: фільтри й сортування), `db-exec` перед нею бере колонки з `prepare` і, знайшовши повтор, виконує інструкцію як незагортну: потоком, до `results.max_rows`, `Outcome.wrapped = false`, у `notices` пояснення. Сортування тоді локальне (позначка «local», як у незагортних), фільтри вимкнені, «Порахувати всього» відмовляє з поясненням.
-
-### Сортування
-
-- Клік по заголовку: ↑ → ↓ → без сортування; Shift+клік додає колонку (багатоколонкове).
-- Сортування робить сервер: `SELECT * FROM (<запит>) AS q ORDER BY "col" DESC LIMIT …`. Сортується весь результат, а не лише видима сторінка.
-- Для незагортних інструкцій (і запитів, виконаних без обгортки через повторні імена колонок) — сортування в пам'яті отриманих рядків з позначкою «локально».
-
-### Фільтр по колонках
-
-- Рядок фільтрів під заголовком (Cmd+Alt+F показує / ховає). Поле на кожну колонку.
-- Синтаксис поля: `foo` — містить (`ILIKE '%foo%'` / `LIKE`), `=42`, `!=0`, `>10`, `<=2026-01-01`, `null`, `!null`, `a,b,c` — `IN`. Для JSON-колонок — пошук по тексту (`::text`).
-- Фільтри теж ідуть на сервер як `WHERE` над обгорткою, значення — лише як параметри (`$1` / `?`), ніколи не конкатенацією.
-- Подробиці: `foo` екранує `%`, `_` (`LIKE … ESCAPE '|'`) і шукає по тексту колонки будь-якого типу; порівняння (`=`, `!=`, `>`…) у Postgres кастує параметр до типу колонки для чисел, дат і `bool` (`CAST($1 AS int8)`), інші типи (json, enum, масиви, текст) порівнюються як текст; у MySQL порівнюється сама колонка (сервер перетворює рядок-параметр), лише `JSON` — через `CAST(… AS CHAR)`. `!=` не повертає `NULL`-рядки. Булеве в MySQL — `=1` (рядок `true` сервер перетворює в 0). Порожнє поле, а також оператор без значення, ігноруються. `a,b,c` не вміє літеральних ком: для них — `=a,b`.
-- Активні фільтри видно в шапці (`2 filters ✕`), «Показати SQL сторінки» показує повний запит.
-
-### Експорт
-
-- Копіювати / зберегти результат як CSV, TSV, JSON, Markdown-таблицю, `INSERT`-и. «Увесь результат» перевиконує запит без пагінації й пише потоком у файл.
-
-### Редагування комірок
-
-Окрема кнопка **Edit** (олівець) у шапці результату `SELECT`-подібної інструкції (`Kind::Query`); повторний клік (або **Done** у смузі) виходить з режиму, з незбереженими змінами — спершу питає «Discard N unsaved changes?».
-
-- **Звідки колонки — каже сервер, не парсер** (`Session::source`, `db-exec/src/source.rs`): інструкція готується (`prepare`, не виконується) на сесії файлу, і опис рядка називає таблицю й колонку кожного поля — Postgres через OID таблиці й номер атрибута (`pg_attribute`), MySQL / MariaDB через `org_table` / `org_name`. Потім читається первинний ключ цих таблиць (Postgres — `pg_index.indisprimary`, MySQL — `information_schema.key_column_usage`, `PRIMARY`). Тож аліаси (`SELECT p.note AS n FROM t p`) і `JOIN` працюють; вирази, агрегати й похідні таблиці колонкою таблиці не вважаються.
-- Редагувати можна колонки таблиці, увесь первинний ключ якої є в результаті (`edit::plan`); повтор тієї самої колонки — лише читання. Решта колонок у режимі редагування мають приглушений заголовок, а смуга під шапкою пише «Editing public.users (key id) · double-click a cell to change it» і чому решта read-only.
-- **Якщо ключ не вирахувати — так і кажемо**: смуга «Can't edit: …» з причиною — «public.v has no primary key» (в'юха чи таблиця без ключа), «the primary key column `id` of public.users is not in the result», «the columns don't come from a table…», read-only підключення, помилка сервера при `prepare`.
-- **Редагування на місці:** подвійний клік / Enter / Space на редагованій комірці перетворює її на поле просто в таблиці (значення виділене; у NULL-комірці поле порожнє з підказкою `NULL`). **Поки поле відкрите, клавішами з комірки не вийти**: ↑ / ↓ / Tab / Shift+Tab нічого не роблять, ← / → лише рухають курсор у тексті. Вийти можна тільки так: **Enter** лишає значення й закриває поле на тій самій комірці (Enter — перемикач: відкрити / закрити), **Esc** скасовує, **клік мишею** по іншій комірці (чи будь-яка зміна виділення таблиці, чи вихід фокусу з поля) лишає значення й закриває поле. Фокус повертається таблиці. Реалізація: клавіші приходять як дії прив'язок (вони виконуються раніше за `key_down`) — поля (`MoveUp`, `IndentInline`…), таблиці (`SelectUp`, `SelectNextColumn`…, коли поле пропускає стрілку далі) чи нашого keymap (`OpenCell` на Enter); обгортка комірки між таблицею й полем ловить їх у фазі capture (`results::edit_keys`), а `OpenCell` при відкритому полі лише закриває його. Поле без власної рамки й тла: комірку, що редагується, видно лише за рамкою виділеної комірки й курсором. Порожнє поле NULL-комірки, якого не чіпали, лишається NULL. Контекстне меню в режимі редагування: **Set cell to NULL** і **Revert cell** для виділеної комірки. **Великі значення редагуються в окремому вікні** (80 % ширини, до 1200 px; редактор на 55 % висоти, прапорець **NULL**, **Set** / Cancel; `edit::big`): JSON (значення чи колонка `json` / `jsonb` / `JSON`) — відформатований, з підсвіткою, і порівнюється за змістом, тож саме переформатування не є зміною; memo — текст із переносами рядків або довший за 200 символів (`edit::MEMO_CHARS`); blob (`bytea`, `*BLOB`, `*BINARY`) — розмір і hex-дамп перших 4 КБ лише для читання, **Load from file…** замінює значення байтами файлу, **Save to file…** зберігає поточні. Зміни не йдуть на сервер одразу: комірка показує нове значення з жовтим тлом, смуга — «N changes», **Discard** і **Save…**. Значення, повернене до початкового, перестає бути зміною.
-- **Save…** будує `UPDATE <схема>.<таблиця> SET … WHERE <ключ> = <старе значення>;` — один на рядок і таблицю (`edit::update_sql`), відформатований: `SET`, кожне присвоєння й кожна умова ключа з нового рядка. Нові значення — рядкові літерали (тип перетворює сервер), байти — hex-літерал (Postgres `'\x…'`, MySQL `X'…'`), `NULL` — `NULL`, ключ — літерал свого типу; рядок із `NULL` у ключі (зовнішній `JOIN`) — помилка в смузі. Підтвердження — велике вікно (80 % ширини, до 1200 px): заголовок «Update N rows on <підключення>?» (на prod — «on PRODUCTION», кнопка червона), SQL у редакторі лише для читання з підсвіткою синтаксису і пошуком, під ним — як він виконається (транзакція). Лише після **Update** він виконується на сесії файлу.
-- Без відкритої транзакції UPDATE-и йдуть в одній власній (`BEGIN` … `COMMIT`); кожен має змінити рівно один рядок (MySQL рахує знайдені, а не змінені рядки), інакше `ROLLBACK` і в смузі «… changed 0 rows, not 1. Rolled back: nothing was saved.». У відкритій транзакції користувача вони просто виконуються в ній, комітить користувач. Після успіху — «Updated N rows», сторінка перечитується. Виконані UPDATE-и йдуть в історію.
-- Зміни належать рядкам на екрані: поки вони є, сторінка, сортування й фільтр не міняються («Save or discard the N pending changes first»); новий запуск інструкції їх скидає.
-
-### Великі значення
-
-- Рядок сторінки приходить повністю, а таблиця малює лише перші `results.cell_preview_kb` (8 КБ) значення. Попап бере повне значення з уже отриманого рядка, без повторного запиту.
-
-## Редактор і навігація
-
-### Підсвітка синтаксису
-
-- Граматика `tree-sitter-sql` (feature `tree-sitter-sql` у `gpui-component`) — та сама система підсвітки й ті самі теми, що в Respite. Ролі: ключове слово, функція, тип, рядок, число, коментар, оператор, ідентифікатор у лапках, параметр.
-- Директиви `-- @…` підсвічуються окремо від звичайних коментарів (роль `attribute`): власний `InputHighlighter` огортає публічний `SyntaxHighlighter` (адаптер редактора приватний). Розбір — повний і синхронний на кожну правку, без фонового; згортання блоків поки немає.
-- Теми: світла і темна, JSON у стилі Zed (спільний формат із Respite).
-
-### Автодоповнення
-
-Ctrl+Space або автоматично під час набору; нечіткий пошук.
-
-| Контекст | Що пропонується |
-| --- | --- |
-| Початок інструкції | Ключові слова (`SELECT`, `INSERT INTO`, `UPDATE`, `WITH`…) і шаблони |
-| Після `FROM`, `JOIN`, `INTO`, `UPDATE` | Таблиці та в'юхи зі схеми активного підключення (схема — префіксом) |
-| Після `alias.` або `таблиця.` | Колонки цієї таблиці з типом |
-| У `SELECT`, `WHERE`, `ORDER BY` | Колонки таблиць з `FROM` цієї інструкції, функції діалекту |
-| Після `-- @` | Директиви з описом |
-
-Контекст визначає чиста функція `complete::complete(текст, курсор, діалект, схема)` (`crates/app/src/complete.rs`): токен-скан інструкції під курсором (за межами рядків, коментарів, `$$`, лапок), не парсер. Аліаси беруться з `FROM` / `JOIN` / `UPDATE` / `INTO` усієї інструкції (`FROM t AS x`, `FROM t x`, `FROM a, b`, `schema.t`), тож `SELECT x.| FROM t x` працює, хоч `FROM` стоїть після курсора. Деталі:
-
-- Схема-префікс (`analytics.events`) — лише коли схем кілька і ця не за замовчуванням (Postgres: перша в `schema` підключення / `search_path`, інакше `public`; MySQL — база підключення). Назва, що потребує лапок (великі літери в Postgres, зарезервоване слово, пробіл), вставляється з лапками.
-- Усередині незакритих `"…"` / `` `…` `` пропонуються лише таблиці й колонки, лапка дозакривається.
-- У рядку, `$$` і коментарі — нічого, крім `-- @` (директиви працюють і без підключення). Після `FROM t` / `FROM t x` — продовження (`WHERE`, `JOIN`…); у списку колонок `INSERT INTO t (` — лише колонки.
-- Нечіткий пошук: префікс, потім початок слова (`uo` → `user_orders`), потім підрядок, потім розкидані літери; точний збіг не пропонується. Меню відкривається літерами, `.`, `@`, `-`, лапками; `-` відкриває лише директиви.
-- Без схеми (ще не прочитана) пропонуються тільки ключові слова, функції й директиви.
-
-Схема (схеми, таблиці, колонки, типи) читається з `information_schema` у фоні **одразу, щойно для файлу вибрано підключення** (також коли вибір відновлено при повторному відкритті; для цього у фоні відкривається сесія файлу; раз за запуск застосунку на підключення) і кешується в пам'яті та в `~/.siesta/cache/<підключення>-<хеш>.json` (один файл на підключення для всіх робочих тек: ключ уже визначає сервер), де хеш — FNV-1a від ефективного підключення (драйвер, url без пароля, host, port, database, user; `Connection::fingerprint`), тож підключення, перестворене під тим самим іменем, але з іншим сервером, не підхоплює стару схему; при відкритті файлу / виборі підключення кеш з диска підхоплюється одразу, свіжа схема його замінює. Після успішної інструкції, що змінює схему (`CREATE`, `ALTER`, `DROP`, `RENAME`, `TRUNCATE`, `COMMENT ON`; визначає `sql_split::is_schema_changing` за токенами верхнього рівня, `EXPLAIN` без `ANALYZE` не рахується), схема перечитується сама; «Refresh Schema» — кнопка у вкладці DB, пункт меню Run і палітра команд — лишається для ручного оновлення. Кнопки «Load schema», що чекала першого запуску, більше немає. API: `Session::schema()` → serde-серіалізований `Schema` (схеми → таблиці / в'юхи → колонки з типом, `nullable`, `primary_key`, `ordinal`, індекси з колонками й `unique`), `Session::table_ddl(схема, таблиця)`. Postgres: усі схеми, крім `pg_catalog`, `information_schema` і `pg_*`; індекси з `pg_index` (в `information_schema` їх немає). MySQL: поточна БД, а без неї — усі несистемні. `information_schema` показує лише об'єкти, до яких користувач має права.
-
-### Діагностика
-
-- Помилка сервера з позицією — червоне підкреслення в редакторі до наступного редагування.
-- Незакритий рядок / коментар / `$$` — підкреслення на льоту (від розбиття на інструкції).
-- `UPDATE` / `DELETE` без `WHERE` (на верхньому рівні, теж `WITH … DELETE` і `EXPLAIN ANALYZE …`) — жовте підкреслення першого слова: `sql-split` повертає діагностику `Warning` на основі `destructive_reason`, редактор показує її, як і решту діагностик (CLI друкує такі попередження в stderr).
-- Повний SQL-лінтер — не мета: синтаксис перевіряє сервер.
-
-### Форматування
-
-Shift+Alt+F — форматувати інструкцію під курсором (або виділення): ключові слова великими, переноси перед `FROM`, `WHERE`, `JOIN`. Бібліотека — `sqlformat`.
-
-### Навігація між файлами
-
-Як у Respite: **проєктних тек немає**. Вкладка Files бокової панелі — дві секції, у дереві **лише `.sql`** і теки:
-
-- **COLLECTIONS** — центральна тека `~/.config/siesta/collections` з підтеками, як `~/.config/respite/collections` у Respite (`siesta_settings::collections_dir_in`; `siesta_workspace::scan`: теки й `.sql`, з `.gitignore`, без прихованих; порожня тека теж видна). Налаштування, keymap і `connections/` лежать поруч у `~/.config/siesta`, тож у дерево не потрапляють. Тека створюється при запуску. Кнопки в заголовку секції (завжди) і на рядку теки (при наведенні, з підказками): **Import Files…** (Lucide `file-down`, у ряд із `file-plus` / `folder-plus`: вибрані `.sql` копіюються в теку; ім'я, що вже є, пропускається, ніколи не перезаписується; інші файли — сповіщення «Not imported»; перший відкривається), **New File** (`file-plus`) і **New Folder** (`folder-plus`). Ім'я питає діалог застосунку, а не системний діалог збереження: macOS не відкриває його в прихованій `~/.config`. `.sql` додається, якщо його немає; наявний файл лише відкривається, не обнуляється; ім'я з `/`, `\` чи з крапкою на початку відхиляється. Новий файл відкривається.
-- **Кошик** (`trash`, при наведенні на файл чи теку COLLECTIONS) спершу питає («Move “x.sql” to the Trash?», для теки — «Everything in it goes too») і переносить у системний Кошик (крейт `trash`, як у Respite); незбережену вкладку чи вкладку з відкритою транзакцією спершу треба зберегти / завершити. Вкладки з того, що пішло в Кошик, закриваються, вибір підключення забувається.
-- **Перейменування** файлу чи теки: олівець «Rename…» при наведенні (на файлах і теках COLLECTIONS та на доданих файлах FILES), пункт File → Rename File…, команда палітри «Rename File…» і **F2** — останні три працюють із файлом поточної вкладки. Діалог «Rename File» / «Rename Folder» (той самий `ask_name`, що й у New File) з поточним іменем; файл показується **без `.sql`** (розширення завжди те саме, тож у полі його нема; так само в «New File»: типово `query`), усе ім'я виділено. Ім'я обрізається по краях; порожнє, з `/` чи `\` або з крапкою на початку — «Invalid name»; `.sql` дописується в кінець, якщо його ще нема (крапка всередині імені, як у `report.2024`, — частина імені: виходить `report.2024.sql`; як у New File); те саме ім'я — нічого не робить. **Нічого не перезаписується**: якщо цільове ім'я існує, перейменування відхиляється («Not renamed»), крім перейменування лише регістру того самого файлу (однакове ім'я без урахування регістру й той самий dev/inode, як на APFS). Відхиляється й тоді, коли в будь-якій зачепленій вкладці (для теки — в усіх під нею) відкрита транзакція («End the transaction in x.sql first.») або виконується інструкція («x.sql is running a statement. Stop it first.»). Після `fs::rename` вкладки **перейменовуються на місці**: порядок вкладок і активна вкладка не змінюються, незбережений буфер зберігає текст і зберігається вже в нове ім'я; разом з вкладками переходять результати, останній запуск, закріплений результат, стан редагування результату, структура (outline), розгорнуті рядки, згорнуті теки, порядок Ctrl+Tab і додані файли (`files.json`); записи історії зі старим шляхом переписуються на новий; сесії БД цього файлу закриваються (наступний запуск перепідключається). Файл, якого ще нема на диску (зразок `untitled.sql`), лише міняє шлях вкладки. Після цього дерево перечитується, `state.json` зберігається. Не охоплено: фонове завантаження схеми, що саме йде для файлу.
-- **FILES** — `.sql` звідусіль: «+» у заголовку (і File → Add Files…, Cmd+O) — системний діалог із вибором кількох; перетягування з Finder на вікно робить те саме (`on_drag_move` + mouse up, бо `on_drop` GPUI губить перетягування після клавіатурного вводу — як у Respite). Не-`.sql` — сповіщення, файл із центральної теки чи вже доданий не дублюється. «×» прибирає зі списку, файл, вкладка й історія лишаються. Список — `~/.siesta/files.json`; файли, яких уже немає, випадають.
-
-Файл розгортається у список інструкцій (`@name` або перший рядок; понад 20 інструкцій одного файлу прокручуються у власному блоці висотою 20 рядків, щоб довгий файл не відсував решту дерева), клік — стрибок, подвійний клік — стрибок + виконання. Cmd+P — пошук файлу (центральна тека й додані), Ctrl+Tab — нещодавні, вкладки відкритих файлів, перечитування при зміні на диску: як у Respite, раз на секунду опитуються mtime відкритих файлів, `settings.json`, `keymap.json` і файли `~/.config/siesta/connections/` (`notify` і `nucleo` не потрібні; пошук файлу — підрядок, інакше розкидане співпадіння); дерево перечитується після збереження, імпорту, створення та Кошика. Відносні шляхи (палітра, історія) рахуються від центральної теки. Запуск: `siesta [файл[:рядок]]` відкриває файл (і додає його у FILES, якщо він поза центральною текою); тека як аргумент — підказка в stderr; без аргумента — відновлені вкладки, а без них — перший файл або зразок `untitled.sql` у центральній теці (пишеться лише при збереженні; рядок `-- @connection` у ньому — лише коли є з’єднання, з першим за назвою).
-
-**Де що зберігається.** Свідомо дві теки з однією роллю кожна, як у Respite; нічого не пишеться в обидві. Кожен шлях будується від одного хелпера на теку: `siesta_settings::config_dir()` (`SIESTA_CONFIG_DIR`) і `siesta_settings::data_dir()` (`SIESTA_DATA_DIR`).
-
-- `~/.config/siesta/` — лише те, що пише користувач (або форма / сторінка налаштувань від його імені): `settings.json`, `keymap.json`, `connections/` і `collections/` (власні `.sql`, з підтеками — центральна тека). Можна тримати в dotfiles-репозиторії.
-- `~/.siesta/` — лише те, що Siesta пише сама: `state.json`, `files.json`, `history/`, `cache/`, `key`. Ніколи не для dotfiles: тут ключ паролів, повний текст виконаного SQL і структура баз.
-  - `state.json` — `WorkspaceState`: відкриті вкладки з курсорами й активна вкладка (підключення й база файлу — його директиви, тут їх немає; старі формати читаються як порожній стан);
-  - `files.json` — файли, додані ззовні (секція FILES);
-  - `history/<id>.json` — історія виконань; `cache/<підключення>-<хеш>.json` — кеш схем; `key` — ключ паролів.
-- У самих проєктах Siesta нічого не тримає: шару налаштувань теки (`.siesta/settings.json`) немає.
-
-Відновлення стану: відкриті вкладки, позиція курсора й активна вкладка зберігаються в `~/.siesta/state.json` (підключення й база — у самих файлах); розташування розділювача — `split` / `split_ratio` у `settings.json`.
-
-### Вкладка DB
-
-Дерево активного підключення: схеми → таблиці / в'юхи → колонки (тип, `PK`, `NOT NULL`), індекси. Дії над таблицею:
-
-- подвійний клік — вставити в редактор `SELECT * FROM таблиця;` після порожнього рядка під інструкцією під курсором (їй, якщо вона без `;`, додається `;`, щоб не злипнутися) і виконати; назва з префіксом схеми й лапками за правилами автодоповнення;
-- «Copy DDL» у контекстному меню (Postgres — збирається з каталогу; MySQL — `SHOW CREATE TABLE`) — у буфер, на сесії файлу;
-- «Insert name» — назва замінює виділення (або йде в позицію курсора).
-
-Подвійний клік по **колонці** (одинарний нічого не робить) додає її в список полів `SELECT` під курсором (лапки — за правилами автодоповнення):
-
-- `SELECT *` стає `SELECT колонка`; інакше в кінець списку (перед `FROM` / `WHERE` / … верхнього рівня) дописується `, колонка`; колонка, що вже є в списку, вдруге не додається.
-- Межі списку знаходить `sql_split::select_list` (лише простий `SELECT`; `WITH …` і решта — ні).
-- Під курсором не `SELECT` (або нічого) — назва колонки замінює виділення чи йде в позицію курсора.
-
-Одинарний клік розгортає / згортає (схема відкрита, таблиця закрита за замовчуванням). Поле пошуку, як у Files: підрядок у назві таблиці (`схема.таблиця`) залишає її закритою, збіг у назві колонки — розгортає таблицю з цими колонками. Порожні стани: немає файлу / підключення; схема ще не завантажена (кнопка «Load schema»); завантаження; помилка (текст і «Retry»). Старий кеш лишається видимим, поки читається нова схема.
-
-### Навігація між інструкціями
-
-- Cmd+Shift+O — пошук інструкції в поточному файлі; Cmd+T — по всій робочій теці.
-- Alt+↑ / Alt+↓ — до попередньої / наступної інструкції.
-
-## CLI і агент
-
-Один бінарник: GUI, CLI і MCP (`siesta mcp`) поверх одного ядра, як у Respite.
-
-| Команда | Дія |
-| --- | --- |
-| `siesta` або `siesta open [шлях[:рядок]]` | Відкрити GUI |
-| `siesta list <файл\|тека>` | Інструкції: файл, рядок, ім'я, перший рядок |
-| `siesta run <файл> [інструкція…]` | Виконати інструкцію(ї) або весь файл |
-| `siesta exec -c <підключення> '<sql>'` | Виконати SQL з аргументу або stdin |
-| `siesta connections [list\|test <ім'я>]` | Підключення з теки конфігурації (секрети масковані, колонка `password`: `set` / `none`), перевірка з'єднання |
-| `siesta connections databases <ім'я>` | Бази на сервері підключення, доступні його обліковим даним (колонка `name`; Postgres — як у GUI, MySQL — `SHOW DATABASES`, системні в кінці) |
-| `siesta connections set-password <ім'я>` | Зашифрувати пароль підключення в `password_enc` його файлу: прихований запит у терміналі, а в пайпі — один рядок зі stdin (порожній або невідоме підключення — код 3; збій шифрування — код 2) |
-| `siesta schema -c <підключення> [таблиця]` | Таблиці / колонки (для агента, щоб писав правильний SQL) |
-
-Інструкція адресується `@name` (`@` необов'язкова), номером рядка (`:42` — будь-який рядок інструкції; рядок між інструкціями належить попередній, як курсор у редакторі) або порядковим номером (`#3`, з 1).
-
-Прапорці `run` / `exec` / `schema`: `-d, --database <база>` — база на сервері підключення (пріоритет: прапорець > `-- @database` у файлі (лише `run`) > `database` підключення > за замовчуванням сервера). Прапорці `run` / `exec`: `-c, --connection`, `--output table|json|jsonl|csv` (`table` у терміналі, `json` у пайпі), `--max-rows` (за замовчуванням 100, `0` = `results.max_rows`, який також є верхньою межею), `--yes` (пропустити підтвердження), `--read-only` (примусово, захищає сервер). `schema` має `--ddl` (текст `CREATE TABLE`). `exec` і `schema` потребують `-c`. Підключення береться з `~/.config/siesta/connections/` (або `SIESTA_CONFIG_DIR`), а не з поточної теки.
-
-Вибір підключення: `-c` > `-- @connection` у файлі > помилка (код 3). Діалект розбиття береться з вибраного підключення.
-
-Підтвердження: на підключенні з `"prod": true` кожна інструкція, що не є читанням (`Kind::Other`), потребує `--yes` (без термінала — код 4 з `confirmation_required`; у терміналі `[y/N]`); читання (`SELECT`, `SHOW`, `EXPLAIN` без `ANALYZE` тощо) виконуються без `--yes`; це діє навіть за `run.confirm_destructive = never`. Окрім того, `-- @confirm`, а за `run.confirm_destructive = always` — `UPDATE` / `DELETE` без `WHERE`, `DROP`, `TRUNCATE`, `ALTER` (`prod` у цьому налаштуванні означає той самий прапорець, тож для не-prod підключень нічого не додає). Підтвердження на prod — правило GUI і CLI; MCP-сервер матиме власні правила (рішення окреме), `read_only` — те, на що він спиратиметься. Усі потрібні підтвердження перевіряються до виконання, тож пакет не виконується наполовину. Без термінала CLI не питає: код 4, якщо немає `--yes`; у терміналі питає `[y/N]`. Перевірка деструктивності — по токенах верхнього рівня (перше слово, `WITH … DELETE` / `UPDATE`, крізь `EXPLAIN ANALYZE`), не парсер; справжній захист — `read_only` на сервері, а ще надійніше — користувач БД лише з правами читання (`read_only` не межа безпеки: див. «Сесії»). Запобіжник `read_only` відмовляє в перемиканні сесії на read-write і в усьому, що пише (код 4, `read_only_refused`; також для `--read-only`); усі інструкції пакета перевіряються до виконання, ще до підтверджень. Пароль у `url` — і в `user:password@`, і в `?password=` — маскується в `connections` і попередження «literal password in public file» його ловить.
-
-Коди виходу: `0` — успіх; `2` — помилка з'єднання (не підключилось, автентифікація, обрив); `3` — помилка розбору, невідоме підключення / інструкція / таблиця, не вибрано підключення, неправильні аргументи; `4` — відмова (потрібне підтвердження без `--yes`, або запобіжник `read_only`); `5` — помилка SQL на сервері. Кілька інструкцій: перша помилка зупиняє виконання (`run.stop_on_error`), код — цієї помилки; з `stop_on_error = false` виконання триває, а код — теж першої помилки.
-
-Кілька інструкцій у JSON: `json` — масив об'єктів (для однієї — сам об'єкт, як у Respite), `jsonl` — об'єкт на рядок. Помилка інструкції — об'єкт з `error` замість полів результату; помилка до виконання (коди 2, 3, 4) — `{"error": {"code", "message", "file", "line", "hint"}}`. У CSV `NULL` — порожнє поле, у таблиці — `NULL`, довгі комірки обрізаються до 60 символів.
-
-```json
-{
-  "schema": "siesta.run/v1",
-  "file": "reports.sql", "statement": { "name": "users_by_day", "line": 12 },
-  "connection": "dev-pg", "database": "app",
-  "columns": [ { "name": "id", "type": "int8" }, { "name": "payload", "type": "jsonb" } ],
-  "rows": [ [1, { "ip": "10.0.0.1" }] ],
-  "rows_truncated": false, "rows_affected": null, "duration_ms": 38, "notices": []
-}
-```
-
-`database` — ефективна база (прапорець, директива або `database` підключення), `null`, коли жодної не задано (тобто за замовчуванням сервера). `error` (замість `columns` … `notices`): `{"code": "sql_error" | "connection_lost", "sqlstate", "message", "detail", "hint", "position"}`. `siesta schema --output json`: `{"schema": "siesta.schema/v1", "connection", "schemas": [{"name", "tables": [{"name", "kind", "columns": [{"name", "data_type", "nullable", "primary_key", "ordinal"}], "indexes": [{"name", "columns", "unique", "primary"}]}]}]}`; для таблиці — `{"schema": "siesta.schema/v1", "connection", "table": {…, "ddl"?}}`.
-
-JSON / JSONB у виводі — вкладені JSON-значення, а не рядки. Агентський skill — `skills/siesta/SKILL.md`, як у Respite.
-
-## Архітектура
-
-Cargo workspace з ядром без залежності від GUI.
-
-| Крейт | Відповідальність | Ключові залежності |
-| --- | --- | --- |
-| `sql-split` | Розбиття файлу на інструкції з позиціями (діалекти PG / MySQL, `$$`, `DELIMITER`), директиви, класифікація читальна / ні | ручний лексер |
-| `db-conn` | Файли підключень (`connections/<ім'я>.json`), `${env:}`, зашифровані паролі (`crypto`, ключ `~/.siesta/key`), маскування секретів | `siesta-settings` (теки), `serde_json`, `chacha20poly1305`, `getrandom`, `base64` |
-| `db-exec` | Сесії, виконання, обгортка сторінки / сортування / фільтру, скасування, конвертація типів у `Value`, історія, кеш схеми | `sqlx` 0.9 (`postgres`, `mysql`, `runtime-tokio`, `tls-rustls`, `json`, `chrono`; без `uuid` / `rust_decimal`: Postgres читається як текст), `tokio` |
-| `workspace` (`siesta-workspace`) | Центральна тека (`scan`: теки й `.sql`, з `.gitignore`), додані файли (`~/.siesta/files.json`), збережений стан UI (`~/.siesta/state.json`: відкриті файли, курсори). Без GUI | `ignore`, `serde_json` |
-| `settings` (`siesta-settings`) | Глобальні й робочої теки `settings.json` (окремий крейт, як `respite-settings`: потрібен і `app`, і `cli`) | `serde`, `serde_json` |
-| `app` (GUI) | Вікно, сайдбар (Files / DB), редактор, панель результату, попап значення | `gpui`, `gpui-component` (`tree-sitter-sql`, `DataTable`, `Pagination`) |
-| `cli` | Команди, вивід, коди виходу | `clap` |
-
-Каркас GUI (центральна тека й додані файли, сайдбар, вкладки, теми, налаштування, відновлення стану, бандл `.app`) береться з Respite копіюванням, а не спільним крейтом: два продукти розвиваються незалежно. Спільний крейт виносимо, лише коли третє місце захоче того самого.
-
-### Типи даних
-
-Усе з бази перетворюється в один enum для таблиці, CLI і попапу:
-`Null | Bool | Int(i64) | Decimal(String) | Float(f64) | Text(String) | Json(serde_json::Value) | Bytes(Vec<u8>) | DateTime(String) | Other { type_name, text }`.
-Невідомий тип (PostGIS, enum, `interval`, `inet`) — `Other` через текстове представлення сервера, щоб нічого не падало. Масиви Postgres показуються як JSON-масив.
-
-Як це зроблено:
-- **Postgres** читається простим протоколом (`raw_sql`), де кожне значення вже текст; `db-exec` розбирає текст за назвою типу (`int8`, `jsonb`, `bytea` → hex, масиви → JSON). Імена типів, яких sqlx не знає (enum, розширення), беруться з `pg_type` з кешем на сесію. Зі сторінкою з фільтрами потрібні bind-параметри, а це розширений (бінарний) протокол, тому зовнішній `SELECT` кастує кожну колонку в `::text` (колонки й типи з `prepare` внутрішнього запиту), і далі той самий розбір. Побічний ефект: `char(n)` у відфільтрованій сторінці без хвостових пробілів.
-- **MySQL / MariaDB** декодується за типом колонки через sqlx (текстовий і бінарний протоколи однаково). MariaDB віддає `JSON` як `LONGTEXT` із колацією `utf8mb4_bin`, яку sqlx через прапорець `BINARY` називає `BLOB`; тому текстоподібні колонки (будь-яка колація, крім справжнього `binary` — це перевіряє `<String as Type<MySql>>::compatible`) декодуються як `Text`, а не `Bytes`. Евристика (`value::mysql_text`): `Text`, чий обрізаний вміст починається з `{` або `[` і розбирається як JSON, стає `Value::Json` (отже, і `VARCHAR`, що просто містить JSON, теж; `ENUM` / `SET` ні). Справжній `JSON` MySQL уже відображається як `Json`; бінарні `BLOB` / `VARBINARY` лишаються `Bytes`. У GUI і в CLI (вкладений JSON у `--output json`) MariaDB-`JSON` виглядає як JSON; інтеграційні тести — `json_text_and_bin_collation_are_text_binary_stays_bytes` і `mariadb_json_column_is_nested_json`.
-- `Value::to_json()`: `Decimal` і `DateTime` — рядки (без втрати точності), нескінченні `Float` — рядки, `Bytes` — hex-рядок без префікса.
-
-### Стан і потоки
-
-- GPUI `Entity`: `Workspace`, `Buffer` на файл (rope + останнє розбиття), `SessionStore` (сесії за ключем файл + підключення + база), `ResultStore` (результат за ключем файл + інструкція), `SchemaCache` (`schema_cache.rs`: схема за ключем підключення — ім'я + хеш ефективного підключення — в `Rc<RefCell<…>>`, спільна з провайдерами автодоповнення всіх редакторів; читання схеми — задача на сесії файлу в tokio, збереження в `~/.siesta/cache` робить вона ж). Підтвердження небезпечних інструкцій (`sql_split::destructive_reason` / `is_destructive`) спільне для GUI і CLI.
-- `sqlx` потребує tokio: окремий потік із tokio-runtime, GUI шле задачі через канал і отримує події (`Started`, `Columns`, `Page`, `Done`, `Failed`) через `cx.spawn` — той самий патерн, що в Respite.
-- Перемикання сторінки, сортування й фільтр — новий запит у тій самій сесії; поки він іде, видно попередню сторінку з індикатором.
-
-### Тестування
-
-- `sql-split`: таблиця кейсів (рядки, коментарі, `$$`, `DELIMITER`, CRLF) з `assert_eq!`, без snapshot-бібліотек (як у Respite).
-- `db-exec`: юніт-тести чистих частин (обгортка, синтаксис фільтра, розбір типів) і інтеграційні тести на Postgres 17 і MariaDB 11 через `docker-compose.yml` (порти 25432 і 23306); запуск — `scripts/test-db.sh` (контейнери лишаються, `--down` їх зупиняє). Тести позначені `#[ignore]` і читають `SIESTA_TEST_PG_URL` / `SIESTA_TEST_MYSQL_URL`. Покрито конвертацію кожного типу, сторінки, сортування, фільтри, `count`, DML, скасування й перепідключення. MySQL 8 у CI не перевіряється (різниця лише в `JSON`).
-- `cli` (`siesta-cli`): юніт-тести адресації інструкцій, форматів виводу (таблиця / json / jsonl / csv, вкладений JSON), кодів виходу, перевірки деструктивності, маршрутизації аргументів (`is_cli`) і `skill_covers_cli` (падає, якщо в `skills/siesta/SKILL.md` бракує команди, довгого прапорця, директиви чи коду виходу); інтеграційні `#[ignore]`-тести `run` / `exec` / `schema` / `connections test` на Docker Postgres і MariaDB (`scripts/test-db.sh` запускає їх разом з `db-exec`).
-- GUI: `#[gpui::test]` для навігації, таблиці, попапу.
-
-## Гарячі клавіші, налаштування, дорожня карта
-
-### Гарячі клавіші (macOS; на Linux Cmd → Ctrl)
-
-| Дія | Клавіші |
-| --- | --- |
-| Виконати інструкцію / виділення | Cmd+Enter |
-| Виконати весь файл | Cmd+Shift+Enter |
-| Повторити останню | Cmd+Alt+L |
-| Скасувати | Esc / Cmd+. |
-| Попередня / наступна інструкція | Alt+↑ / Alt+↓ |
-| Підключення | Cmd+Alt+E |
-| Повне значення комірки / рядок як JSON | Enter / Cmd+Shift+Enter (у таблиці) |
-| Фільтри колонок | Cmd+Alt+F |
-| Наступна / попередня сторінка | Cmd+] / Cmd+[ (у таблиці) |
-| Форматувати інструкцію | Shift+Alt+F |
-| Автодоповнення | Ctrl+Space (на всіх платформах) |
-| Бокова панель / панель результату | Cmd+B / Cmd+J |
-| Файл / інструкція у файлі / у теці | Cmd+P / Cmd+Shift+O / Cmd+T |
-| Історія | Cmd+Y |
-| Додати файли (FILES) | Cmd+O |
-| Палітра команд | Cmd+Shift+P |
-
-Перевизначаються в `keymap.json`.
-
-### Налаштування
-
-Лише глобальні, `~/.config/siesta/settings.json`, snake_case:
-
-Робоча тека перекриває глобальні значення по ключах (вкладені групи зливаються, масиви замінюються); коментарі `//` і `/* */` дозволені; невідомі ключі ігноруються; помилковий файл пропускається з повідомленням.
-
-- UI, як у Respite: `appearance` (`system` | `light` | `dark`), `keymap` (`default` | `vscode` | `jetbrains`), `theme` (типово `Gruvbox`; `Default` — вбудована тема gpui-component), `ui_font_size` (14), `font_family`, `font_size` (14), `split` (`horizontal` | `vertical`; типово `vertical` — редактор над результатом), `split_ratio` (0.55), `editor.line_numbers`, `editor.soft_wrap`, `editor.highlight_current_line`, `editor.run_button` (зелена ▶ біля номера рядка кожної інструкції; типово `true`).
-- `results.page_size` (100), `results.max_rows` (10 000), `results.cell_preview_kb` (8), `results.null_text` (`NULL`), `results.json_preview_lines` (0 — вимкнено; кнопка `{ }` вмикає).
-- `run.stop_on_error` (true), `run.confirm_destructive` (`prod` | `always` | `never`, типово `prod`; для prod-підключень підтвердження не-читань не залежить від нього, див. «Конвеєр виконання»), `run.statement_timeout_ms` (немає), `run.connect_timeout_ms` (10000; див. «Сесії»).
-- Налаштувань підключень немає: вони в `~/.config/siesta/connections/`, а продакшн задає прапорець `prod` у підключенні.
-- `history.total` (500) — скільки записів історії виконань зберігається (на всі робочі теки разом).
-
-### Дорожня карта
-
-**Фаза 1 — MVP**
-
-- [x] `sql-split`: інструкції, діалекти, `$$`, `DELIMITER`, директиви
-- [x] Підключення: по файлу на підключення в `~/.config/siesta/connections/`, `${env:}`, TLS, `read_only`, `prod`, форма «New / Edit connection»
-- [x] Виконання на `sqlx` (Postgres, MySQL / MariaDB): сесії, скасування, помилки з позицією
-- [x] GUI: каркас із Respite, редактор з `tree-sitter-sql`, активна інструкція, вибір підключення, Cmd+Enter
-- [x] Таблиця: типи, NULL, пагінація, сортування, фільтр по колонках, копіювання
-- [x] Попап повного значення: JSON із підсвіткою, рядок як JSON
-- [x] Вкладка DB і автодоповнення таблиць / колонок
-- [x] CLI: `list`, `run`, `exec`, `connections`, `schema`; skill для агентів
-- [x] Історія виконань (Cmd+Y): `~/.siesta/history`, сторінка зі списком, фільтром, Insert і Run again (CLI поки не пише, див. розділ «Історія»)
-- [ ] Експорт результату: CSV / TSV / JSON / Markdown / `INSERT` (описано в розділі «Експорт», ще не реалізовано)
-
-**Фаза 2**
-
-- [x] MCP-сервер (`siesta mcp`, stdio): tools `connections`, `schema`, `list_statements`, `run_sql`; кожен запускає відповідну команду CLI з `--output json`. `run_sql` ніколи не передає `--yes`, а stdin закритий, тож підтвердити нічого не можна: пише лише там, де підтвердження не потрібне. На `read_only`-підключенні запис відмовляється (`read_only_refused`). На `prod` агент виконує лише читання і `UPDATE` з `WHERE` верхнього рівня — без підтвердження; решта (`DELETE`, `INSERT`, `DROP`, `TRUNCATE`, `ALTER`, `WITH … UPDATE`, `SET`…) — код 4 `prod_refused` до виконання (`sql_split::prod_agent_violation`; CLI дізнається про MCP зі змінної `SIESTA_MCP`, яку ставить `siesta mcp` дочірнім командам). Усе, що потребує підтвердження (`-- @confirm`, `run.confirm_destructive = always`), — код 4 `confirmation_required`
-- [ ] SSH-тунель
-- [x] Паролі зашифровані локальним ключем у файлі підключення (XChaCha20-Poly1305, AAD = ім'я, ліниве розшифрування, `siesta connections set-password`)
-- [ ] Експорт великих результатів потоком, `EXPLAIN` деревом
-- [ ] Параметри в запитах (`:name` / `{{var}}` з промптом)
-
-**Фаза 3**
-
-- [x] Редагування комірок з генерацією `UPDATE` за первинним ключем
-- [ ] SQLite, ClickHouse, MSSQL
-
-### Рішення та відкриті питання
-
-- **Драйвер: `sqlx`.** Один API для Postgres і MySQL / MariaDB, чистий Rust, rustls. Нестача — скасування — закривається `pg_cancel_backend` / `KILL QUERY` з окремого з'єднання.
-- **Сторінки, сортування й фільтри — на сервері** через обгортку `SELECT * FROM (<запит>) AS q …`. Клієнт ніколи не тримає весь результат.
-- **Сесія на файл + підключення.** `SET` і транзакції працюють як у консольному клієнті.
-- **Редактор чистий**, як у Respite: жодних статусів у рядках; єдина кнопка — ▶ у gutter біля номера рядка (`editor.run_button`), не в тексті.
-- **Панель результату (крок 5b):**
-  - Результат лежить за ключем (файл, текст інструкції): змінений текст — нова інструкція без результату; закриття файлу забуває його результати й сесії.
-  - Пакет: над вкладками рядок `Result 1 | Result 2 …` і `N statements · M rows affected`; клік по вкладці ставить курсор на інструкцію, і панель, як завжди, показує результат інструкції під курсором. Новий запуск однієї інструкції пакет прибирає.
-  - Свіжий запуск (Cmd+Enter, «▶ Run») починає з першої сторінки без сортування й фільтрів; сторінка, розмір, сортування й фільтри змінюються вже в показаному результаті.
-  - Фільтри застосовуються по Enter у будь-якому полі (запит на кожну літеру був би зайвим); `2 filters ✕` у шапці їх скидає.
-  - Попап комірки відкривається подвійним кліком, Enter або Space: одинарний клік лише виділяє (інакше комірку не виділити для Cmd+C). ↑ / ↓ ходять по колонці, коли фокус у діалозі, а не в редакторі значення.
-  - Cmd+C — виділена комірка (порожній рядок для `NULL`); у контекстному меню рядка: «Copy row» (TSV), «Copy as JSON», «Copy as INSERT» (таблиця — заглушка `table_name`: з довільного `SELECT` її не визначити).
-  - «Показати SQL сторінки» відкриває вкладку Query (там уже `executed_sql` і параметри).
-  - Підтвердження: `-- @confirm` питає завжди; `UPDATE` / `DELETE` без `WHERE` на верхньому рівні, `DROP`, `TRUNCATE`, `ALTER` — за `run.confirm_destructive` (`sql_split::is_destructive`, перевірка токенів, не парсер).
-  - `run.statement_timeout_ms` застосовує `db-exec` (`Session::set_statement_timeout`): `SET statement_timeout` (Postgres) / `SET SESSION max_execution_time` (MySQL, діє лише на `SELECT`) / `SET SESSION max_statement_time` (MariaDB, секунди); після автоперевідкриття з'єднання — заново.
-  - Cmd+] / Cmd+[ і Cmd+C / Enter / Space працюють, коли фокус у таблиці; Cmd+Alt+F — скрізь.
-- **Підключення — файли в теці конфігурації, паролі — лише зашифровані в них.** Один JSON на підключення (`~/.config/siesta/connections/<ім'я>.json`), проєктних файлів підключень, ланцюжка тек, `${dotenv:}` і маркерів `${keychain}` немає; пароль — `password_enc` (XChaCha20-Poly1305, AAD = ім'я підключення) з локальним ключем `~/.siesta/key` (0600; у теці даних, не поруч із файлами підключень), розшифровується лише при відкритті сесії; немає `password_enc` — підключення без пароля; не вдалося зашифрувати → збереження пароля у формі падає з помилкою, решта підключення зберігається; уся крипто-частина — у `db_conn::crypto`, тести працюють у тимчасових `SIESTA_CONFIG_DIR` / `SIESTA_DATA_DIR`. Системне сховище (Keychain / Secret Service) відкинуто: підписування dev-збірок і запити дозволу не варті захисту від того, що все одно читається під користувачем.
-- **Каркас копіюється з Respite**, а не виноситься в спільний крейт (поки).
-- **Ліцензія: MIT.**
-- **Назва: Siesta.** Пара до Respite: обидві про відпочинок. Бінарник — `siesta`. На crates.io ім'я `siesta` зайняте, тож крейти з префіксом (`siesta-cli`, `siesta-core`…), як у Respite; Homebrew вільний.
-
-**Ще відкрито**
-
-1. **Обгортка для MySQL 5.7 / старих MariaDB** — підзапит у `FROM` вимагає alias і не всі `SELECT … FOR UPDATE` загортаються; такі інструкції йдуть як незагортні.
-2. **Транзакції за замовчуванням:** autocommit (як `psql`) чи явний режим з кнопкою Commit (як DataGrip)?
-3. **Повідомлення сервера:** `NOTICE` Postgres недосяжні через sqlx (він лише логує їх), тож `notices` для Postgres порожній; MySQL-warnings читаються через `SHOW WARNINGS` лише після не-читальних інструкцій. Потрібні `NOTICE` (напр. `RAISE NOTICE`) — окреме рішення (власний перехоплювач `tracing` чи інший драйвер).
-4. **`JSON` у MariaDB** приходить як `BLOB` / `LONGTEXT` із `utf8mb4_bin`: вирішено евристикою «текст, що є JSON-об'єктом / масивом, — `Json`» (див. «Типи значень»); точніше було б знати тип із `information_schema` (там `longtext` + `json_valid`-CHECK), але евристики досить.
-5. **Спільний каркас з Respite:** якщо обидва продукти житимуть довго, коли виносити спільні крейти (`workspace`, теми, сайдбар)?
+1. **Wrapper for MySQL 5.7 / old MariaDB:** a subquery in `FROM` needs an alias and not every `SELECT … FOR UPDATE` wraps; such statements run unwrapped.
+2. **Default transactions:** autocommit (like `psql`) or an explicit mode with a Commit button (like DataGrip)?
+3. **Server messages:** Postgres `NOTICE` is unreachable through sqlx (it only logs), so `notices` is empty for Postgres; MySQL warnings are read with `SHOW WARNINGS` only after non-read statements. Wanting `RAISE NOTICE` is a separate decision (a `tracing` interceptor or another driver).
+4. **MariaDB `JSON`** is detected by heuristic (text that is a JSON object / array); knowing the type from `information_schema` (`longtext` + `json_valid` CHECK) would be more exact, but the heuristic is enough.
+5. **Shared shell with Respite:** if both products live long, when to extract shared crates (workspace, themes, sidebar)?

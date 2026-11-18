@@ -207,7 +207,7 @@ cargo test --workspace          # unit and GUI tests
 scripts/test-db.sh              # integration tests on Postgres and MariaDB in Docker (--down stops them)
 ```
 
-The full design is in [the specification](<Siesta специфікація легкого SQL-клієнта на Rust + GPUI.md>) (in Ukrainian). Siesta is a sibling of [Respite](https://github.com/gandriyko/respite), a text-first REST client built the same way.
+The principles and decisions behind the design are in [the specification](<Siesta специфікація легкого SQL-клієнта на Rust + GPUI.md>). Siesta is a sibling of [Respite](https://github.com/gandriyko/respite), a text-first REST client built the same way.
 
 ## License
 

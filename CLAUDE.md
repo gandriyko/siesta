@@ -1,8 +1,10 @@
 # Siesta
 
 Lightweight desktop SQL client (Postgres, MySQL / MariaDB) on Rust + GPUI + gpui-component.
-The spec is `Siesta специфікація легкого SQL-клієнта на Rust + GPUI.md` — the source of truth for
-behaviour; update it in the same change when a decision changes.
+The spec is `Siesta специфікація легкого SQL-клієнта на Rust + GPUI.md` (written in English): it records
+principles and decisions with their reasons. Change it **only when a principle or a decision changes**
+(or a new one is made) — not for every feature, tweak, key, setting or message. Behaviour details live in
+the code, the tests, `README.md` and `skills/siesta/SKILL.md`; don't copy them into the spec.
 
 ## Git
 
