@@ -34,8 +34,8 @@ pub enum Keymap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Split {
-    #[default]
     Horizontal,
+    #[default]
     Vertical,
 }
 
@@ -123,7 +123,7 @@ impl Default for Settings {
         Self {
             appearance: Appearance::System,
             keymap: Keymap::Default,
-            split: Split::Horizontal,
+            split: Split::Vertical,
             split_ratio: 0.55,
             theme: "macOS Classic".into(),
             ui_font_size: 14.,
