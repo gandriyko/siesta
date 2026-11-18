@@ -432,10 +432,6 @@ impl TableDelegate for Grid {
             return div()
                 .id(("cell-edit", col))
                 .w_full()
-                // A light tint marks the cell being edited (pending values are tinted with `warning`).
-                .px_1()
-                .rounded_sm()
-                .bg(cx.theme().primary.opacity(0.14))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // Only Enter (keep) and Esc (cancel) leave the field; no other key reaches another
                 // cell. Enter arrives as the table's `OpenCell` (see `open_selected`).
