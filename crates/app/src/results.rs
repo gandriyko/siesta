@@ -1002,7 +1002,7 @@ impl Siesta {
                 .text_color(muted)
                 .child(if running.is_some() { "Running…".to_string() } else { format!("{RUN_KEY} to run") })
                 .into_any_element(),
-            (Some(_), Tab::Messages | Tab::Query) => div().flex_1().min_h_0().child(gpui_component::input::Editor::new(&self.ui.meta).size_full().bordered(false)).into_any_element(),
+            (Some(_), Tab::Messages | Tab::Query) => div().flex_1().min_h_0().child(gpui_component::input::Editor::new(&self.ui.meta).readonly(true).size_full().bordered(false)).into_any_element(),
             (Some(d), Tab::Result) => match &d.result {
                 Err(err) => v_flex()
                     .flex_1()

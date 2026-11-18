@@ -1785,6 +1785,15 @@ mod tests {
         assert_eq!(title, "Row 1");
         assert!(text.starts_with("{\n  \"id\": 1,\n  \"doc\": {\n    \"tags\": ["), "{text}");
         assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok());
+        // The viewer is read-only: typing into it changes nothing.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.open_popup(1, Some(2), window, cx)));
+        cx.run_until_parked();
+        let editor = cx.update(|_, cx| app.read(cx).ui.popup.clone().unwrap().read(cx).editor());
+        assert!(!cx.update(|_, cx| editor.read(cx).is_editable()), "viewer is editable");
+        cx.update(|window, cx| editor.update(cx, |s, cx| s.focus(window, cx)));
+        cx.simulate_input("zz");
+        cx.simulate_keystrokes("enter backspace");
+        assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "plain");
     }
 
     #[gpui::test]

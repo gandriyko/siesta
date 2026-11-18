@@ -441,9 +441,9 @@ impl Siesta {
         self.focus_table(window, cx);
     }
 
-    /// Enter / Tab / an arrow in the field: keep the value and edit the next cell that way. Tab
-    /// walks the editable columns and wraps to the next row; Enter and ↑ / ↓ stay in the column.
-    /// Off the edge of the page the value is kept and editing ends.
+    /// Enter / Tab / an arrow in the field: keep the value, end editing and select the next cell
+    /// (Enter there edits it). Tab walks the editable columns and wraps to the next row; Enter and
+    /// ↑ / ↓ stay in the column. Off the edge of the page the selection stays.
     pub(crate) fn move_inline(&mut self, m: Move, window: &mut Window, cx: &mut Context<Self>) {
         let Some((row, col)) = self.shown_edit(cx).and_then(|e| e.inline.as_ref()).map(|i| (i.row, i.col)) else { return };
         let Some(t) = self.shown_edit(cx).and_then(|e| e.target().cloned()) else { return };
@@ -465,7 +465,6 @@ impl Siesta {
             t.scroll_to_row(r, cx);
             t.scroll_to_col(c, cx);
         });
-        self.edit_cell(r, c, window, cx);
     }
 
     /// Esc in the field: the cell keeps what it had.
@@ -592,7 +591,7 @@ impl Siesta {
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(div().h(viewport.height * 0.55).border_1().border_color(t.border).rounded_md().child(Editor::new(&viewer).size_full().bordered(false)))
+                        .child(div().h(viewport.height * 0.55).border_1().border_color(t.border).rounded_md().child(Editor::new(&viewer).readonly(true).size_full().bordered(false)))
                         .child(div().text_sm().text_color(if prod { t.danger } else { t.muted_foreground }).child(tx)),
                 )
                 .footer(

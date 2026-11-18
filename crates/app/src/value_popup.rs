@@ -119,6 +119,11 @@ impl Popup {
         &self.shown
     }
 
+    #[cfg(test)]
+    pub fn editor(&self) -> Entity<EditorState> {
+        self.editor.clone()
+    }
+
     fn is_json(&self) -> bool {
         matches!(self.body, Body::Json(_))
     }
@@ -218,7 +223,8 @@ impl Render for Popup {
                             .child(Button::new("popup-next").icon(IconName::ArrowDown).disabled(self.pos >= last).tooltip("Next row (↓)").on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx)))),
                     ),
             )
-            .child(div().h(h).border_1().border_color(cx.theme().border).rounded_md().child(Editor::new(&self.editor).size_full().bordered(false)))
+            .child(div().h(h).border_1().border_color(cx.theme().border).rounded_md()// The element's own `readonly` (default false) overrides the state's on every render.
+            .child(Editor::new(&self.editor).readonly(true).size_full().bordered(false)))
             .when(wide, |c| c.child(div().flex_none().child(Input::new(&self.filter).small().cleanable(true))))
             .child(div().text_xs().text_color(muted).child("↑ / ↓ walk the column, Esc closes"))
     }
