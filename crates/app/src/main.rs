@@ -70,6 +70,12 @@ const RUN_KEY: &str = "Ctrl+Enter";
 
 /// A notification that is safe while the window is still being built (no `Root` yet: an
 /// immediate one panics), so startup paths use this.
+/// "Connections renamed to the new name rules: My DB → my-db, …".
+fn connections_renamed_note(renames: &[(String, String)]) -> String {
+    let list: Vec<String> = renames.iter().map(|(o, n)| format!("{o} → {n}")).collect();
+    format!("Connections renamed to the new name rules: {}", list.join(", "))
+}
+
 fn notify_later(window: &mut Window, cx: &mut App, msg: impl Into<SharedString>) {
     let msg = msg.into();
     window.defer(cx, move |window, cx| window.push_notification(msg, cx));
@@ -267,6 +273,20 @@ impl Siesta {
                 }
             }),
         ];
+        // Connections named by the old rules are renamed before anything reads them; no file is open yet.
+        if let (Some(config), Some(keys)) = (config_dir.as_deref(), siesta_settings::data_dir()) {
+            let (renames, warnings) = db_conn::migrate_names(config, &keys);
+            for w in &warnings {
+                notify_later(window, cx, format!("Connections: {w}"));
+            }
+            if !renames.is_empty() {
+                let (_, errors) = siesta_workspace::rewrite_connection_refs(&siesta_settings::collections_dir_in(config), base.as_deref(), &renames);
+                for e in &errors {
+                    notify_later(window, cx, format!("Connections: {e}"));
+                }
+                notify_later(window, cx, connections_renamed_note(&renames));
+            }
+        }
         let conns = Arc::new(config_dir.as_deref().map(Connections::load).unwrap_or_default());
         let mut this = Self {
             conns,
@@ -422,6 +442,7 @@ impl Siesta {
     }
 
     fn reload_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.migrate_connection_names(window, cx);
         let c = Arc::new(self.config_dir.as_deref().map(Connections::load).unwrap_or_default());
         self.report_connections(&c, window, cx);
         self.conns = c.clone();
@@ -830,55 +851,61 @@ impl Siesta {
         self.docs[ix].reparse(cx);
     }
 
-    /// Connection `old` was renamed to `new`: files whose `-- @connection old` line would now name
-    /// an unknown connection are offered a rewrite (open tabs as an undoable edit, other listed
-    /// files on disk).
-    pub(crate) fn rename_references(&mut self, old: &str, new: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let names = |f: &Path| f.strip_prefix(self.folder()).unwrap_or(f).display().to_string();
-        let open: Vec<PathBuf> = self.docs.iter().filter(|d| d.connection() == Some(old)).map(|d| (*d.path).clone()).collect();
-        let closed: Vec<PathBuf> = self
+    /// Connections were renamed (`renames`: `(old, new)`): every file whose `-- @connection old`
+    /// line would now name an unknown connection is rewritten right away (open tabs as an undoable
+    /// edit, other listed files on disk), then one notification says how many files were updated
+    /// (and which could not be written).
+    pub(crate) fn rename_references(&mut self, renames: &[(String, String)], window: &mut Window, cx: &mut Context<Self>) {
+        let new_of = |old: Option<&str>| old.and_then(|o| renames.iter().find(|(r, _)| r == o)).map(|(_, n)| n.clone());
+        let open: Vec<(usize, String)> = self.docs.iter().enumerate().filter_map(|(ix, d)| Some((ix, new_of(d.connection())?))).collect();
+        let closed: Vec<(PathBuf, String)> = self
             .files
             .iter()
             .filter(|f| siesta_workspace::is_sql(f) && !self.docs.iter().any(|d| *d.path == **f))
-            .filter(|f| std::fs::read_to_string(f).is_ok_and(|t| sql_split::split(&t, Default::default()).connection.as_deref() == Some(old)))
-            .cloned()
+            .filter_map(|f| {
+                let t = std::fs::read_to_string(f).ok()?;
+                Some((f.clone(), new_of(sql_split::split(&t, Default::default()).connection.as_deref())?))
+            })
             .collect();
-        if open.is_empty() && closed.is_empty() {
+        let mut updated = 0;
+        for (ix, new) in open {
+            let text = self.docs[ix].editor.read(cx).value().to_string();
+            if let Some(t) = sql_split::rewrite_connection(&text, self.docs[ix].dialect, Some(&new)) {
+                self.replace_text(ix, &text, &t, window, cx);
+                updated += 1;
+            }
+        }
+        let mut failed = Vec::new();
+        for (f, new) in closed {
+            let Ok(t) = std::fs::read_to_string(&f) else { continue };
+            let Some(r) = sql_split::rewrite_connection(&t, Default::default(), Some(&new)) else { continue };
+            match std::fs::write(&f, r) {
+                Ok(()) => updated += 1,
+                Err(e) => failed.push(format!("{}: {e}", f.display())),
+            }
+        }
+        if updated > 0 {
+            window.push_notification(format!("Updated `-- @connection` in {updated} {}", if updated == 1 { "file" } else { "files" }), cx);
+        }
+        if !failed.is_empty() {
+            window.push_notification(failed.join("\n"), cx);
+        }
+        cx.notify();
+    }
+
+    /// Renames the connection files whose names break the naming rules (the password moves with the
+    /// file) and rewrites the `-- @connection` lines of the open tabs; one notification lists the renames.
+    fn migrate_connection_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(config), Some(keys)) = (self.config_dir.clone(), siesta_settings::data_dir()) else { return };
+        let (renames, warnings) = db_conn::migrate_names(&config, &keys);
+        for w in &warnings {
+            notify_later(window, cx, format!("Connections: {w}"));
+        }
+        if renames.is_empty() {
             return;
         }
-        let list: Vec<String> = open.iter().chain(&closed).map(|f| names(f)).collect();
-        let detail = format!("These files set `-- @connection {old}`:\n{}\n\nRewrite it to `-- @connection {new}`?", list.join("\n"));
-        let answer = window.prompt(PromptLevel::Info, "Connection renamed", Some(&detail), &["Rewrite", "Leave"], cx);
-        let (old, new) = (old.to_string(), new.to_string());
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            this.update_in(cx, |this, window, cx| {
-                for p in open {
-                    let Some(ix) = this.docs.iter().position(|d| *d.path == p && d.connection() == Some(old.as_str())) else { continue };
-                    let text = this.docs[ix].editor.read(cx).value().to_string();
-                    if let Some(t) = sql_split::rewrite_connection(&text, this.docs[ix].dialect, Some(&new)) {
-                        this.replace_text(ix, &text, &t, window, cx);
-                    }
-                }
-                let failed: Vec<String> = closed
-                    .iter()
-                    .filter_map(|f| {
-                        let t = std::fs::read_to_string(f).ok()?;
-                        (sql_split::split(&t, Default::default()).connection.as_deref() == Some(old.as_str())).then_some(())?;
-                        let r =sql_split::rewrite_connection(&t, Default::default(), Some(&new))?;
-                        std::fs::write(f, r).err().map(|e| format!("{}: {e}", f.display()))
-                    })
-                    .collect();
-                if !failed.is_empty() {
-                    window.push_notification(failed.join("\n"), cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        notify_later(window, cx, connections_renamed_note(&renames));
+        self.rename_references(&renames, window, cx);
     }
 
     /// The database picker's choice for the current file (`None` = the connection's default):
@@ -2368,7 +2395,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rename_offers_to_rewrite_directives_and_closing_drops_the_form(tcx: &mut TestAppContext) {
+    fn rename_rewrites_directives_and_closing_drops_the_form(tcx: &mut TestAppContext) {
         let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
         let (a, c, d) = (ws.path().join("collections/a.sql"), ws.path().join("collections/c.sql"), ws.path().join("collections/d.sql"));
         std::fs::write(&d, "-- @connection my\nSELECT 'd';\n").unwrap();
@@ -2388,8 +2415,6 @@ mod tests {
             })
         });
         drop(form);
-        cx.run_until_parked();
-        cx.simulate_prompt_answer("Rewrite");
         cx.run_until_parked();
         // a.sql's line came from the picker, c.sql's and d.sql's were typed: all follow the rename.
         let (picked, c_text) = cx.update(|_, cx| {

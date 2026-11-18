@@ -9,6 +9,7 @@ db-conn = { path = "../db-conn" }
 db-exec = { path = "../db-exec" }
 sql-split = { path = "../sql-split" }
 siesta-settings = { path = "../settings" }
+siesta-workspace = { path = "../workspace" }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 serde_json = "1"

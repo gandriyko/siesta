@@ -167,6 +167,12 @@ One JSON file per connection in the user's config dir, `~/.config/siesta/connect
 (the file name is the connection name; the desktop app's "New connection" form writes it). There are no
 project-level connection files.
 
+A connection name is `[a-z0-9][a-z0-9_-]*`, at most 64 characters (lowercase ASCII): it is the file name,
+the value of `-- @connection NAME` and the CLI argument. Old connections named otherwise (`My DB.json`) are
+renamed automatically (to `my-db`; the password is re-encrypted and `-- @connection` lines in the
+collections and added files are rewritten) the first time the app or the CLI runs; the CLI reports it
+on stderr, so JSON on stdout stays clean.
+
 ```jsonc
 // ~/.config/siesta/connections/dev-pg.json
 { "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" }

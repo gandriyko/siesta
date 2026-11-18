@@ -1366,6 +1366,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
+ "deunicode",
  "getrandom 0.4.3",
  "serde_json",
  "siesta-settings",
@@ -1414,6 +1415,12 @@ dependencies = [
  "rustc_version",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 
 [[package]]
 name = "digest"
@@ -6313,6 +6320,7 @@ dependencies = [
  "rpassword",
  "serde_json",
  "siesta-settings",
+ "siesta-workspace",
  "sql-split",
  "tempfile",
  "tokio",
@@ -6335,6 +6343,7 @@ dependencies = [
  "ignore",
  "serde",
  "serde_json",
+ "sql-split",
  "tempfile",
 ]
 

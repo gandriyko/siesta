@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 mod global;
 pub mod crypto;
-pub use global::{ConnectionForm, delete, has_password, names, read_form, save, set_password};
+pub use global::{ConnectionForm, delete, has_password, migrate_names, names, read_form, save, set_password};
 mod urlparse;
 pub use urlparse::{ParsedUrl, parse_url};
 
@@ -28,8 +28,25 @@ pub fn connections_dir(config: &Path) -> PathBuf {
     config.join("connections")
 }
 
-/// A connection name is a file name: no path separators, no leading dot, no control characters.
+/// The longest connection name.
+pub const MAX_NAME: usize = 64;
+
+/// A connection name for saving: `[a-z0-9][a-z0-9_-]*`, at most [`MAX_NAME`] characters (it is a
+/// file name, the value of `-- @connection` and a CLI argument). [`normalize_name`] produces one.
 pub fn valid_name(name: &str) -> Result<(), String> {
+    let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_';
+    if name.is_empty() {
+        Err("name is required".into())
+    } else if name.chars().count() > MAX_NAME || !name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()) || !name.chars().all(ok) {
+        Err(format!("invalid connection name '{name}': lowercase latin letters, digits, - and _ (not first), up to {MAX_NAME} characters"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The lax check for names of files that already exist (legacy names keep loading, reading,
+/// deleting): no path separators, no leading dot, no control characters, no surrounding spaces.
+pub fn valid_file_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         Err("name is required".into())
     } else if name != name.trim() || name.starts_with('.') || name.contains(['/', '\\']) || name.chars().any(char::is_control) {
@@ -37,6 +54,22 @@ pub fn valid_name(name: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Turns whatever was typed into the nearest valid name, as the form's Name field does while you
+/// type: non-ASCII is transliterated to Latin, lowercased, whitespace becomes `-`, every other
+/// disallowed character and leading `-` / `_` are dropped, cut to [`MAX_NAME`]. A trailing `-`
+/// stays (so `my ` then `db` gives `my-db`), repeated `-` are kept. Idempotent.
+pub fn normalize_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in deunicode::deunicode(s).chars() {
+        let c = if c.is_whitespace() { '-' } else { c.to_ascii_lowercase() };
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_';
+        if ok && !(out.is_empty() && (c == '-' || c == '_')) && out.len() < MAX_NAME {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +204,9 @@ impl Connections {
         let mut out = Self::default();
         let dir = connections_dir(config);
         for name in names(config) {
+            if valid_name(&name).is_err() {
+                out.warnings.push(format!("connection '{name}': names are lowercase latin letters, digits, - and _; open it and save to rename it to '{}'", normalize_name(&name)));
+            }
             let path = dir.join(format!("{name}.json"));
             let obj = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())) {
                 Ok(Value::Object(o)) => o,
@@ -501,13 +537,42 @@ mod tests {
     }
 
     #[test]
-    fn names_are_file_names() {
-        for ok in ["dev", "my db", "prod-eu_1", "ключ"] {
+    fn names_are_slugs() {
+        for ok in ["dev", "prod-eu_1", "a", "0x", "a-", &"a".repeat(64)] {
             assert!(valid_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", " ", "a/b", "a\\b", ".x", " x", "x ", "a\nb"] {
+        for bad in ["", " ", "a/b", ".x", "x ", "my db", "ключ", "Dev", "-a", "_a", "a.b", "a@b", &"a".repeat(65)] {
             assert!(valid_name(bad).is_err(), "{bad:?}");
         }
+        for ok in ["dev", "my db", "prod-eu_1", "ключ", "My DB"] {
+            assert!(valid_file_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", " ", "a/b", "a\\b", ".x", " x", "x ", "a\nb"] {
+            assert!(valid_file_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn normalizing() {
+        for (i, o) in [("My DB", "my-db"), ("Größe", "grosse"), ("it's \"a\" @#.x/y", "its-a-xy"), ("-_-a", "a"), ("my ", "my-"), ("a  b", "a--b"), ("PROD_EU-1", "prod_eu-1"), ("---", ""), ("a-", "a-")] {
+            assert_eq!(normalize_name(i), o, "{i:?}");
+        }
+        let k = normalize_name("ключ");
+        assert!(!k.is_empty() && valid_name(&k).is_ok(), "{k}");
+        assert_eq!(normalize_name(&"é".repeat(100)).len(), 64);
+        for i in ["My DB", "ключ тест", "  x ", "-a-", "Größe!", "\u{1F600}a"] {
+            let n = normalize_name(i);
+            assert_eq!(normalize_name(&n), n, "{i:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_names_load_with_a_warning() {
+        let t = config(&[("My DB", r#"{"url": "postgres://h/d"}"#), ("ok", r#"{"url": "postgres://h/d"}"#)]);
+        let c = Connections::load(t.path());
+        assert!(c.connections.contains_key("My DB") && c.connections.contains_key("ok"));
+        let w = c.warnings.join("\n");
+        assert!(w.contains("connection 'My DB'") && w.contains("rename it to 'my-db'") && !w.contains("'ok'"), "{w}");
     }
 
     #[test]

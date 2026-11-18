@@ -74,6 +74,8 @@ pub(crate) struct ConnForm {
     /// Why the URL was not (fully) applied, or what it ignored; shown muted under the field.
     url_note: Option<String>,
     _sub: Subscription,
+    /// Keeps the Name field a valid connection name while typing.
+    _name_sub: Subscription,
     pub host: Entity<InputState>,
     pub port: Entity<InputState>,
     database: Entity<InputState>,
@@ -118,8 +120,21 @@ impl ConnForm {
                 this.apply_url(&text, window, cx);
             }
         });
+        // The Name field turns what is typed into a valid name (also an old name opened for editing,
+        // so Save renames it); `normalize_name` is idempotent, so the set_value below settles at once.
+        let name = input("local", &db_conn::normalize_name(&f.name), window, cx);
+        let _name_sub = cx.subscribe_in(&name, window, |_, name, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                let text = name.read(cx).value().to_string();
+                let fixed = db_conn::normalize_name(&text);
+                if fixed != text {
+                    name.update(cx, |s, cx| s.set_value(fixed, window, cx));
+                }
+            }
+        });
         Self {
             _sub,
+            _name_sub,
             url_note: None,
             has_password: f.has_password,
             app,
@@ -127,7 +142,7 @@ impl ConnForm {
             keys,
             target,
             original,
-            name: input("local", &f.name, window, cx),
+            name,
             url,
             host: input("localhost", &f.host, window, cx),
             port: input("5432", &f.port, window, cx),
@@ -222,7 +237,7 @@ impl ConnForm {
                 .update(cx, |this, cx| {
                     this.connection_changed(window, cx);
                     if let Some(old) = &renamed {
-                        this.rename_references(old, &name, window, cx);
+                        this.rename_references(&[(old.clone(), name.clone())], window, cx);
                     }
                 })
                 .ok();
@@ -548,7 +563,7 @@ impl Siesta {
         self.close_connection_sessions(&name);
         if let Some(old) = &renamed {
             self.close_connection_sessions(old);
-            self.rename_references(old, &name, window, cx);
+            self.rename_references(&[(old.clone(), name.clone())], window, cx);
         }
         if let Some(target) = target {
             self.pick_for(&target, Some(name), window, cx);

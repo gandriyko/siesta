@@ -32,6 +32,28 @@ pub fn scan(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Rewrites `-- @connection old` to the new name (`renames`: `(old, new)` pairs) on disk in every `.sql`
+/// file of the central folder `collections` and of the added list (`base/files.json`). Returns how
+/// many files were changed and the errors of those that could not be written.
+pub fn rewrite_connection_refs(collections: &Path, base: Option<&Path>, renames: &[(String, String)]) -> (usize, Vec<String>) {
+    let mut files: Vec<PathBuf> = scan(collections).into_iter().filter(|p| p.is_file()).collect();
+    files.extend(base.map(load_files).unwrap_or_default());
+    files.sort();
+    files.dedup();
+    let (mut changed, mut errors) = (0, Vec::new());
+    for f in files.iter().filter(|f| is_sql(f)) {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Some(old) = sql_split::split(&text, Default::default()).connection else { continue };
+        let Some((_, new)) = renames.iter().find(|(o, _)| *o == old) else { continue };
+        let Some(rewritten) = sql_split::rewrite_connection(&text, Default::default(), Some(new)) else { continue };
+        match std::fs::write(f, rewritten) {
+            Ok(()) => changed += 1,
+            Err(e) => errors.push(format!("{}: {e}", f.display())),
+        }
+    }
+    (changed, errors)
+}
+
 /// Added files that still exist.
 pub fn load_files(base: &Path) -> Vec<PathBuf> {
     let list: Vec<PathBuf> = std::fs::read(base.join("files.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -118,5 +140,24 @@ mod tests {
         // A state.json of the old per-workspace layout reads as empty, not as an error.
         std::fs::write(base.path().join("state.json"), r#"{"workspaces": {}, "last": "/x", "recent": []}"#).unwrap();
         assert_eq!(load_state(base.path()), WorkspaceState::default());
+    }
+
+    #[test]
+    fn rewrites_connection_refs_in_central_and_added_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (coll, base, other) = (dir.path().join("collections"), dir.path().join("base"), dir.path().join("other"));
+        for d in [&coll, &base, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, b, c) = (coll.join("a.sql"), other.join("b.sql"), coll.join("c.sql"));
+        std::fs::write(&a, "-- @connection My DB\nselect 1;\n").unwrap();
+        std::fs::write(&b, "-- @connection My DB\nselect 2;\n").unwrap();
+        std::fs::write(&c, "-- @connection fine\nselect 3;\n").unwrap();
+        save_files(&base, std::slice::from_ref(&b));
+        let (n, errs) = rewrite_connection_refs(&coll, Some(&base), &[("My DB".into(), "my-db".into())]);
+        assert_eq!((n, errs.len()), (2, 0));
+        assert!(std::fs::read_to_string(&a).unwrap().starts_with("-- @connection my-db\n"));
+        assert!(std::fs::read_to_string(&b).unwrap().starts_with("-- @connection my-db\n"));
+        assert!(std::fs::read_to_string(&c).unwrap().starts_with("-- @connection fine\n"));
     }
 }

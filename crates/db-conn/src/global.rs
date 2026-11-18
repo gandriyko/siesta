@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::{Connection, crypto, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, parse_url, valid_name};
+use crate::{MAX_NAME, Connection, crypto, Driver, SslMode, connections_dir, mode_name, parse, parse_driver, parse_url, valid_file_name, valid_name, normalize_name};
 
 /// What the form edits. Strings are trimmed on save; an empty one removes the key.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -104,7 +104,7 @@ pub fn has_password(config: &Path, name: &str) -> bool {
 
 /// Encrypts `password` into the existing connection file `name` (the rest of the file stays).
 pub fn set_password(config: &Path, keys: &Path, name: &str, password: &str) -> Result<(), String> {
-    valid_name(name)?;
+    valid_file_name(name)?;
     let path = path_of(config, name);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let Ok(Value::Object(mut e)) = serde_json::from_str(&text) else { return Err(format!("{}: not a JSON object", path.display())) };
@@ -120,7 +120,7 @@ pub fn names(config: &Path) -> Vec<String> {
         .flatten()
         .filter(|e| e.path().is_file())
         .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(String::from))
-        .filter(|n| valid_name(n).is_ok())
+        .filter(|n| valid_file_name(n).is_ok())
         .collect();
     v.sort();
     v
@@ -212,9 +212,57 @@ pub fn save(config: &Path, keys: &Path, form: &ConnectionForm, original: Option<
     Ok(warn)
 }
 
+/// Renames every connection file whose name breaks [`valid_name`] to `normalize_name(old)` (`connection`
+/// if that is empty; `-2`, `-3`, … if the name is taken) and re-encrypts its password for the new
+/// name. Returns the `(old, new)` pairs done and the warnings (a password that could not move, a file
+/// that could not be renamed: it stays under its old name and loads with a warning). Idempotent.
+pub fn migrate_names(config: &Path, keys: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let all = names(config);
+    let mut taken: std::collections::BTreeSet<String> = all.iter().cloned().collect();
+    let (mut done, mut warnings) = (Vec::new(), Vec::new());
+    for old in all.iter().filter(|n| valid_name(n).is_err()) {
+        let base = Some(normalize_name(old)).filter(|b| !b.is_empty()).unwrap_or_else(|| "connection".into());
+        let free = |n: &str| !taken.contains(n) && (!path_of(config, n).exists() || old.eq_ignore_ascii_case(n));
+        let mut new = base.clone();
+        let mut i = 2;
+        while !free(&new) {
+            let suffix = format!("-{i}");
+            new = format!("{}{suffix}", &base[..base.len().min(MAX_NAME - suffix.len())]);
+            i += 1;
+        }
+        let (from, to) = (path_of(config, old), path_of(config, &new));
+        let Ok(Value::Object(mut obj)) = std::fs::read_to_string(&from).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) else {
+            warnings.push(format!("connection '{old}': cannot be read, not renamed"));
+            continue;
+        };
+        if let Err(e) = std::fs::rename(&from, &to) {
+            warnings.push(format!("connection '{old}': cannot be renamed to '{new}': {e}"));
+            continue;
+        }
+        if let Some(enc) = obj.get("password_enc").and_then(Value::as_str).map(String::from) {
+            match crypto::decrypt(keys, old, &enc).and_then(|p| crypto::encrypt(keys, &new, &p)) {
+                Ok(e) => {
+                    obj.insert("password_enc".into(), e.into());
+                }
+                Err(_) => {
+                    obj.remove("password_enc");
+                    warnings.push(format!("connection '{old}' renamed to '{new}'; its password could not be moved, set it again"));
+                }
+            }
+            if let Err(e) = write_atomic(&to, &obj) {
+                warnings.push(e);
+            }
+        }
+        taken.remove(old);
+        taken.insert(new.clone());
+        done.push((old.clone(), new));
+    }
+    (done, warnings)
+}
+
 /// Removes the connection's file (the password goes with it); whether the file was there.
 pub fn delete(config: &Path, name: &str) -> Result<bool, String> {
-    valid_name(name)?;
+    valid_file_name(name)?;
     let path = path_of(config, name);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
@@ -247,6 +295,38 @@ mod tests {
 
     fn json(c: &Path, name: &str) -> Value {
         serde_json::from_str(&fs::read_to_string(path_of(c, name)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn migrate_renames_legacy_files_and_keeps_passwords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (d, keys) = (&tmp.path().join("config"), &tmp.path().join("data"));
+        fs::create_dir_all(connections_dir(d)).unwrap();
+        let enc = |n: &str| crypto::encrypt(keys, n, "pw").unwrap();
+        let put = |n: &str, pw: Option<String>| {
+            let mut m = Map::new();
+            m.insert("driver".into(), "postgres".into());
+            if let Some(p) = pw {
+                m.insert("password_enc".into(), p.into());
+            }
+            write_atomic(&path_of(d, n), &m).unwrap();
+        };
+        put("My DB", Some(enc("My DB")));
+        put("my-db", None);
+        put("ok", None);
+        put("!!!", None);
+        put("Bad pw", Some("v1:garbage".into()));
+        let (done, warns) = migrate_names(d, keys);
+        assert!(done.contains(&("My DB".into(), "my-db-2".into())) && done.contains(&("!!!".into(), "connection".into())) && done.contains(&("Bad pw".into(), "bad-pw".into())), "{done:?}");
+        assert_eq!(done.len(), 3);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("'bad-pw'") && json(d, "bad-pw").get("password_enc").is_none());
+        assert!(!path_of(d, "My DB").exists() || path_of(d, "My DB").canonicalize().ok() == path_of(d, "my-db-2").canonicalize().ok());
+        let moved = crate::Connections::load(d).connections.remove("my-db-2").unwrap();
+        assert_eq!(moved.resolve_password_in(keys).unwrap().password.as_deref(), Some("pw"));
+        assert!(json(d, "ok").is_object());
+        // Second run: nothing left to do.
+        assert_eq!(migrate_names(d, keys), (vec![], vec![]));
     }
 
     #[test]

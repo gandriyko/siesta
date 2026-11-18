@@ -83,11 +83,32 @@ impl Env {
         for e in &loaded.errors {
             eprintln!("{} {e}", paint("warning:", YELLOW, true));
         }
+        if let (Some(config), Some(keys)) = (config, siesta_settings::data_dir()) {
+            Self::migrate_names(config, &keys);
+        }
         let conns = config.map(Connections::load).unwrap_or_default();
         for w in &conns.warnings {
             eprintln!("{} {w}", paint("warning:", YELLOW, true));
         }
         Env { settings: loaded.settings, conns }
+    }
+
+    /// Old connections whose names break the naming rules are renamed (and their `-- @connection`
+    /// lines rewritten on disk); what happened goes to stderr, never stdout.
+    fn migrate_names(config: &Path, keys: &Path) {
+        let (renames, warnings) = db_conn::migrate_names(config, keys);
+        for w in &warnings {
+            eprintln!("{} {w}", paint("warning:", YELLOW, true));
+        }
+        if renames.is_empty() {
+            return;
+        }
+        let (files, errors) = siesta_workspace::rewrite_connection_refs(&siesta_settings::collections_dir_in(config), siesta_settings::data_dir().as_deref(), &renames);
+        let list: Vec<String> = renames.iter().map(|(o, n)| format!("{o} -> {n}")).collect();
+        eprintln!("siesta: connections renamed to the new name rules: {}; updated `-- @connection` in {files} files", list.join(", "));
+        for e in &errors {
+            eprintln!("{} {e}", paint("warning:", YELLOW, true));
+        }
     }
 
     pub fn pick(&self, name: &str) -> Result<Connection, CliError> {
