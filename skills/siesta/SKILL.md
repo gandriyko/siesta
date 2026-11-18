@@ -183,6 +183,8 @@ on stderr, so JSON on stdout stays clean.
 - Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `port` / `database`
   (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
+  `host` may be a Unix socket path: a folder for Postgres (`/tmp`), the socket file for MySQL (`/tmp/mysql.sock`).
+  Postgres without `user` connects as the OS user.
   There is no `password` key.
 - `${env:NAME}` reads the environment.
 - The password lives only as `password_enc` in the connection file, encrypted with the key in

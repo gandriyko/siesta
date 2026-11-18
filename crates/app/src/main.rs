@@ -197,6 +197,11 @@ fn db_rows(list: Option<&runner::DbList>) -> Vec<DbRow> {
     }
 }
 
+/// "Can't list databases: <first line>", whole (the connection form clips it by width).
+pub(crate) fn db_error_line(e: &str) -> String {
+    format!("Can't list databases: {}", e.lines().next().unwrap_or("").trim())
+}
+
 /// "Can't list databases: <first line, at most 80 chars>".
 pub(crate) fn db_error_text(e: &str) -> String {
     let line = e.lines().next().unwrap_or("").trim();

@@ -56,6 +56,11 @@ pub fn valid_file_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// The OS user, Postgres's default user name (`USER`, else `LOGNAME`, else `postgres`).
+pub fn os_user() -> String {
+    ["USER", "LOGNAME"].iter().find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty())).unwrap_or_else(|| "postgres".into())
+}
+
 /// Turns whatever was typed into the nearest valid name, as the form's Name field does while you
 /// type: non-ASCII is transliterated to Latin, lowercased, whitespace becomes `-`, every other
 /// disallowed character and leading `-` / `_` are dropped, cut to [`MAX_NAME`]. A trailing `-`

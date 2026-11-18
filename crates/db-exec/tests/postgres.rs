@@ -27,6 +27,12 @@ async fn databases_list_and_override_pg() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn list_databases_wrong_name_pg() {
+    list_databases_with_wrong_name(PG).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn encrypted_password_connects_pg() {
     encrypted_password_connects(PG).await;
 }

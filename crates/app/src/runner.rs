@@ -767,10 +767,7 @@ impl Siesta {
         self.db_lists.insert(key.clone(), DbList::Loading);
         let timeout = Duration::from_millis(self.settings.settings.run.connect_timeout_ms);
         let handle = RT.spawn(async move {
-            let mut s = Session::open_with(&base, timeout).await?;
-            let r = s.databases().await;
-            s.close().await;
-            r
+            db_exec::list_databases(&base, timeout).await
         });
         cx.spawn_in(window, async move |this, cx| {
             let r = handle.await.unwrap_or_else(|e| Err(DbError { message: format!("Internal error: {e}"), ..Default::default() }));

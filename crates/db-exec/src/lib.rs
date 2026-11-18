@@ -240,6 +240,9 @@ fn pg_options(c: &Connection) -> Result<PgConnectOptions, DbError> {
     }
     if let Some(u) = &c.user {
         o = o.username(u);
+    } else if matches!(o.get_username(), "" | "anonymous" | "unknown") {
+        // sqlx falls back to a stub name when it can't read the OS user: use the real one like libpq.
+        o = o.username(&db_conn::os_user());
     }
     if let Some(p) = &c.password {
         o = o.password(p);
@@ -271,7 +274,8 @@ fn mysql_options(c: &Connection) -> Result<MySqlConnectOptions, DbError> {
         None => MySqlConnectOptions::new(),
     };
     if let Some(h) = &c.host {
-        o = o.host(h);
+        // A path is the socket file (`/tmp/mysql.sock`).
+        o = if h.starts_with('/') { o.socket(h) } else { o.host(h) };
     }
     if let Some(p) = c.port {
         o = o.port(p);
@@ -317,6 +321,30 @@ type SqlxResult<T> = Result<T, sqlx::Error>;
 
 fn sql_str(s: &str) -> sqlx::SqlStr {
     AssertSqlSafe(s.to_string()).into_sql_str()
+}
+
+/// The databases `c`'s credentials can open. Postgres connects to a database even to list them, and
+/// the default one (the user's name) often doesn't exist: on SQLSTATE `3D000` it retries on
+/// `postgres`, then `template1`.
+pub async fn list_databases(c: &Connection, connect_timeout: Duration) -> Result<Vec<String>, DbError> {
+    let mut tried: Vec<Option<String>> = vec![c.database.clone().filter(|d| !d.is_empty())];
+    let mut conn = c.clone();
+    conn.database = tried[0].clone();
+    loop {
+        match Session::open_with(&conn, connect_timeout).await {
+            Ok(mut s) => {
+                let names = s.databases().await;
+                s.close().await;
+                return names;
+            }
+            Err(e) if c.driver == Driver::Postgres && e.code.as_deref() == Some("3D000") => {
+                let Some(next) = ["postgres", "template1"].into_iter().find(|n| !tried.iter().any(|t| t.as_deref() == Some(*n))) else { return Err(e) };
+                tried.push(Some(next.into()));
+                conn.database = Some(next.into());
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 impl Session {
@@ -886,6 +914,23 @@ pub(crate) fn read_write_switch(sql: &str, d: Dialect) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_hosts_and_default_user() {
+        let mut c = Connection { name: "t".into(), driver: Driver::Postgres, url: None, host: Some("/tmp".into()), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
+        let o = pg_options(&c).unwrap();
+        assert!(!matches!(o.get_username(), "" | "anonymous" | "unknown"));
+        assert_eq!(Opts::Pg(o).target(), None);
+        c.user = Some("bob".into());
+        assert_eq!(pg_options(&c).unwrap().get_username(), "bob");
+        c.user = None;
+        c.url = Some("postgres://alice@h/d".into());
+        assert_eq!(pg_options(&c).unwrap().get_username(), "alice");
+        let m = Connection { name: "t".into(), driver: Driver::MySql, url: None, host: Some("/tmp/mysql.sock".into()), port: None, database: None, user: None, password: None, password_enc: None, ssl: Default::default(), read_only: false, prod: false, schema: None, init_sql: None, color: None };
+        let o = mysql_options(&m).unwrap();
+        assert!(o.get_socket().is_some());
+        assert_eq!(Opts::My(o).target(), None);
+    }
+
     use super::*;
     use Dialect::{MySql as MY, Postgres as PG};
 

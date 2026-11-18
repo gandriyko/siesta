@@ -18,6 +18,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -34,10 +35,10 @@ fn default_port(d: Driver) -> &'static str {
 }
 
 /// The hints of the fields that differ per driver: (URL, Host, User, Init SQL).
-fn driver_hints(d: Driver) -> [&'static str; 4] {
+fn driver_hints(d: Driver) -> [String; 4] {
     match d {
-        Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)", "localhost, or /tmp for the Unix socket", "postgres", "SET TIME ZONE 'UTC'"],
-        Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)", "localhost", "root", "SET time_zone = '+00:00'"],
+        Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)".into(), "localhost, or a socket folder like /tmp".into(), format!("{} (your OS user)", db_conn::os_user()), "SET TIME ZONE 'UTC'".into()],
+        Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)".into(), "localhost, or a socket file like /tmp/mysql.sock".into(), "root".into(), "SET time_zone = '+00:00'".into()],
     }
 }
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
@@ -198,8 +199,8 @@ impl ConnForm {
     fn driver_hints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let d = self.driver.unwrap_or(Driver::Postgres);
         let [url, host, user, init] = driver_hints(d);
-        for (input, hint) in [(&self.port, default_port(d)), (&self.url, url), (&self.host, host), (&self.user, user), (&self.init_sql, init)] {
-            input.update(cx, |s, cx| s.set_placeholder(hint, window, cx));
+        for (input, hint) in [(&self.port, default_port(d).to_string()), (&self.url, url), (&self.host, host), (&self.user, user), (&self.init_sql, init)] {
+            input.update(cx, |s, cx| s.set_placeholder(hint.clone(), window, cx));
         }
     }
 
@@ -322,25 +323,21 @@ impl ConnForm {
         cx.notify();
     }
 
-    /// The ↻ in the Database field: connects with the form's values (the database field left out,
-    /// so a wrong name doesn't block the list) and offers the databases the credentials can open.
+    /// The ↻ in the Database field: connects with the form's values (a wrong database name doesn't
+    /// block the list: it falls back to the server's default databases) and offers the databases the credentials can open.
     fn load_databases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut form = self.collect(cx);
-        form.database.clear();
+        let form = self.collect(cx);
         let conn = match form.to_connection(&self.dir, &self.keys, self.original.as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                self.db_note = Some(crate::db_error_text(&e));
+                self.db_note = Some(crate::db_error_line(&e));
                 return cx.notify();
             }
         };
         self.db_note = Some("Loading…".into());
         let timeout = self.app.read_with(cx, |a, _| Duration::from_millis(a.settings.settings.run.connect_timeout_ms)).unwrap_or(db_exec::CONNECT_TIMEOUT);
         let handle = RT.spawn(async move {
-            let mut s = Session::open_with(&conn, timeout).await?;
-            let names = s.databases().await;
-            s.close().await;
-            names
+            db_exec::list_databases(&conn, timeout).await
         });
         let abort = handle.abort_handle();
         let task = cx.spawn_in(window, async move |this, cx| {
@@ -353,8 +350,8 @@ impl ConnForm {
                         this.databases = names;
                     }
                     // One short line: the full error would widen the field (Test shows it whole).
-                    Ok(Err(e)) => this.db_note = Some(crate::db_error_text(&e.to_string())),
-                    Err(e) => this.db_note = Some(crate::db_error_text(&e.to_string())),
+                    Ok(Err(e)) => this.db_note = Some(crate::db_error_line(&e.to_string())),
+                    Err(e) => this.db_note = Some(crate::db_error_line(&e.to_string())),
                 }
                 cx.notify();
             })
@@ -476,7 +473,11 @@ impl Render for ConnForm {
                 })))
             }
         };
-        let database = v_flex().gap_1().child(database).children(self.db_note.clone().map(|n| div().text_xs().text_color(muted).child(n)));
+        // One clipped line under the Database / User row; the whole text is the tooltip.
+        let db_note = self.db_note.clone().map(|n| {
+            let full = n.clone();
+            div().id("db-note").w_full().text_xs().text_color(muted).truncate().child(n).tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        });
         // Colour: "None" or one of the palette, each a swatch in the current theme's shade.
         let color = {
             let dark = cx.theme().is_dark();
@@ -516,7 +517,8 @@ impl Render for ConnForm {
             .child(field("URL", &self.url))
             .children(self.url_note.clone().map(|n| div().text_xs().text_color(muted).child(n)))
             .child(h_flex().gap_2().child(div().flex_1().child(field("Host", &self.host))).child(div().w(px(100.)).child(field("Port", &self.port))))
-            .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(div().flex_1().min_w_0().child(field("User", &self.user))))
+            .child(h_flex().gap_2().items_start().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(div().flex_1().min_w_0().child(field("User", &self.user))))
+            .children(db_note)
             .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))
             .child(h_flex().gap_2().child(div().flex_1().child(Self::field("SSL mode", muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
             // `search_path` exists only in Postgres; MySQL's schema is the database.

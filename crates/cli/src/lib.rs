@@ -319,10 +319,10 @@ fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8
 
 fn databases(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
     let env = Env::load();
-    let (rt, mut s, _) = open_session(&env, name, None)?;
-    let names = rt.block_on(s.databases()).map_err(|e| db_error(&e));
-    rt.block_on(s.close());
-    let rows: Vec<Value> = names?.into_iter().map(|n| json!({ "name": n })).collect();
+    let conn = env.pick(name)?;
+    let rt = runtime();
+    let names = rt.block_on(db_exec::list_databases(&conn, std::time::Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{name}': {e}"), 2))?;
+    let rows: Vec<Value> = names.into_iter().map(|n| json!({ "name": n })).collect();
     emit_objects(out, format, &["name"], &rows);
     Ok(0)
 }

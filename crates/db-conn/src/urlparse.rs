@@ -58,21 +58,23 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
         }
         None => hostport.split_once(':').unwrap_or((hostport, "")),
     };
-    if host.is_empty() {
-        return Err("Missing host".into());
-    }
     let port = if port.is_empty() { None } else { Some(port.parse::<u16>().map_err(|_| "Invalid port")?) };
     let mut p = ParsedUrl {
         driver: Some(driver),
         user: decode(user),
         password: decode(password),
-        host: host.into(),
+        host: decode(host),
         port,
         database: decode(path.strip_prefix('/').unwrap_or_default()),
         ..Default::default()
     };
     for (k, v) in query.split('&').filter(|s| !s.is_empty()).map(|s| s.split_once('=').unwrap_or((s, ""))) {
         let v = decode(v);
+        // A Unix socket: libpq's `?host=/dir`, MySQL's `?socket=/file`.
+        if matches!((driver, k), (Driver::Postgres, "host") | (Driver::MySql, "socket")) && v.starts_with('/') {
+            p.host = v;
+            continue;
+        }
         let mode = match (driver, k) {
             (Driver::Postgres, "sslmode") => match v.as_str() {
                 "disable" => Some(SslMode::Disable),
@@ -96,6 +98,9 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
             Some(m) => p.ssl_mode = Some(m),
             None => p.ignored.push(k.into()),
         }
+    }
+    if p.host.is_empty() {
+        return Err("Missing host".into());
     }
     Ok(p)
 }
@@ -135,6 +140,9 @@ mod tests {
             ("mysql+pymysql://u@h/db", (Some(MySql), "u", "", "h", None, "db", None, none.clone())),
             ("postgresql+asyncpg://u@h/db", (Some(Postgres), "u", "", "h", None, "db", None, none.clone())),
             ("jdbc:mysql://h/db", (Some(MySql), "", "", "h", None, "db", None, none.clone())),
+            ("postgres:///db?host=/tmp", (Some(Postgres), "", "", "/tmp", None, "db", None, none.clone())),
+            ("postgres://u@%2Fvar%2Frun%2Fpostgresql/db", (Some(Postgres), "u", "", "/var/run/postgresql", None, "db", None, none.clone())),
+            ("mysql://u@localhost/db?socket=/tmp/mysql.sock", (Some(MySql), "u", "", "/tmp/mysql.sock", None, "db", None, none.clone())),
             ("postgres://h/db?application_name=a&sslmode=require", (Some(Postgres), "", "", "h", None, "db", Some(SslMode::Require), vec!["application_name".into()])),
         ] {
             assert_eq!(ok(url), own(want), "{url}");

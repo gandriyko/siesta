@@ -75,6 +75,18 @@ pub async fn databases_and_override(driver: Driver) {
     assert_eq!(texts(&run(&mut s, current).await), ["siesta"]);
 }
 
+/// A database name that doesn't exist must not block the list (Postgres falls back to `postgres`).
+pub async fn list_databases_with_wrong_name(driver: Driver) {
+    let c = connection(driver).with_database(Some("no_such_db_xyz"));
+    let r = db_exec::list_databases(&c, std::time::Duration::from_secs(10)).await;
+    if driver == Driver::Postgres {
+        let dbs = r.expect("fallback list");
+        assert!(dbs.iter().any(|d| d == "siesta"), "{dbs:?}");
+    } else {
+        assert!(r.is_err());
+    }
+}
+
 /// `driver` pointed at the port of the other database. It must fail within the connect timeout.
 /// `hangs`: the client waits for a server greeting that never comes (MySQL on Postgres), so the
 /// timeout itself ends it with the "No response" message; the Postgres client instead rejects
