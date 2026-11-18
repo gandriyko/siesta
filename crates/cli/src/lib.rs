@@ -47,7 +47,8 @@ enum Cmd {
     },
     /// Tables, columns and indexes of a connection (for writing correct SQL)
     Schema(SchemaArgs),
-    /// MCP server on stdio for AI agents (tools: connections, schema, list_statements, run_sql; SQL read-only)
+    /// MCP server on stdio for AI agents (tools: connections, schema, list_statements, run_sql;
+    /// writes refused on read_only connections, on prod only reads and UPDATE … WHERE)
     Mcp,
 }
 
