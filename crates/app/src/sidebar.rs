@@ -128,6 +128,47 @@ fn row_action(id: impl Into<ElementId>, child: impl IntoElement, tip: &'static s
         .child(child)
 }
 
+/// `p` with its leading `from` replaced by `to`; any other path as it is.
+fn moved(p: &Path, from: &Path, to: &Path) -> PathBuf {
+    match p.strip_prefix(from) {
+        Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+        Ok(rest) => to.join(rest),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+/// Where `from` goes when renamed to `input`: the same folder, the name trimmed; a file gets
+/// `.sql` when it lacks it (as New File does). Names with a path separator or empty ones are refused.
+fn renamed_path(from: &Path, input: &str, is_dir: bool) -> Result<PathBuf, String> {
+    let name = input.trim();
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return Err(format!("Invalid name: {name}"));
+    }
+    let mut to = from.with_file_name(name);
+    if !is_dir && !siesta_workspace::is_sql(&to) {
+        to.set_extension("sql");
+    }
+    Ok(to)
+}
+
+/// `to` is `from` under a name that differs in case only (the same file on a case-insensitive
+/// disk, where `to.exists()` is true), so renaming onto it overwrites nothing.
+fn case_only_rename(from: &Path, to: &Path) -> bool {
+    name_of(from).eq_ignore_ascii_case(&name_of(to)) && same_file(from, to)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(x), Ok(y)) if (x.dev(), x.ino()) == (y.dev(), y.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+    }
+}
+
 fn name_of(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
@@ -341,10 +382,120 @@ impl Siesta {
                     .child(Button::new("name-ok").label(ok).primary().on_click(move |_, window, cx| apply(window, cx))),
             )
         });
+        // A file's name is selected without its extension (`.sql` stays unless the user wants it gone).
+        let stem = default.strip_suffix(".sql").filter(|s| !s.is_empty()).map(|s| s.chars().count());
         input.update(cx, |s, cx| {
             s.focus(window, cx);
-            s.select_all(window, cx);
+            match stem {
+                Some(n) => {
+                    s.set_cursor_position(gpui_component::input::Position::new(0, n as u32), window, cx);
+                    window.defer(cx, |window, cx| window.dispatch_action(gpui_component::input::SelectToStartOfLine.boxed_clone(), cx));
+                }
+                None => s.select_all(window, cx),
+            }
         });
+    }
+
+    /// The pencil on a row and File → Rename File…: asks for the new name of a file or folder.
+    pub(crate) fn rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let (title, ok) = if path.is_dir() { ("Rename Folder", "Rename") } else { ("Rename File", "Rename") };
+        let name = name_of(&path);
+        self.ask_name(title, &name, ok, window, cx, move |this, name, window, cx| {
+            this.rename_path(&path, name, window, cx);
+        });
+    }
+
+    /// Renames the file or folder `from` (its new name is `input`; a file gets `.sql` when it
+    /// lacks it) and moves everything of the app that is keyed by its path along. Refused, with a
+    /// notification, when the target exists (never overwritten; a case-only rename of the same
+    /// file is fine), or an affected tab has an open transaction or a running statement.
+    /// `from` that is not on disk yet (the untitled sample) only changes the tab's path.
+    pub(crate) fn rename_path(&mut self, from: &Path, input: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let on_disk = from.exists();
+        let to = match renamed_path(from, input, from.is_dir()) {
+            Ok(to) => to,
+            Err(e) => {
+                window.push_notification(e, cx);
+                return false;
+            }
+        };
+        if to == from {
+            return false;
+        }
+        if to.exists() && !case_only_rename(from, &to) {
+            window.push_notification(Notification::warning(format!("{} already exists.", name_of(&to))).title("Not renamed"), cx);
+            return false;
+        }
+        let affected: Vec<PathBuf> = self.docs.iter().filter(|d| d.path.starts_with(from)).map(|d| (*d.path).clone()).collect();
+        if let Some(p) = affected.iter().find(|p| self.in_tx(p)) {
+            window.push_notification(format!("End the transaction in {} first.", name_of(p)), cx);
+            return false;
+        }
+        if let Some(k) = self.store.entries.iter().find(|(k, e)| k.0.starts_with(from) && e.running.is_some()).map(|(k, _)| k) {
+            window.push_notification(format!("{} is running a statement. Stop it first.", name_of(&k.0)), cx);
+            return false;
+        }
+        if on_disk && let Err(e) = std::fs::rename(from, &to) {
+            window.push_notification(format!("Couldn't rename {}: {e}", name_of(from)), cx);
+            return false;
+        }
+        for p in &affected {
+            // The next run reconnects under the new name.
+            self.close_sessions(p, None);
+        }
+        self.rekey(from, &to);
+        self.repoint_history(from, &to);
+        self.rescan();
+        self.remember(cx);
+        cx.notify();
+        true
+    }
+
+    /// Everything keyed by a path under `from` follows it to `to`: tabs (in place, so the order
+    /// and the front tab stay), results, outlines, expanded / collapsed rows, the added files.
+    fn rekey(&mut self, from: &Path, to: &Path) {
+        let mv = |p: &Path| moved(p, from, to);
+        for d in self.docs.iter_mut().filter(|d| d.path.starts_with(from)) {
+            d.path = std::sync::Arc::new(mv(&d.path));
+            d.mtime = crate::doc::mtime(&d.path);
+        }
+        let entries = std::mem::take(&mut self.store.entries);
+        self.store.entries = entries.into_iter().map(|((p, s), e)| ((mv(&p), s), e)).collect();
+        let batches = std::mem::take(&mut self.store.batches);
+        self.store.batches = batches.into_iter().map(|(p, keys)| (mv(&p), keys.into_iter().map(|(p, s)| (mv(&p), s)).collect())).collect();
+        if let Some((p, _)) = &mut self.store.last {
+            *p = mv(p);
+        }
+        if let Some(k) = &mut self.ui.pinned {
+            k.0 = mv(&k.0);
+        }
+        if let Some(e) = &mut self.ui.edit {
+            e.key.0 = mv(&e.key.0);
+        }
+        self.outlines = std::mem::take(&mut self.outlines).into_iter().map(|(p, v)| (mv(&p), v)).collect();
+        self.expanded = std::mem::take(&mut self.expanded).into_iter().map(|p| mv(&p)).collect();
+        self.collapsed_dirs = std::mem::take(&mut self.collapsed_dirs).into_iter().map(|p| mv(&p)).collect();
+        for p in self.mru.iter_mut().chain(self.close_armed.iter_mut()).chain(self.tab_cycle.iter_mut().flat_map(|(v, _)| v.iter_mut())) {
+            *p = mv(p);
+        }
+        if self.added.iter().any(|p| p.starts_with(from)) {
+            self.added = self.added.iter().map(|p| mv(p)).collect();
+            self.save_added();
+        }
+    }
+
+    /// History entries keep the file they ran in: point them at the new name.
+    fn repoint_history(&mut self, from: &Path, to: &Path) {
+        let Some(store) = self.base.as_deref().and_then(|b| db_exec::history::Store::open(b).ok()) else { return };
+        for mut e in store.list().into_iter().filter(|e| Path::new(&e.file).starts_with(from)) {
+            e.file = moved(Path::new(&e.file), from, to).to_string_lossy().into_owned();
+            if let Ok(json) = serde_json::to_vec_pretty(&e) {
+                let _ = std::fs::write(store.dir().join(format!("{}.json", e.id)), json);
+            }
+        }
+        if self.show_history {
+            self.reload_history();
+        }
     }
 
     fn toggle(&mut self, key: &Path) {
@@ -465,6 +616,16 @@ impl Siesta {
                 this.trash(p.clone(), window, cx);
             },
         ))
+    }
+
+    /// Pencil on a file or folder row: rename it.
+    fn rename_action(&self, ix: usize, path: &Path, cx: &mut Context<Self>) -> Stateful<Div> {
+        let size = cx.theme().font_size * 0.95;
+        let p = path.to_path_buf();
+        row_action(("rename", ix), Icon::default().data(include_bytes!("../assets/pencil.svg")).size(size), "Rename…", false, cx).on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.rename(p.clone(), window, cx);
+        }))
     }
 
     /// Asks, then moves a file or a folder of the central folder to the system Trash (it can be
@@ -610,6 +771,7 @@ impl Siesta {
                     .child(icon(if open { IconName::FolderOpen } else { IconName::Folder }, muted))
                     .child(div().flex_1().truncate().child(name.clone()))
                     .children(self.folder_actions(ix, path, false, cx))
+                    .child(self.rename_action(ix, path, cx))
                     .child(self.trash_action(ix, path, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_dir(&p);
@@ -645,6 +807,7 @@ impl Siesta {
                     .child(toggle)
                     .child(icon(IconName::FileText, if current { cx.theme().foreground } else { muted }))
                     .child(div().flex_1().truncate().child(name.clone()))
+                    .child(self.rename_action(ix, path, cx))
                     .child(remove)
                     .child(div().flex_none().text_xs().text_color(muted).child(meta))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -790,7 +953,7 @@ pub(crate) fn chevron(open: bool, color: Hsla) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's glob import brings its own `test` macro.
-    use super::{FILE_STATEMENTS, Row, Tree, long_statement_runs};
+    use super::{FILE_STATEMENTS, Row, Tree, long_statement_runs, moved, renamed_path};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -810,6 +973,22 @@ mod tests {
         // Nothing long: one plain span; nothing at all: no spans.
         assert_eq!(long_statement_runs(&rows[1 + long..]), [(0..n - 1 - long, None)]);
         assert!(long_statement_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn rename_target_and_name_rules() {
+        let from = Path::new("/w/q/a.sql");
+        assert_eq!(renamed_path(from, " b.sql ", false), Ok(PathBuf::from("/w/q/b.sql")));
+        assert_eq!(renamed_path(from, "b", false), Ok(PathBuf::from("/w/q/b.sql")));
+        assert_eq!(renamed_path(from, "B.SQL", false), Ok(PathBuf::from("/w/q/B.SQL")));
+        assert_eq!(renamed_path(from, "a.sql", false), Ok(from.to_path_buf()));
+        assert_eq!(renamed_path(Path::new("/w/q"), "r.v2", true), Ok(PathBuf::from("/w/r.v2")));
+        for bad in ["", "  ", "x/y.sql", "x\\y"] {
+            assert!(renamed_path(from, bad, false).is_err(), "{bad:?}");
+        }
+        assert_eq!(moved(Path::new("/w/q/a.sql"), Path::new("/w/q"), Path::new("/w/r")), PathBuf::from("/w/r/a.sql"));
+        assert_eq!(moved(Path::new("/w/q/a.sql"), Path::new("/w/q/a.sql"), Path::new("/w/q/b.sql")).as_os_str(), "/w/q/b.sql");
+        assert_eq!(moved(Path::new("/w/qq/a.sql"), Path::new("/w/q"), Path::new("/w/r")), PathBuf::from("/w/qq/a.sql"));
     }
 
     #[test]

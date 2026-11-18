@@ -49,7 +49,7 @@ actions!(
     [
         RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, AddFiles, Import, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
-        NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory,
+        NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory, RenameFile,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
         CopyCells, OpenCell, OpenRow, NextPage, PrevPage, PopupPrev, PopupNext
     ]
@@ -1447,6 +1447,11 @@ impl Render for Siesta {
                     this.close(ix, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &RenameFile, window, cx| {
+                if let Some(path) = this.doc().map(|d| (*d.path).clone()) {
+                    this.rename(path, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &AddFiles, window, cx| this.add_files(window, cx)))
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
@@ -1491,6 +1496,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Import…", Import),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
+            MenuItem::action("Rename File…", RenameFile),
             MenuItem::action("Close Tab", CloseTab),
         ]),
         Menu::new("Edit").items([
@@ -1557,6 +1563,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Toggle Sidebar", Box::new(ToggleSidebar)),
         ("Next Tab", Box::new(NextTab)),
         ("Save", Box::new(SaveFile)),
+        ("Rename File…", Box::new(RenameFile)),
         ("Close Tab", Box::new(CloseTab)),
         ("Add Files…", Box::new(AddFiles)),
         ("Import…", Box::new(Import)),
@@ -2276,6 +2283,124 @@ mod tests {
         assert!(added.is_empty() && z.is_file() && siesta_workspace::load_files(base.path()).is_empty());
         let history = db_exec::history::Store::open(base.path()).unwrap().list();
         assert_eq!((history[0].file.as_str(), history[0].sql.as_str()), (z.to_str().unwrap(), "SELECT 'z'"));
+    }
+
+    fn open_names(app: &Entity<Siesta>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.update(|_, cx| app.read(cx).docs.iter().map(|d| d.name()).collect())
+    }
+
+    #[gpui::test]
+    fn renaming_an_open_file_moves_it_and_keeps_the_tabs(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let col = ws.path().join("collections");
+        let (a, b, c, bb) = (col.join("a.sql"), col.join("b.sql"), col.join("c.sql"), col.join("bb.sql"));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open(b.clone(), None, window, cx);
+                this.open(c.clone(), None, window, cx);
+                this.select(1, window, cx);
+                this.record_history(&b, vec![db_exec::history::Entry { connection: "dev".into(), sql: "SELECT 'b'".into(), ..Default::default() }], cx);
+            })
+        });
+        cx.run_until_parked();
+        // No `.sql` typed: it is added; the tab stays where it was and stays the front one.
+        assert!(cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&b, "bb", window, cx))));
+        assert!(!b.exists() && bb.is_file());
+        assert_eq!(open_names(&app, &mut cx), ["a.sql", "bb.sql", "c.sql"]);
+        cx.update(|_, cx| {
+            let this = app.read(cx);
+            assert_eq!(this.current, Some(1));
+            assert!(this.docs.iter().all(|d| *d.path != b) && this.files.contains(&bb) && !this.files.contains(&b));
+            assert!(this.mru.iter().all(|p| *p != b));
+        });
+        let state = siesta_workspace::load_state(base.path());
+        assert_eq!(state.current.as_deref(), Some(bb.as_path()));
+        assert!(state.open.iter().any(|o| o.path == bb) && state.open.iter().all(|o| o.path != b));
+        // The history follows the file.
+        assert_eq!(db_exec::history::Store::open(base.path()).unwrap().list()[0].file, bb.to_str().unwrap());
+        // The same name again is a no-op.
+        assert!(!cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&bb, "bb.sql", window, cx))));
+        // A bad name changes nothing.
+        assert!(!cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&bb, "x/y", window, cx))));
+        assert!(bb.is_file());
+    }
+
+    #[gpui::test]
+    fn renaming_onto_an_existing_file_is_refused(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let col = ws.path().join("collections");
+        let (a, b) = (col.join("a.sql"), col.join("b.sql"));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        assert!(!cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&a, "b.sql", window, cx))));
+        assert!(!cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&a, "b", window, cx))));
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "SELECT 'b';\n");
+        assert!(std::fs::read_to_string(&a).unwrap().starts_with("SELECT 1;"));
+        assert_eq!(open_names(&app, &mut cx), ["a.sql"]);
+        assert_eq!(cx.update(|_, cx| app.read(cx).docs[0].path.as_path().to_path_buf()), a);
+    }
+
+    #[gpui::test]
+    fn renaming_a_folder_moves_the_tabs_inside(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let col = ws.path().join("collections");
+        let (sub, sub2, x) = (col.join("sub"), col.join("sub2"), col.join("sub/x.sql"));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&x, "SELECT 'x';\n").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(col.join("a.sql")));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open(x.clone(), None, window, cx);
+                this.collapsed_dirs.insert(sub.clone());
+                this.rescan();
+            })
+        });
+        assert!(cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&sub, "sub2", window, cx))));
+        assert!(!sub.exists() && sub2.join("x.sql").is_file());
+        cx.update(|_, cx| {
+            let this = app.read(cx);
+            assert_eq!(this.docs.iter().map(|d| (*d.path).clone()).collect::<Vec<_>>(), [col.join("a.sql"), sub2.join("x.sql")]);
+            assert_eq!(this.current, Some(1));
+            assert!(this.collapsed_dirs.contains(&sub2) && !this.collapsed_dirs.contains(&sub));
+            assert!(this.files.contains(&sub2.join("x.sql")) && !this.files.contains(&x));
+        });
+        let state = siesta_workspace::load_state(base.path());
+        assert_eq!(state.current, Some(sub2.join("x.sql")));
+    }
+
+    #[gpui::test]
+    fn a_case_only_rename_is_allowed(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let col = ws.path().join("collections");
+        let (b, upper) = (col.join("b.sql"), col.join("B.sql"));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(b.clone()));
+        assert!(cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&b, "B.sql", window, cx))));
+        let names: Vec<String> = std::fs::read_dir(&col).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"B.sql".to_string()) && !names.contains(&"b.sql".to_string()), "{names:?}");
+        assert_eq!(std::fs::read_to_string(&upper).unwrap(), "SELECT 'b';\n");
+        assert_eq!(open_names(&app, &mut cx), ["B.sql"]);
+    }
+
+    #[gpui::test]
+    fn a_dirty_buffer_keeps_its_text_and_saves_to_the_new_path(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let col = ws.path().join("collections");
+        let (b, moved) = (col.join("b.sql"), col.join("moved.sql"));
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(b.clone()));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.docs[0].editor.update(cx, |s, cx| s.set_value("SELECT 99;\n", window, cx));
+                this.docs[0].dirty = true;
+            })
+        });
+        assert!(cx.update(|window, cx| app.update(cx, |this, cx| this.rename_path(&b, "moved", window, cx))));
+        // The disk still has the saved text; the buffer has the unsaved one and is still dirty.
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "SELECT 'b';\n");
+        assert_eq!(cx.update(|_, cx| app.read(cx).docs[0].editor.read(cx).value().to_string()), "SELECT 99;\n");
+        assert!(cx.update(|_, cx| app.read(cx).docs[0].dirty));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.save(window, cx)));
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "SELECT 99;\n");
+        assert!(!b.exists());
     }
 
     #[gpui::test]

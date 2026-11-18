@@ -59,6 +59,7 @@ fn defaults() -> Vec<Spec> {
         spec("alt-down", NextStatement, Editor),
         spec(key("s"), SaveFile, Both),
         spec(key("w"), CloseTab, Both),
+        spec("f2", RenameFile, Both),
         spec(key("b"), ToggleSidebar, Both),
         spec("ctrl-tab", NextTab, Both),
         spec(key(","), OpenSettings, Both),
