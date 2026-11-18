@@ -17,7 +17,9 @@ From an agent, use the CLI only; never launch the GUI.
   client refuses writes before sending (and the server session is read-only). Use it for every exploratory query. It is a safety default, not a security
   boundary; a read-only database user is the real protection.
 - Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
-  the statement and the connection, and run it with `--yes` only after they agree.
+  the statement and the connection, and run it with `--yes` only after they agree. On a `prod`
+  connection `--yes` does not work without a terminal (exit `4`, `prod_needs_terminal`): the user runs it
+  themselves in a terminal.
 - Never write passwords into a connection file; they live only encrypted (`password_enc`, local key in
   `~/.siesta/key`; `siesta connections set-password NAME`, done by the user). Never read or print the key. `siesta connections` shows connections
   with secrets masked and whether a password is set.
@@ -53,7 +55,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
   Run `siesta connections databases NAME` to see what is available.
 - `--max-rows N` — rows per statement (default 100, `0` = the `results.max_rows` setting, which is also the upper limit).
 - `--read-only` — force the connection read-only.
-- `--yes` — skip the confirmations (non-read statements on a `prod` connection, `-- @confirm`; see Safety).
+- `--yes` — skip the confirmations (`-- @confirm`, destructive statements under the setting; on a `prod` connection only in a terminal, see Safety).
 
 `schema` options:
 
@@ -183,7 +185,7 @@ on stderr, so JSON on stdout stays clean.
 
 - Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
   (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
-  non-read statement needs `--yes`), `schema` (Postgres `search_path`), `init_sql`, `color`.
+  non-read statement needs confirmation in a terminal), `schema` (Postgres `search_path`), `init_sql`, `color`.
   `socket`: `true` connects through the local Unix socket found at connect time (Postgres: a folder with `.s.PGSQL.<port>` among `/tmp`,
   `/var/run/postgresql`, Homebrew's; MySQL: the usual `mysql.sock` / `mysqld.sock` files), or a path (Postgres: the folder, MySQL: the file); `host` is then ignored.
   A `host` that starts with `/` still works as a socket path. `siesta connections` shows `socket`.
@@ -212,7 +214,7 @@ on stderr, so JSON on stdout stays clean.
   statement needs it when it has `-- @confirm`, or, with the setting `run.confirm_destructive` = `always`,
   when it is `UPDATE` / `DELETE` without `WHERE`, `DROP`, `TRUNCATE` or `ALTER`.
 - Without a terminal the CLI never asks: it exits `4` (error code `confirmation_required`) before running
-  anything, so a batch is never half-run. In a terminal it asks `[y/N]`. `--yes` skips the question.
+  anything, so a batch is never half-run. In a terminal it asks `[y/N]`. `--yes` skips the question, but not for a non-read statement on a `prod` connection without a terminal: that is refused with `prod_needs_terminal` (exit `4`), so you cannot unlock production with a flag; the user runs it in a terminal.
 - `siesta connections` shows the `prod` flag of every connection. For a prod connection prefer `--read-only`
   and ask the user before every run.
 - `--read-only` and `"read_only": true` set a read-only session on the server, plus a client-side check by

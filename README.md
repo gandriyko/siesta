@@ -172,12 +172,12 @@ siesta run reports.sql users_by_day --output json         # machine-readable (th
 siesta exec -c dev-pg 'SELECT count(*) FROM users'        # no file needed
 siesta exec -c dev-pg -d app_test 'SELECT current_database()'
 siesta exec -c prod-mysql --read-only 'SELECT 1'          # writes are refused (exit 4)
-siesta run cleanup.sql --yes                              # non-read statements on prod need --yes
+siesta run cleanup.sql                                     # on prod, non-read statements ask [y/N] in a terminal
 siesta schema -c dev-pg users                             # look at the columns before writing a query
 ```
 
 - **Output.** `--output` is `table`, `json`, `jsonl` or `csv`. JSON follows the `siesta.run/v1` shape, with JSON / JSONB values nested. Results stop at 100 rows unless you pass `--max-rows`.
-- **Exit codes.** `0` ok, `2` connection error, `3` parse error or unknown connection / statement, `4` refused (confirmation needed: pass `--yes`), `5` SQL error.
+- **Exit codes.** `0` ok, `2` connection error, `3` parse error or unknown connection / statement, `4` refused (confirmation needed: pass `--yes`; on a `prod` connection `--yes` is not accepted without a terminal, run it in one and answer the prompt), `5` SQL error.
 
 ## AI agents
 

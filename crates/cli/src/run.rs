@@ -231,7 +231,8 @@ fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes:
     for j in jobs {
         // `prod` connections confirm every non-read statement; the policy only matters elsewhere
         // (`prod` in the policy means that same flag, so it adds nothing for the others).
-        let reason = if conn.prod && !agent_on_prod && j.kind.needs_prod_confirm() {
+        let on_prod = conn.prod && !agent_on_prod && j.kind.needs_prod_confirm();
+        let reason = if on_prod {
             Some("production connection")
         } else if j.confirm {
             Some("marked -- @confirm")
@@ -241,6 +242,16 @@ fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes:
             None
         };
         let Some(reason) = reason else { continue };
+        if yes && on_prod && !interactive {
+            // `--yes` cannot answer for a person: whoever is not at a terminal (an agent's shell, a
+            // script) never gets a non-read statement through on prod; run it in a terminal.
+            let err = CliError::new("prod_needs_terminal", format!("statement at line {} on '{}' changes a production connection: --yes is not accepted without a terminal", j.line, conn.name), 4);
+            let err = match file {
+                Some(p) => err.at(p, Some(j.line)),
+                None => err.at_line(j.line),
+            };
+            return Err(err.hint("ask the user to run it in a terminal, where it asks [y/N]"));
+        }
         if yes {
             continue;
         }
@@ -504,7 +515,10 @@ mod tests {
         assert_eq!(refused(&e, &prod, read("SHOW x", Kind::Read), false), None);
         assert_eq!(refused(&e, &prod, job_of("SELECT 1", true), false), Some(4)); // `-- @confirm` still asks
         assert_eq!(refused(&e, &prod, job_of("DELETE FROM t WHERE id = 1", false), false), Some(4));
-        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), true), None);
+        // `--yes` is not accepted on prod without a terminal (tests have none); elsewhere it is.
+        assert_eq!(refused(&e, &prod, job_of("DELETE FROM t", false), true), Some(4));
+        // A read marked `-- @confirm` is not a prod change: `--yes` answers it.
+        assert_eq!(refused(&e, &prod, Job { confirm: true, ..read("SELECT 1", Kind::Query) }, true), None);
         // Neither a read-only nor a plain connection does, by default.
         assert_eq!(refused(&e, &ro, job_of("DROP TABLE t", false), false), None);
         assert_eq!(refused(&e, &dev, job_of("DROP TABLE t", false), false), None);
