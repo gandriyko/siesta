@@ -407,7 +407,8 @@ impl TableDelegate for Grid {
                         view.update(cx, |this, cx| this.cancel_inline(window, cx)).ok();
                     }
                 })
-                .child(Input::new(input).xsmall())
+                // Bare text: the selected cell's own frame is the only border.
+                .child(Input::new(input).appearance(false).xsmall().p_0())
                 .into_any_element();
         }
         let Some(v) = self.value(row, col) else { return div().into_any_element() };
