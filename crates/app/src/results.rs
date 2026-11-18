@@ -436,8 +436,9 @@ impl TableDelegate for Grid {
                 // Only Enter (keep) and Esc (cancel) leave the field; no other key reaches another
                 // cell. Enter arrives as the table's `OpenCell` (see `open_selected`).
                 .map(|d| edit_keys(d, view))
-                // Bare text: the selected cell's own frame is the only border.
-                .child(Input::new(input).appearance(false).xsmall().p_0())
+                // Bare text: the selected cell's own frame is the only border. `small`, as the table
+                // (`DataTable::small`): the same font size as the other cells.
+                .child(Input::new(input).appearance(false).small().p_0())
                 .into_any_element();
         }
         let Some(&ri) = self.order.get(row) else { return div().into_any_element() };
