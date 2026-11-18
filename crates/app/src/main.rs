@@ -198,7 +198,7 @@ fn db_rows(list: Option<&runner::DbList>) -> Vec<DbRow> {
 }
 
 /// "Can't list databases: <first line, at most 80 chars>".
-fn db_error_text(e: &str) -> String {
+pub(crate) fn db_error_text(e: &str) -> String {
     let line = e.lines().next().unwrap_or("").trim();
     let short = if line.chars().count() > 80 { format!("{}…", line.chars().take(80).collect::<String>()) } else { line.to_string() };
     format!("Can't list databases: {short}")

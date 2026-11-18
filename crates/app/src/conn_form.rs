@@ -24,6 +24,22 @@ use gpui_component::{
 use crate::{Siesta, format, runner::RT};
 
 const DRIVERS: [(&str, Driver); 2] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql)];
+
+/// The driver's default port (also the Port field's hint).
+fn default_port(d: Driver) -> &'static str {
+    match d {
+        Driver::Postgres => "5432",
+        Driver::MySql => "3306",
+    }
+}
+
+/// The hints of the fields that differ per driver: (URL, Host, User, Init SQL).
+fn driver_hints(d: Driver) -> [&'static str; 4] {
+    match d {
+        Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)", "localhost, or /tmp for the Unix socket", "postgres", "SET TIME ZONE 'UTC'"],
+        Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)", "localhost", "root", "SET time_zone = '+00:00'"],
+    }
+}
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
     ("Default", None),
     ("disable", Some(SslMode::Disable)),
@@ -111,9 +127,7 @@ impl ConnForm {
             let hint = if f.has_password { "•••••••• (unchanged)" } else { "Stored encrypted in the connection file" };
             cx.new(|cx| InputState::new(window, cx).placeholder(hint).masked(true))
         };
-        // A saved connection's driver may not be Postgres, so its form shows no example URL.
-        let url_hint = if original.is_some() { "" } else { "postgres://user:password@host:5432/db (fills the fields below)" };
-        let url = input(url_hint, "", window, cx);
+        let url = input("", "", window, cx);
         let _sub = cx.subscribe_in(&url, window, |this, url, ev: &InputEvent, window, cx| {
             if matches!(ev, InputEvent::Change) {
                 let text = url.read(cx).value().to_string();
@@ -132,7 +146,7 @@ impl ConnForm {
                 }
             }
         });
-        Self {
+        let mut this = Self {
             _sub,
             _name_sub,
             url_note: None,
@@ -145,12 +159,12 @@ impl ConnForm {
             name,
             url,
             host: input("localhost", &f.host, window, cx),
-            port: input("5432", &f.port, window, cx),
+            port: input("", &f.port, window, cx),
             database: input("", &f.database, window, cx),
             user: input("", &f.user, window, cx),
             password,
             schema: input("public (Postgres search_path)", &f.schema, window, cx),
-            init_sql: input("SET TIME ZONE 'UTC'", &f.init_sql, window, cx),
+            init_sql: input("", &f.init_sql, window, cx),
             color: f.color.trim().to_string(),
             driver: f.driver,
             ssl: f.ssl_mode,
@@ -163,6 +177,29 @@ impl ConnForm {
             databases: Vec::new(),
             loading_dbs: None,
             db_note: None,
+        };
+        this.driver_hints(window, cx);
+        this
+    }
+
+    /// Picks the driver: the fields' hints follow it, and a port left at the other driver's
+    /// default moves to this one's.
+    fn set_driver(&mut self, driver: Driver, window: &mut Window, cx: &mut Context<Self>) {
+        let port = self.port.read(cx).value().trim().to_string();
+        if DRIVERS.iter().any(|(_, d)| *d != driver && port == default_port(*d)) {
+            self.port.update(cx, |s, cx| s.set_value(default_port(driver), window, cx));
+        }
+        self.driver = Some(driver);
+        self.driver_hints(window, cx);
+        cx.notify();
+    }
+
+    /// The hints of the driver-specific fields (Port, URL, Host, User, Init SQL) for the current driver.
+    fn driver_hints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let d = self.driver.unwrap_or(Driver::Postgres);
+        let [url, host, user, init] = driver_hints(d);
+        for (input, hint) in [(&self.port, default_port(d)), (&self.url, url), (&self.host, host), (&self.user, user), (&self.init_sql, init)] {
+            input.update(cx, |s, cx| s.set_placeholder(hint, window, cx));
         }
     }
 
@@ -182,6 +219,7 @@ impl ConnForm {
                         set(&self.password, p.password, window, cx);
                     }
                     self.driver = p.driver;
+                    self.driver_hints(window, cx);
                     self.ssl = p.ssl_mode;
                     if !p.ignored.is_empty() {
                         self.url_note = Some(format!("Ignored: {}", p.ignored.join(", ")));
@@ -292,7 +330,7 @@ impl ConnForm {
         let conn = match form.to_connection(&self.dir, &self.keys, self.original.as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                self.db_note = Some(e);
+                self.db_note = Some(crate::db_error_text(&e));
                 return cx.notify();
             }
         };
@@ -314,8 +352,9 @@ impl ConnForm {
                         this.db_note = names.is_empty().then(|| "No databases".to_string());
                         this.databases = names;
                     }
-                    Ok(Err(e)) => this.db_note = Some(e.to_string()),
-                    Err(e) => this.db_note = Some(e.to_string()),
+                    // One short line: the full error would widen the field (Test shows it whole).
+                    Ok(Err(e)) => this.db_note = Some(crate::db_error_text(&e.to_string())),
+                    Err(e) => this.db_note = Some(crate::db_error_text(&e.to_string())),
                 }
                 cx.notify();
             })
@@ -385,9 +424,8 @@ impl Render for ConnForm {
 
         let driver_ix = DRIVERS.iter().position(|(_, d)| Some(*d) == self.driver).unwrap_or(0);
         let driver = DRIVERS.iter().fold(
-            TabBar::new("conn-driver").segmented().small().selected_index(driver_ix).on_click(cx.listener(|this, ix: &usize, _, cx| {
-                this.driver = Some(DRIVERS[(*ix).min(DRIVERS.len() - 1)].1);
-                cx.notify();
+            TabBar::new("conn-driver").segmented().small().selected_index(driver_ix).on_click(cx.listener(|this, ix: &usize, window, cx| {
+                this.set_driver(DRIVERS[(*ix).min(DRIVERS.len() - 1)].1, window, cx);
             })),
             |bar, (label, _)| bar.child(Tab::new().label(*label)),
         );
@@ -478,10 +516,11 @@ impl Render for ConnForm {
             .child(field("URL", &self.url))
             .children(self.url_note.clone().map(|n| div().text_xs().text_color(muted).child(n)))
             .child(h_flex().gap_2().child(div().flex_1().child(field("Host", &self.host))).child(div().w(px(100.)).child(field("Port", &self.port))))
-            .child(h_flex().gap_2().child(div().flex_1().child(Self::field("Database", muted, database))).child(div().flex_1().child(field("User", &self.user))))
+            .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(div().flex_1().min_w_0().child(field("User", &self.user))))
             .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))
             .child(h_flex().gap_2().child(div().flex_1().child(Self::field("SSL mode", muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
-            .child(field("Schema (search_path)", &self.schema))
+            // `search_path` exists only in Postgres; MySQL's schema is the database.
+            .when(self.driver != Some(Driver::MySql), |f| f.child(field("Schema (search_path)", &self.schema)))
             .child(field("Init SQL", &self.init_sql))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))
             .child(div().text_xs().text_color(muted).child(location))
