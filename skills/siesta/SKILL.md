@@ -91,8 +91,9 @@ before anything runs — ask the user to run these:
   `UPDATE … WHERE` runs there without confirmation;
 - statements that need confirmation (`confirmation_required`: `-- @confirm`, and destructive ones
   under `run.confirm_destructive = always`, see Safety). Relative paths resolve against the
-directory the client starts the server in. Register it, for example in Claude Code:
-`claude mcp add siesta -- siesta mcp`.
+directory the client starts the server in. Register it, for example in Claude Code (`siesta` must be on `PATH`: `cargo install --path crates/app`):
+`claude mcp add -s user siesta -- siesta mcp`, then check `claude mcp get siesta` says Connected. The tools
+appear in a new session.
 
 ## JSON output
 

@@ -186,8 +186,12 @@ siesta schema -c dev-pg users                             # look at the columns 
 For clients that talk MCP instead of running commands, `siesta mcp` is a stdio MCP server with the tools `connections`, `schema`, `list_statements` and `run_sql`. Each tool runs the CLI command with JSON output, so the results, masking and exit codes are the same. `run_sql` never skips a confirmation: writes on a `read_only` connection and anything that would ask (`-- @confirm`) are refused, and on a `prod` connection it runs only reads and `UPDATE … WHERE` (no `DELETE`, `INSERT`, `DROP`, `TRUNCATE`, `ALTER`). Nothing opens on screen.
 
 ```sh
-claude mcp add siesta -- siesta mcp
+cargo install --path crates/app          # puts `siesta` on PATH
+claude mcp add -s user siesta -- siesta mcp
+claude mcp get siesta                    # should say Connected
 ```
+
+`-s user` makes the server available in every project. The tools appear in a new Claude Code session.
 
 ## Development
 
