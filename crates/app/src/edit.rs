@@ -14,7 +14,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Editor, EditorState, InputEvent, InputState},
     v_flex,
 };
 use sql_split::{Dialect, Kind};
@@ -33,10 +33,70 @@ pub struct Target {
     pub note: Option<String>,
 }
 
-/// Binary values are not edited as text.
 fn binary(type_name: &str) -> bool {
     let t = type_name.to_ascii_uppercase();
     t == "BYTEA" || t.contains("BLOB") || t.contains("BINARY")
+}
+
+/// Text longer than this is a memo: it is edited in a window, not in the cell.
+pub const MEMO_CHARS: usize = 200;
+
+/// A value too big for the cell, edited in its own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Big {
+    /// Pretty-printed, with JSON highlighting.
+    Json,
+    /// Multi-line or long text.
+    Memo,
+    /// Bytes: a hex dump, loaded from and saved to a file.
+    Blob,
+}
+
+/// Whether the value of a cell (its pending text, else the result's value) needs a window.
+pub fn big(v: &Value, type_name: &str, pending: Option<&NewValue>) -> Option<Big> {
+    let ty = type_name.to_ascii_lowercase();
+    if matches!(v, Value::Bytes(_)) || binary(type_name) || matches!(pending, Some(NewValue::Bytes(_))) {
+        return Some(Big::Blob);
+    }
+    if matches!(v, Value::Json(_)) || ty.contains("json") {
+        return Some(Big::Json);
+    }
+    let text = match pending {
+        Some(NewValue::Text(s)) => s.clone(),
+        _ => v.display(),
+    };
+    (text.contains('\n') || text.chars().count() > MEMO_CHARS).then_some(Big::Memo)
+}
+
+/// A pending value of a cell.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NewValue {
+    /// Sent as a string literal; the server converts it to the column type.
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl NewValue {
+    /// The result's value as a pending one (NULL is `None`).
+    pub fn of(v: &Value) -> Option<NewValue> {
+        match v {
+            Value::Null => None,
+            Value::Bytes(b) => Some(NewValue::Bytes(b.clone())),
+            other => Some(NewValue::Text(other.display())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn text(s: &str) -> Option<NewValue> {
+        Some(NewValue::Text(s.into()))
+    }
+
+    pub fn as_value(&self) -> Value {
+        match self {
+            NewValue::Text(s) => Value::Text(s.clone()),
+            NewValue::Bytes(b) => Value::Bytes(b.clone()),
+        }
+    }
 }
 
 fn qualified(d: Dialect, t: &SourceTable) -> String {
@@ -75,7 +135,7 @@ pub fn plan(columns: &[Column], src: &Source) -> Result<Target, String> {
         let Some((ti, name)) = c else { continue };
         // The same table column twice (`SELECT id, id`): only the first one is edited.
         let repeated = src.columns[..i].contains(c);
-        if !keys[*ti].is_empty() && !repeated && !binary(&columns[i].type_name) {
+        if !keys[*ti].is_empty() && !repeated {
             cols[i] = Some((*ti, name.clone()));
         }
     }
@@ -84,7 +144,7 @@ pub fn plan(columns: &[Column], src: &Source) -> Result<Target, String> {
             return Err("the columns don't come from a table (expressions, functions or a subquery)".into());
         }
         if reasons.is_empty() {
-            reasons.push("only binary or repeated columns come from the table".into());
+            reasons.push("only repeated columns come from the table".into());
         }
         return Err(reasons.join("; "));
     }
@@ -97,10 +157,11 @@ pub fn plan(columns: &[Column], src: &Source) -> Result<Target, String> {
 }
 
 /// Pending new values per (row of the result, column); `None` is SQL NULL.
-pub type Changes = BTreeMap<(usize, usize), Option<String>>;
+pub type Changes = BTreeMap<(usize, usize), Option<NewValue>>;
 
-/// One `UPDATE … SET … WHERE <key> = <value as it was>;` per changed row and table. The new values
-/// are string literals (the server converts them to the column type); keys keep their own type.
+/// One `UPDATE … SET … WHERE <key> = <value as it was>;` per changed row and table. New text is a
+/// string literal (the server converts it to the column type), new bytes a hex literal; keys keep
+/// their own type.
 pub fn update_sql(d: Dialect, t: &Target, rows: &[Vec<Value>], changes: &Changes) -> Result<Vec<String>, String> {
     // (row, table) → its changed columns
     let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
@@ -116,7 +177,7 @@ pub fn update_sql(d: Dialect, t: &Target, rows: &[Vec<Value>], changes: &Changes
             .iter()
             .map(|c| {
                 let name = &t.cols[*c].as_ref().expect("editable").1;
-                let value = changes[&(row, *c)].as_ref().map_or_else(|| "NULL".to_string(), |s| literal(&Value::Text(s.clone()), d));
+                let value = changes[&(row, *c)].as_ref().map_or_else(|| "NULL".to_string(), |v| literal(&v.as_value(), d));
                 format!("{} = {value}", quote_ident(d, name))
             })
             .collect();
@@ -131,14 +192,6 @@ pub fn update_sql(d: Dialect, t: &Target, rows: &[Vec<Value>], changes: &Changes
         out.push(format!("UPDATE {}\nSET {}\nWHERE {};", qualified(d, table), assignments.join(",\n    "), cond.join("\n  AND ")));
     }
     Ok(out)
-}
-
-/// The text a cell is edited as (in the cell, so JSON is compact), NULL as `None`.
-pub fn edit_text(v: &Value) -> Option<String> {
-    match v {
-        Value::Null => None,
-        other => Some(other.display()),
-    }
 }
 
 /// Where a key in the in-place field goes.
@@ -216,87 +269,143 @@ impl Edit {
 }
 
 enum Field {
-    Line(Entity<InputState>),
+    /// JSON (pretty-printed) and memo text.
     Text(Entity<EditorState>),
+    /// Bytes, shown as a read-only hex dump; replaced from a file.
+    Blob { bytes: Vec<u8>, dump: Entity<EditorState> },
 }
 
-type Apply = Rc<dyn Fn(Option<String>, &mut Window, &mut App)>;
+type Apply = Rc<dyn Fn(Option<NewValue>, &mut Window, &mut App)>;
 
-/// The dialog of one cell: the value (one line, or an editor for multi-line text and JSON) and NULL.
+/// The window of a big value (JSON, memo, blob): the value and NULL.
 pub struct CellEdit {
     field: Field,
     null: bool,
-    _subs: Vec<Subscription>,
+}
+
+fn dump_text(b: &[u8]) -> String {
+    format!("{} bytes\n\n{}", b.len(), crate::format::hexdump(b, crate::value_popup::HEX_LIMIT))
 }
 
 impl CellEdit {
-    fn new(value: Option<String>, json: bool, apply: Apply, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let text = value.clone().unwrap_or_default();
-        let mut subs = vec![];
-        let field = if json || text.contains('\n') {
-            let ed = cx.new(|cx| {
-                let mut s = EditorState::new(window, cx).line_number(false).soft_wrap(true).folding(false);
-                s.set_highlighter(SharedString::from(if json { "json" } else { "text" }), cx);
+    fn new(value: Option<NewValue>, kind: Big, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = |text: String, lang: &'static str, readonly: bool, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut s = EditorState::new(window, cx).line_number(false).soft_wrap(!readonly).folding(false);
+                s.set_highlighter(SharedString::from(lang), cx);
                 s.set_value(text, window, cx);
+                s.set_readonly(readonly, cx);
                 s
-            });
-            Field::Text(ed)
-        } else {
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
-            subs.push(cx.subscribe_in(&input, window, move |this: &mut Self, _, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
-                    apply(this.value(cx), window, cx);
-                }
-            }));
-            Field::Line(input)
+            })
         };
-        CellEdit { field, null: value.is_none(), _subs: subs }
+        let field = match (kind, &value) {
+            (Big::Blob, v) => {
+                let bytes = match v {
+                    Some(NewValue::Bytes(b)) => b.clone(),
+                    Some(NewValue::Text(s)) => s.clone().into_bytes(),
+                    None => vec![],
+                };
+                let dump = editor(dump_text(&bytes), "text", true, window, cx);
+                Field::Blob { bytes, dump }
+            }
+            (_, v) => {
+                let text = match v {
+                    Some(NewValue::Text(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                // JSON is edited pretty-printed (text that does not parse stays as it is).
+                let (text, lang) = match kind {
+                    Big::Json => (serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|j| serde_json::to_string_pretty(&j).ok()).unwrap_or(text), "json"),
+                    _ => (text, "text"),
+                };
+                Field::Text(editor(text, lang, false, window, cx))
+            }
+        };
+        CellEdit { field, null: value.is_none() }
     }
 
-    fn value(&self, cx: &App) -> Option<String> {
+    fn value(&self, cx: &App) -> Option<NewValue> {
         if self.null {
             return None;
         }
         Some(match &self.field {
-            Field::Line(i) => i.read(cx).value().to_string(),
-            Field::Text(e) => e.read(cx).value().to_string(),
+            Field::Text(e) => NewValue::Text(e.read(cx).value().to_string()),
+            Field::Blob { bytes, .. } => NewValue::Bytes(bytes.clone()),
         })
     }
 
     fn focus(this: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        let field = match &this.read(cx).field {
-            Field::Line(i) => Field::Line(i.clone()),
-            Field::Text(e) => Field::Text(e.clone()),
-        };
-        match &field {
-            Field::Line(i) => i.update(cx, |s, cx| {
-                s.focus(window, cx);
-                s.select_all(window, cx);
-            }),
-            Field::Text(e) => e.update(cx, |s, cx| s.focus(window, cx)),
+        if let Field::Text(e) = &this.read(cx).field {
+            let e = e.clone();
+            e.update(cx, |s, cx| s.focus(window, cx));
         }
+    }
+
+    /// Blob: the bytes of a file replace the value.
+    fn load_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let read = std::fs::read(&path);
+            this.update_in(cx, |this, window, cx| match read {
+                Ok(b) => {
+                    if let Field::Blob { bytes, dump } = &mut this.field {
+                        dump.update(cx, |s, cx| s.set_value(dump_text(&b), window, cx));
+                        *bytes = b;
+                    }
+                    this.null = false;
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(format!("{}: {e}", path.display()), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Blob: the bytes to a file.
+    fn save_file(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Field::Blob { bytes, .. } = &self.field else { return };
+        let bytes = bytes.clone();
+        let picked = cx.prompt_for_new_path(&std::env::home_dir().unwrap_or_default(), Some("value.bin"));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            let msg = match std::fs::write(&path, &bytes) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("{}: {e}", path.display()),
+            };
+            cx.update(|window, cx| window.push_notification(msg, cx)).ok();
+        })
+        .detach();
     }
 }
 
 impl Render for CellEdit {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let field = match &self.field {
-            Field::Line(i) => div().child(Input::new(i)).into_any_element(),
-            Field::Text(e) => div()
-                .h(window.viewport_size().height * 0.45)
-                .border_1()
-                .border_color(cx.theme().border)
-                .rounded_md()
-                .child(Editor::new(e).size_full().bordered(false))
-                .into_any_element(),
+        let (editor, readonly, blob) = match &self.field {
+            Field::Text(e) => (e.clone(), false, false),
+            Field::Blob { dump, .. } => (dump.clone(), true, true),
         };
-        v_flex()
-            .gap_2()
-            .child(div().when(self.null, |d| d.opacity(0.4)).child(field))
+        let field = div()
+            .h(window.viewport_size().height * 0.55)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            // The element's own `readonly` overrides the state's on every render.
+            .child(Editor::new(&editor).readonly(readonly).size_full().bordered(false));
+        let actions = h_flex()
+            .gap_3()
+            .items_center()
             .child(Checkbox::new("cell-null").label("NULL").checked(self.null).on_click(cx.listener(|this, v: &bool, _, cx| {
                 this.null = *v;
                 cx.notify();
             })))
+            .when(blob, |row| {
+                row.child(Button::new("blob-load").label("Load from file…").small().on_click(cx.listener(|this, _, window, cx| this.load_file(window, cx))))
+                    .child(Button::new("blob-save").label("Save to file…").small().on_click(cx.listener(|this, _, window, cx| this.save_file(window, cx))))
+            });
+        v_flex().gap_2().child(div().when(self.null, |d| d.opacity(0.4)).child(field)).child(actions)
     }
 }
 
@@ -396,8 +505,9 @@ impl Siesta {
     }
 
     /// Double-click / Enter on a cell in edit mode: an editable cell turns into a field in place
-    /// (Enter or leaving the field keeps the value, Esc cancels); multi-line text opens a dialog.
-    /// `false`: not in edit mode or the column is read-only (the viewer opens instead).
+    /// (Enter or leaving the field keeps the value, Esc cancels); a big value (JSON, memo, blob)
+    /// opens in its own window. `false`: not in edit mode or the column is read-only (the viewer
+    /// opens instead).
     pub(crate) fn edit_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(target) = self.shown_edit(cx).and_then(|e| e.target().cloned()) else { return false };
         if target.cols.get(col).is_none_or(Option::is_none) {
@@ -408,13 +518,21 @@ impl Siesta {
         let g = self.ui.table.read(cx).delegate();
         let (Some(&ri), Some(o)) = (g.order.get(row), g.outcome()) else { return true };
         let column = o.columns[col].clone();
-        let original = edit_text(&o.rows[ri][col]);
+        let value = o.rows[ri][col].clone();
         let offset = g.done.as_ref().map_or(0, |d| d.page.offset);
-        let current = self.shown_edit(cx).and_then(|e| e.changes.get(&(ri, col)).cloned()).unwrap_or_else(|| original.clone());
-        if current.as_deref().is_some_and(|s| s.contains('\n')) {
-            self.edit_in_dialog(ri, col, &column, offset as usize + row + 1, current, original, window, cx);
+        let original = NewValue::of(&value);
+        let pending = self.shown_edit(cx).and_then(|e| e.changes.get(&(ri, col)).cloned());
+        if let Some(kind) = big(&value, &column.type_name, pending.as_ref().and_then(Option::as_ref)) {
+            let current = pending.unwrap_or_else(|| original.clone());
+            self.edit_in_window(ri, col, &column, kind, offset as usize + row + 1, current, original, window, cx);
             return true;
         }
+        let text = |v: Option<NewValue>| match v {
+            Some(NewValue::Text(s)) => Some(s),
+            Some(NewValue::Bytes(_)) | None => None,
+        };
+        let original = text(original);
+        let current = pending.map_or_else(|| original.clone(), text);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current.clone().unwrap_or_default()).placeholder(if current.is_none() { "NULL" } else { "" }));
         // Enter, Tab and the arrows are taken by the cell before the field sees them (`move_key`).
         let subs = vec![cx.subscribe_in(&input, window, |_, _, ev: &InputEvent, window, cx| {
@@ -438,8 +556,8 @@ impl Siesta {
     pub(crate) fn commit_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(i) = self.ui.edit.as_mut().and_then(|e| e.inline.take()) else { return };
         let text = i.input.read(cx).value().to_string();
-        let value = if text.is_empty() && i.current.is_none() { None } else { Some(text) };
-        self.set_change(i.ri, i.col, value, i.original, cx);
+        let value = if text.is_empty() && i.current.is_none() { None } else { Some(NewValue::Text(text)) };
+        self.set_change(i.ri, i.col, value, i.original.map(NewValue::Text), cx);
         self.focus_table(window, cx);
     }
 
@@ -491,29 +609,36 @@ impl Siesta {
         }
         let g = self.ui.table.read(cx).delegate();
         let (Some(&ri), Some(o)) = (g.order.get(row), g.outcome()) else { return };
-        let original = edit_text(&o.rows[ri][col]);
+        let original = NewValue::of(&o.rows[ri][col]);
         let value = if null { None } else { original.clone() };
         self.set_change(ri, col, value, original, cx);
     }
 
+    /// The window of a big value: JSON (pretty-printed, compared by content, so reformatting alone
+    /// is no change), memo text, or a blob (hex dump, Load from file… / Save to file…).
     #[allow(clippy::too_many_arguments)]
-    fn edit_in_dialog(&mut self, ri: usize, col: usize, column: &Column, n: usize, current: Option<String>, original: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let json = column.type_name.to_ascii_lowercase().contains("json");
+    fn edit_in_window(&mut self, ri: usize, col: usize, column: &Column, kind: Big, n: usize, current: Option<NewValue>, original: Option<NewValue>, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
         let apply: Apply = Rc::new(move |value, window, cx| {
             window.close_dialog(cx);
+            let parse = |v: &Option<NewValue>| match v {
+                Some(NewValue::Text(s)) => serde_json::from_str::<serde_json::Value>(s).ok(),
+                _ => None,
+            };
+            let same_json = kind == Big::Json && parse(&value).is_some() && parse(&value) == parse(&original);
+            let value = if same_json { original.clone() } else { value };
             let (this, original) = (this.clone(), original.clone());
-            // Enter arrives through the dialog's subscription, mid-update: apply after it.
             window.defer(cx, move |_, cx| {
                 this.update(cx, |this, cx| this.set_change(ri, col, value, original, cx)).ok();
             });
         });
-        let form = cx.new(|cx| CellEdit::new(current, json, apply.clone(), window, cx));
+        let form = cx.new(|cx| CellEdit::new(current, kind, window, cx));
         let title = format!("{} · {} · row {n}", column.name, column.type_name);
         let field = form.clone();
+        let width = (window.viewport_size().width * 0.8).min(px(1200.));
         window.open_dialog(cx, move |dialog, _, _| {
             let (apply, read) = (apply.clone(), field.clone());
-            dialog.title(title.clone()).w(px(640.)).child(field.clone()).footer(
+            dialog.title(title.clone()).w(width).child(field.clone()).footer(
                 h_flex()
                     .w_full()
                     .justify_end()
@@ -528,7 +653,7 @@ impl Siesta {
         CellEdit::focus(&form, window, cx);
     }
 
-    fn set_change(&mut self, row: usize, col: usize, value: Option<String>, original: Option<String>, cx: &mut Context<Self>) {
+    fn set_change(&mut self, row: usize, col: usize, value: Option<NewValue>, original: Option<NewValue>, cx: &mut Context<Self>) {
         let Some(key) = self.shown_key(cx) else { return };
         let Some(e) = self.ui.edit.as_mut().filter(|e| e.key == key) else { return };
         if value == original {
@@ -711,7 +836,7 @@ impl Siesta {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings `gpui::test`, which shadows `#[test]`.
-    use super::{Changes, edit_text, plan, update_sql};
+    use super::{Big, Changes, NewValue, big, plan, update_sql};
     use db_exec::{Column, Source, SourceTable, Value};
     use sql_split::Dialect;
 
@@ -728,7 +853,8 @@ mod tests {
         let cols = [col("id", "int4"), col("n", "text"), col("upper", "text"), col("blob", "bytea")];
         let src = Source { columns: vec![Some((0, "id".into())), Some((0, "name".into())), None, Some((0, "data".into()))], tables: vec![table("users", &["id"])] };
         let t = plan(&cols, &src).unwrap();
-        assert_eq!(t.cols, [Some((0, "id".to_string())), Some((0, "name".to_string())), None, None]);
+        // Binary columns too (they are edited in the blob window).
+        assert_eq!(t.cols, [Some((0, "id".to_string())), Some((0, "name".to_string())), None, Some((0, "data".to_string()))]);
         assert_eq!(t.keys, [vec![0]]);
         assert_eq!(t.note.as_deref(), Some("computed columns are read-only"));
 
@@ -754,9 +880,9 @@ mod tests {
         let t = plan(&cols, &src).unwrap();
         let rows = vec![vec![Value::Int(1), Value::Int(2), Value::Text("x".into()), Value::Null], vec![Value::Int(3), Value::Int(4), Value::Null, Value::Null]];
         let mut changes = Changes::new();
-        changes.insert((0, 2), Some("it's".into()));
+        changes.insert((0, 2), NewValue::text("it's"));
         changes.insert((0, 3), None);
-        changes.insert((1, 0), Some("30".into()));
+        changes.insert((1, 0), NewValue::text("30"));
         let sql = update_sql(Dialect::Postgres, &t, &rows, &changes).unwrap();
         assert_eq!(
             sql,
@@ -768,10 +894,15 @@ mod tests {
         );
         let sql = update_sql(Dialect::MySql, &t, &rows, &changes).unwrap();
         assert_eq!(sql[0], "UPDATE `public`.`t`\nSET `note` = 'it''s',\n    `j` = NULL\nWHERE `a` = 1\n  AND `b` = 2;");
+        // New bytes are a hex literal.
+        let mut bytes = Changes::new();
+        bytes.insert((0, 2), Some(NewValue::Bytes(vec![0xde, 0xad])));
+        assert_eq!(update_sql(Dialect::Postgres, &t, &rows, &bytes).unwrap()[0], "UPDATE \"public\".\"t\"\nSET \"note\" = '\\xdead'\nWHERE \"a\" = 1\n  AND \"b\" = 2;");
+        assert!(update_sql(Dialect::MySql, &t, &rows, &bytes).unwrap()[0].contains("`note` = X'dead'"));
         // A NULL key (outer join): no row to update.
         let rows = vec![vec![Value::Null, Value::Int(2), Value::Null, Value::Null]];
         let mut changes = Changes::new();
-        changes.insert((0, 2), Some("x".into()));
+        changes.insert((0, 2), NewValue::text("x"));
         assert!(update_sql(Dialect::Postgres, &t, &rows, &changes).unwrap_err().contains("is NULL"));
     }
 
@@ -798,8 +929,19 @@ mod tests {
 
     #[test]
     fn cells_edit_as_text() {
-        assert_eq!(edit_text(&Value::Null), None);
-        assert_eq!(edit_text(&Value::Int(5)).as_deref(), Some("5"));
-        assert_eq!(edit_text(&Value::Json(serde_json::json!({"a": 1}))).as_deref(), Some("{\"a\":1}"));
+        assert_eq!(NewValue::of(&Value::Null), None);
+        assert_eq!(NewValue::of(&Value::Int(5)), Some(NewValue::Text("5".into())));
+        assert_eq!(NewValue::of(&Value::Bytes(vec![1])), Some(NewValue::Bytes(vec![1])));
+        // Big values open in a window: JSON, blobs, multi-line or long text.
+        let text = |s: &str| Value::Text(s.into());
+        assert_eq!(big(&Value::Json(serde_json::json!({"a": 1})), "jsonb", None), Some(Big::Json));
+        assert_eq!(big(&Value::Null, "json", None), Some(Big::Json));
+        assert_eq!(big(&Value::Bytes(vec![1]), "bytea", None), Some(Big::Blob));
+        assert_eq!(big(&Value::Null, "LONGBLOB", None), Some(Big::Blob));
+        assert_eq!(big(&text("a\nb"), "text", None), Some(Big::Memo));
+        assert_eq!(big(&text(&"x".repeat(201)), "text", None), Some(Big::Memo));
+        assert_eq!(big(&text("short"), "text", None), None);
+        // A pending multi-line value keeps the window even for a short original.
+        assert_eq!(big(&text("short"), "text", Some(&NewValue::Text("a\nb".into()))), Some(Big::Memo));
     }
 }

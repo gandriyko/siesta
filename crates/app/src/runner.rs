@@ -1097,7 +1097,7 @@ mod tests {
         let target = crate::edit::plan(&cols, &src).unwrap();
         let rows = vec![vec![db_exec::Value::Text("a".into()), db_exec::Value::Int(1)], vec![db_exec::Value::Text("b".into()), db_exec::Value::Int(2)]];
         let mut changes = crate::edit::Changes::new();
-        changes.insert((0, 0), Some("A".into()));
+        changes.insert((0, 0), crate::edit::NewValue::text("A"));
         changes.insert((1, 0), None);
         let sql = crate::edit::update_sql(Dialect::Postgres, &target, &rows, &changes).unwrap();
         let a = rt.block_on(apply_job(h.clone(), conn.clone(), opts, sql, h.token()));

@@ -436,7 +436,7 @@ impl TableDelegate for Grid {
                 .rounded_sm()
                 .bg(t.warning.opacity(0.22))
                 .when(new.is_none(), |d| d.italic())
-                .child(new.clone().unwrap_or_else(|| self.null_text.clone()))
+                .child(new.as_ref().map_or_else(|| self.null_text.clone(), |v| cell_display(&v.as_value(), &self.null_text, self.preview_bytes)))
                 .into_any_element();
         }
         // JSON cells: hovering shows the whole document, formatted; the tip stays while the
