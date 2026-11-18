@@ -17,6 +17,8 @@ pub struct Doc {
     pub sql: bool,
     /// The split of the current text, refreshed after every edit.
     pub file: Arc<SqlFile>,
+    /// [`outline`] of the current text, made with the split: the tree reads it every frame.
+    pub outline: Vec<(usize, String)>,
     pub dialect: Dialect,
     /// The connections of the config dir.
     pub conns: Arc<Connections>,
@@ -66,6 +68,7 @@ impl Doc {
             editor,
             sql,
             file: Arc::default(),
+            outline: vec![],
             dialect: Dialect::default(),
             conns,
             active: None,
@@ -131,6 +134,7 @@ impl Doc {
             self.dialect = wanted;
             file = sql_split::split(&text, wanted);
         }
+        self.outline = outline(&text, &file);
         self.file = Arc::new(file);
         let default_schema = self.effective_connection().as_ref().and_then(default_schema);
         let mut lang = self.lang.borrow_mut();

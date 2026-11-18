@@ -5,7 +5,7 @@
 //! compact single-child folders (`api/v2`), inset rounded selection and muted meta on the right.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -134,12 +134,12 @@ fn name_of(p: &Path) -> String {
 
 impl Siesta {
     /// `(line, label)` of a file's statements: live split when open, else read once.
-    pub(crate) fn outline_of(&mut self, path: &Path, cx: &App) -> Vec<(usize, String)> {
+    pub(crate) fn outline_of(&mut self, path: &Path) -> Vec<(usize, String)> {
         if !siesta_workspace::is_sql(path) {
             return vec![];
         }
         match self.docs.iter().find(|d| *d.path == *path) {
-            Some(d) => crate::doc::outline(&d.editor.read(cx).value(), &d.file),
+            Some(d) => d.outline.clone(),
             None => self
                 .outlines
                 .entry(path.to_path_buf())
@@ -359,12 +359,12 @@ impl Siesta {
         }
     }
 
-    pub(crate) fn build_rows(&mut self, query: &str, cx: &App) -> Vec<Row> {
+    pub(crate) fn build_rows(&mut self, query: &str) -> Vec<Row> {
         let root = self.folder();
         let central = self.central.clone();
         let mut rows = vec![Row::Section(Section::Collections)];
         let mut found = vec![];
-        self.emit(&Tree::build(&root, &central), &root, 0, query, &mut found, cx);
+        self.emit(&Tree::build(&root, &central), &root, 0, query, &mut found);
         if found.is_empty() && query.is_empty() {
             rows.push(Row::Note { text: "No files yet: the buttons above make or import one", depth: 0 });
         }
@@ -372,7 +372,7 @@ impl Siesta {
         rows.push(Row::Section(Section::Files));
         let mut found = vec![];
         for f in self.added.clone() {
-            self.emit_file(&f, 0, query, true, &mut found, cx);
+            self.emit_file(&f, 0, query, true, &mut found);
         }
         if found.is_empty() && query.is_empty() {
             rows.push(Row::Note { text: "+ adds .sql files from anywhere", depth: 0 });
@@ -381,7 +381,7 @@ impl Siesta {
         rows
     }
 
-    fn emit(&mut self, tree: &Tree, base: &Path, depth: usize, query: &str, rows: &mut Vec<Row>, cx: &App) {
+    fn emit(&mut self, tree: &Tree, base: &Path, depth: usize, query: &str, rows: &mut Vec<Row>) {
         let searching = !query.is_empty();
         for (name, node) in &tree.dirs {
             // Compact folders: a chain of single-child folders shows as `a/b/c`.
@@ -392,7 +392,7 @@ impl Siesta {
             }
             if searching {
                 let mut found = vec![];
-                self.emit(node, &path, depth + 1, query, &mut found, cx);
+                self.emit(node, &path, depth + 1, query, &mut found);
                 if !found.is_empty() {
                     rows.push(Row::Dir { path: path.clone(), name: label, depth });
                     rows.extend(found);
@@ -401,16 +401,16 @@ impl Siesta {
             }
             rows.push(Row::Dir { path: path.clone(), name: label, depth });
             if !self.collapsed_dirs.contains(&path) {
-                self.emit(node, &path, depth + 1, query, rows, cx);
+                self.emit(node, &path, depth + 1, query, rows);
             }
         }
         for f in &tree.files {
-            self.emit_file(f, depth, query, false, rows, cx);
+            self.emit_file(f, depth, query, false, rows);
         }
     }
 
-    fn emit_file(&mut self, f: &Path, depth: usize, query: &str, added: bool, rows: &mut Vec<Row>, cx: &App) {
-        let outline = self.outline_of(f, cx);
+    fn emit_file(&mut self, f: &Path, depth: usize, query: &str, added: bool, rows: &mut Vec<Row>) {
+        let outline = self.outline_of(f);
         let (name, path) = (name_of(f), f.to_path_buf());
         if !query.is_empty() {
             // A file-name match keeps all its statements; otherwise only the matching ones.
@@ -507,26 +507,52 @@ impl Siesta {
     }
 
     /// Every row; a file's statements beyond [`FILE_STATEMENTS`] go into a block of that height
-    /// that scrolls on its own, so one long file doesn't push the rest of the tree away.
-    // ponytail: not virtualized (uniform_list can't hold a block of another height); fine for
-    // hundreds of rows, a variable-height `list` if the tree ever has thousands.
+    /// that scrolls on its own, so one long file doesn't push the rest of the tree away. The block
+    /// is a `uniform_list`: only its visible rows are built, as the tree is laid out every frame
+    /// (each cursor move redraws the window) and hundreds of statement rows made ↑/↓ stutter.
+    // ponytail: the tree outside the blocks is not virtualized; fine for hundreds of rows.
     fn render_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = vec![];
         for (span, path) in long_statement_runs(&self.rows) {
-            let items = span.map(|i| self.render_row(i, cx));
             match path {
                 // Keyed by the file, so its scroll position survives the tree changing around it.
                 Some(p) => {
                     let id = ElementId::Name(format!("statements:{}", p.display()).into());
-                    out.push(div().id(id).flex_none().h(px(FILE_STATEMENTS as f32 * ROW_H)).overflow_y_scroll().children(items).into_any_element());
+                    let start = span.start;
+                    let list = uniform_list(
+                        id,
+                        span.len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let range = (start + range.start).min(this.rows.len())..(start + range.end).min(this.rows.len());
+                            let statuses = this.statuses_of(range.clone(), cx);
+                            range.map(|i| this.render_row(i, &statuses, cx)).collect::<Vec<_>>()
+                        }),
+                    );
+                    out.push(div().flex_none().h(px(FILE_STATEMENTS as f32 * ROW_H)).child(list.size_full()).into_any_element());
                 }
-                None => out.extend(items),
+                None => {
+                    let statuses = self.statuses_of(span.clone(), cx);
+                    out.extend(span.map(|i| self.render_row(i, &statuses, cx)));
+                }
             }
         }
         out
     }
 
-    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// Run statuses of the files whose statements are among `rows`, one pass per file.
+    fn statuses_of(&self, rows: std::ops::Range<usize>, cx: &App) -> HashMap<PathBuf, HashMap<usize, (String, bool)>> {
+        let mut out = HashMap::new();
+        for r in &self.rows[rows] {
+            if let Row::Statement { path, .. } = r
+                && !out.contains_key(path)
+            {
+                out.insert(path.clone(), self.statement_statuses(path, cx));
+            }
+        }
+        out
+    }
+
+    fn render_row(&self, ix: usize, statuses: &HashMap<PathBuf, HashMap<usize, (String, bool)>>, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme();
         let (muted, hover, active, guide) = (t.muted_foreground, t.list_hover, t.list_active, t.sidebar_border);
         let row = &self.rows[ix];
@@ -637,7 +663,7 @@ impl Siesta {
                 let selected = doc.is_some() && doc == self.current && doc.is_some_and(|i| self.docs[i].active_statement().is_some_and(|s| s.line == *line));
                 let (p, line) = (path.clone(), *line);
                 // The last run: row count, or ✕, between the label and the line number.
-                let status = self.statement_status(path, line, cx);
+                let status = statuses.get(path).and_then(|s| s.get(&line)).cloned();
                 base.when(selected, |r| r.bg(active))
                     .child(spacer())
                     .child(div().flex_1().truncate().font_family(t.mono_font_family.clone()).child(label.clone()))
@@ -689,7 +715,7 @@ impl Siesta {
         let body = match self.side_tab {
             SideTab::Files => {
                 let query = self.sidebar_filter.read(cx).value().trim().to_lowercase();
-                self.rows = self.build_rows(&query, cx);
+                self.rows = self.build_rows(&query);
                 let list = div().id("sidebar").overflow_y_scroll().children(self.render_rows(cx));
                 let search = div()
                     .flex_none()

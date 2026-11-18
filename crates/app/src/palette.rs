@@ -179,7 +179,7 @@ impl Siesta {
     pub(crate) fn pick_workspace_statement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut items = vec![];
         for f in self.files.clone().into_iter().filter(|f| siesta_workspace::is_sql(f)) {
-            let outline = self.outline_of(&f, cx);
+            let outline = self.outline_of(&f);
             let rel = f.strip_prefix(self.folder()).unwrap_or(&f).display().to_string();
             for (line, label) in outline {
                 let path = f.clone();

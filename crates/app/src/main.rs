@@ -1930,9 +1930,9 @@ mod tests {
         let a = ws.path().join("collections/a.sql");
         // The file expands into its statements: `@name` or the first line.
         let rows = cx.update(|_, cx| {
-            app.update(cx, |this, cx| {
+            app.update(cx, |this, _| {
                 this.expanded.insert(a.clone());
-                this.build_rows("", cx)
+                this.build_rows("")
             })
         });
         let statements: Vec<(usize, String)> = rows

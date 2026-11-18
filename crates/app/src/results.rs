@@ -580,6 +580,17 @@ impl Ui {
     }
 }
 
+/// What the tree shows beside a statement: `…` while it runs, its row count, or ✕.
+fn entry_status(e: &Entry) -> Option<(String, bool)> {
+    if e.running.is_some() && e.done.is_none() {
+        return Some(("…".into(), false));
+    }
+    match &e.done.as_ref()?.result {
+        Ok(o) => Some((o.rows_affected.filter(|_| o.columns.is_empty()).map_or_else(|| o.rows.len().to_string(), |n| n.to_string()), false)),
+        Err(_) => Some(("✕".into(), true)),
+    }
+}
+
 fn plain_error(e: &DbError) -> String {
     let mut s = match &e.code {
         Some(c) => format!("ERROR {c}: {}", e.message),
@@ -636,18 +647,27 @@ impl Siesta {
     }
 
     /// Row count or ✕ beside a statement of the tree.
+    #[cfg(test)]
     pub(crate) fn statement_status(&self, path: &Path, line: usize, cx: &App) -> Option<(String, bool)> {
-        let d = self.docs.iter().find(|d| *d.path == path)?;
-        let st = d.file.statements.iter().find(|s| s.line == line)?;
-        let text = d.editor.read(cx).text().slice(st.range.clone()).to_string();
-        let e = self.store.entries.get(&(path.to_path_buf(), text))?;
-        if e.running.is_some() && e.done.is_none() {
-            return Some(("…".into(), false));
+        self.statement_statuses(path, cx).remove(&line)
+    }
+
+    /// Row count or ✕ per statement line (1-based) of an open file, for the tree. One pass over
+    /// the file's results, not a text copy per statement: the tree is drawn every frame.
+    pub(crate) fn statement_statuses(&self, path: &Path, cx: &App) -> HashMap<usize, (String, bool)> {
+        let mut out = HashMap::new();
+        let Some(d) = self.docs.iter().find(|d| *d.path == path) else { return out };
+        let rope = d.editor.read(cx).text();
+        for ((p, text), e) in &self.store.entries {
+            let Some(status) = (p == path).then(|| entry_status(e)).flatten() else { continue };
+            // Only a statement of the same length can have this text: compare those alone.
+            for st in d.file.statements.iter().filter(|s| s.range.len() == text.len()) {
+                if rope.slice(st.range.clone()) == text.as_str() {
+                    out.insert(st.line, status.clone());
+                }
+            }
         }
-        match &e.done.as_ref()?.result {
-            Ok(o) => Some((o.rows_affected.filter(|_| o.columns.is_empty()).map_or_else(|| o.rows.len().to_string(), |n| n.to_string()), false)),
-            Err(_) => Some(("✕".into(), true)),
-        }
+        out
     }
 
     fn entry(&self, key: &Key) -> Option<&Entry> {
