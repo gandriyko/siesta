@@ -338,6 +338,11 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
         h
     });
     for (n, j) in jobs.iter().enumerate() {
+        // Shown as running in the app's History until this iteration ends (after `record`).
+        let _running = history.as_ref().and_then(|h| {
+            let entry = db_exec::history::Entry { source: source.into(), line: j.line, connection: conn.name.clone(), database: conn.database.clone(), sql: j.text.clone(), ..Default::default() };
+            h.begin(&history_file, entry).inspect_err(|e| eprintln!("{} history: {e}", paint("warning:", YELLOW, true))).ok()
+        });
         let result = rt.block_on(session.run(&j.text, j.kind, &page));
         let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, database: conn.database.as_deref(), result: &result, max_rows: cap };
         if let Err(e) = &result {

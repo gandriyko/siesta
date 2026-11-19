@@ -162,6 +162,8 @@ pub(crate) struct Siesta {
     conn_form: Option<WeakEntity<conn_form::ConnForm>>,
     /// History page (Cmd+Y) in place of the editor.
     show_history: bool,
+    /// `history/` and `history/running/` mtimes at the last reload (`poll_history`).
+    history_stamp: [Option<std::time::SystemTime>; 2],
     /// This project's history, newest first; read when the page opens and after runs.
     history: Vec<db_exec::history::Entry>,
     /// Indices into `history` matching the filter (the list's rows).
@@ -331,6 +333,7 @@ impl Siesta {
             config_dir,
             conn_form: None,
             show_history: false,
+            history_stamp: [None; 2],
             history: vec![],
             history_rows: vec![],
             history_filter,
@@ -471,6 +474,7 @@ impl Siesta {
                 let alive = this.update_in(cx, |this, window, cx| {
                     let now = stamp(&this.settings);
                     this.check_files(window, cx);
+                    this.poll_history(cx);
                     if now == last {
                         return;
                     }

@@ -13,6 +13,7 @@ use gpui_component::{
     ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::Input,
+    spinner::Spinner,
 };
 use crate::Siesta;
 
@@ -92,8 +93,26 @@ impl Siesta {
         }
     }
 
+    /// Statements still executing (from the CLI or MCP) come first.
     pub(crate) fn reload_history(&mut self) {
-        self.history = self.history_store().map(|s| s.list()).unwrap_or_default();
+        self.history_stamp = self.history_dirs_mtime();
+        self.history = self.history_store().map(|s| [s.running(), s.list()].concat()).unwrap_or_default();
+    }
+
+    /// Modification times of `history/` and `history/running/`: a run started or finished in
+    /// any process changes one of them.
+    fn history_dirs_mtime(&self) -> [Option<std::time::SystemTime>; 2] {
+        let dir = self.history_store().map(|s| s.dir().to_path_buf());
+        let mtime = |p: Option<PathBuf>| std::fs::metadata(p?).and_then(|m| m.modified()).ok();
+        [mtime(dir.clone()), mtime(dir.map(|d| d.join("running")))]
+    }
+
+    /// Called every second: an open History page follows CLI and MCP runs live.
+    pub(crate) fn poll_history(&mut self, cx: &mut Context<Self>) {
+        if self.show_history && self.history_dirs_mtime() != self.history_stamp {
+            self.reload_history();
+            cx.notify();
+        }
     }
 
     /// Indices of entries matching every word of the filter (SQL, connection, database, file, outcome).
@@ -255,8 +274,11 @@ impl Siesta {
             .child(div().w(px(CONN_W)).flex_none().truncate().text_xs().child(conn))
             .child(div().flex_1().min_w_0().truncate().text_sm().font_family(mono).child(sql))
             .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(self.history_origin(e)))
-            .child(div().w(px(OUTCOME_W)).flex_none().truncate().text_xs().text_color(outcome_color).child(e.outcome()))
-            .child(div().w(px(MS_W)).flex_none().text_right().text_xs().text_color(slow).child(e.duration_ms.to_string()))
+            .child(div().w(px(OUTCOME_W)).flex_none().flex().items_center().gap_1p5().truncate().text_xs().map(|d| match e.running {
+                true => d.text_color(t.warning).child(Spinner::new().xsmall()).child("running"),
+                false => d.text_color(outcome_color).child(e.outcome()),
+            }))
+            .child(div().w(px(MS_W)).flex_none().text_right().text_xs().text_color(slow).when(!e.running, |d| d.child(e.duration_ms.to_string())))
             .child(div().w(px(ACTIONS_W)).flex_none().flex().child(insert).child(run))
             // Double click inserts the statement.
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {

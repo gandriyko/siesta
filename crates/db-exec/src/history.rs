@@ -32,6 +32,9 @@ pub struct Entry {
     pub affected: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Still executing: read from `history/running/` ([`Store::running`]), not stored.
+    #[serde(skip)]
+    pub running: bool,
 }
 
 impl Entry {
@@ -91,6 +94,40 @@ impl Store {
         Ok(id)
     }
 
+    /// Mark a statement as executing: `history/running/<id>.json`, which other processes (the
+    /// app's History) see. Dropping the guard removes it.
+    pub fn begin(&self, file: &Path, mut entry: Entry) -> io::Result<Running> {
+        let dir = self.dir.join("running");
+        std::fs::create_dir_all(&dir)?;
+        let now = chrono::Utc::now();
+        entry.id = format!("{}-{}", now.format("%Y-%m-%dT%H-%M-%S%.9fZ"), std::process::id());
+        entry.time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        entry.file = file.to_string_lossy().into_owned();
+        let path = dir.join(format!("{}.json", entry.id));
+        std::fs::write(&path, serde_json::to_vec(&entry).map_err(io::Error::other)?)?;
+        Ok(Running(path))
+    }
+
+    /// Statements executing now, newest first. A marker left by a killed process is dropped
+    /// after [`STALE`].
+    pub fn running(&self) -> Vec<Entry> {
+        let mut out: Vec<Entry> = std::fs::read_dir(self.dir.join("running"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|f| {
+                if f.metadata().ok()?.modified().ok()?.elapsed().unwrap_or_default() > STALE {
+                    let _ = std::fs::remove_file(f.path());
+                    return None;
+                }
+                let e: Entry = serde_json::from_slice(&std::fs::read(f.path()).ok()?).ok()?;
+                Some(Entry { running: true, ..e })
+            })
+            .collect();
+        out.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+        out
+    }
+
     /// Ids, newest first.
     fn ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = std::fs::read_dir(&self.dir)
@@ -107,6 +144,19 @@ impl Store {
     // ponytail: reads every entry (≤ `total` small files) when the window opens; add an index file if it shows up.
     pub fn list(&self) -> Vec<Entry> {
         self.ids().iter().filter_map(|id| serde_json::from_slice::<Entry>(&std::fs::read(self.dir.join(format!("{id}.json"))).ok()?).ok()).collect()
+    }
+}
+
+/// A `running` marker older than this belongs to a killed process.
+// ponytail: age instead of a PID liveness check; a statement slower than this vanishes from the list early.
+const STALE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Executing marker from [`Store::begin`]; removed on drop (done, failed or interrupted).
+pub struct Running(PathBuf);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -131,5 +181,13 @@ mod tests {
         assert_eq!(list.iter().map(|e| (e.sql.as_str(), e.file.as_str())).collect::<Vec<_>>(), [("DELETE", "/w1/q/reports.sql"), ("SELECT b", "/w2/x.sql"), ("SELECT 2", "/w1/q/reports.sql")]);
         assert_eq!((list[0].outcome(), list[2].outcome()), ("42P01 no table".into(), "2 rows".into()));
         assert!(list[0].time.ends_with('Z') && !list[0].time_label().is_empty());
+
+        // An executing marker is listed apart from the history and gone on drop.
+        let running = s.begin(file, Entry { source: "mcp".into(), sql: "SELECT pg_sleep(5)".into(), ..Default::default() }).unwrap();
+        let r = s.running();
+        assert_eq!((r.len(), r[0].sql.as_str(), r[0].running, r[0].file.as_str()), (1, "SELECT pg_sleep(5)", true, "/w1/q/reports.sql"));
+        assert_eq!(s.list().len(), 3);
+        drop(running);
+        assert!(s.running().is_empty());
     }
 }

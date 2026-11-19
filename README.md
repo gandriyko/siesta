@@ -36,7 +36,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 | **Connections** | Postgres and MySQL / MariaDB, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
 | **Safety** | Production connections get a red banner and confirm every non-read statement; read-only connections refuse writes in Siesta and in the server session; open transactions are asked about before a file or the app closes |
 | **Schema** | DB tab: schemas, tables, columns and indexes; insert a `SELECT` for a table or show its DDL |
-| **History** | Every run is stored per project (statement, connection, time, duration, rows or error; never the data), whether it came from the app, the CLI (`cli`) or an agent through MCP (`mcp`). A filterable list (<kbd>⌘</kbd> <kbd>Y</kbd>) to insert or rerun any entry |
+| **History** | Every run is stored per project (statement, connection, time, duration, rows or error; never the data), whether it came from the app, the CLI (`cli`) or an agent through MCP (`mcp`). A filterable list (<kbd>⌘</kbd> <kbd>Y</kbd>) to insert or rerun any entry. A CLI or MCP statement still executing shows at the top with a spinner (`running`), and the open page follows new runs live |
 | **Files** | A central folder of `.sql` files with subfolders, plus files added from anywhere; import, new file / folder, Trash, drag and drop; a statement tree, command palette, light and dark themes, VS Code / JetBrains keymaps, state restored on launch |
 
 ## Quick start
@@ -141,6 +141,7 @@ Two folders, kept apart on purpose: one for what you write, one for what the app
   files.json                the sidebar's Files: paths of .sql files added from elsewhere
   state.json                open tabs and cursors, reopened on launch
   history/                  every run: <time>.json (source gui / cli / mcp, file, statement, connection, database, outcome)
+    running/                CLI / MCP statements executing now, removed when they finish
   cache/                    database structure per connection, for the DB tab and completion
 ```
 
