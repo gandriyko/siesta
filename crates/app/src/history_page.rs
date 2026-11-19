@@ -29,6 +29,50 @@ const OUTCOME_W: f32 = 150.;
 const MS_W: f32 = 56.;
 const ACTIONS_W: f32 = 56.;
 
+/// The statement cell's hover tip: the SQL formatted and highlighted, scrollable when long.
+/// Hoverable, so the pointer can move onto it and scroll; a click copies the formatted SQL.
+struct SqlTip {
+    text: SharedString,
+    runs: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+impl SqlTip {
+    fn new(sql: &str, cx: &App) -> Self {
+        let text = sqlformat::format(sql.trim(), &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default());
+        let mut hl = gpui_component::highlighter::SyntaxHighlighter::new("sql");
+        hl.update(None, &gpui_component::input::Rope::from(text.as_str()), None);
+        let runs = hl.styles(&(0..text.len()), &*cx.theme().highlight_theme);
+        Self { text: text.into(), runs }
+    }
+}
+
+impl Render for SqlTip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        div()
+            .id("sql-tip")
+            .max_w(px(720.))
+            .max_h(px(420.))
+            .overflow_scroll()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_color(t.popover_foreground)
+            .shadow_md()
+            .font_family(t.mono_font_family.clone())
+            .text_size(t.mono_font_size * 0.9)
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(this.text.to_string()));
+                window.push_notification("Copied the statement", cx);
+            }))
+            .child(StyledText::new(self.text.clone()).with_highlights(self.runs.clone()))
+    }
+}
+
 impl Siesta {
     fn history_store(&self) -> Option<Store> {
         let mut s = Store::open(self.base.as_deref()?).inspect_err(|e| eprintln!("siesta: history disabled: {e}")).ok()?;
@@ -251,6 +295,7 @@ impl Siesta {
             None => e.connection.clone(),
         };
         let sql: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let full = e.sql.clone();
         let insert = Button::new(("history-insert", ix)).icon(IconName::Plus).ghost().xsmall().tooltip("Insert into the editor").on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
             this.history_insert(i, window, cx);
@@ -272,7 +317,22 @@ impl Siesta {
             .hover(move |s| s.bg(hover))
             .child(div().w(px(TIME_W)).flex_none().text_xs().font_family(mono.clone()).text_color(muted).child(e.time_label()))
             .child(div().w(px(CONN_W)).flex_none().truncate().text_xs().child(conn))
-            .child(div().flex_1().min_w_0().truncate().text_sm().font_family(mono).child(sql))
+            .child(
+                div()
+                    .id(("history-sql", ix))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_family(mono)
+                    .child(sql)
+                    // GPUI's default 500 ms feels slow when moving down the list.
+                    .tooltip_show_delay(std::time::Duration::from_millis(100))
+                    .hoverable_tooltip(move |_, cx| {
+                        let tip = SqlTip::new(&full, cx);
+                        cx.new(|_| tip).into()
+                    }),
+            )
             .child(div().w(px(FILE_W)).flex_none().truncate().text_xs().text_color(muted).child(self.history_origin(e)))
             .child(div().w(px(OUTCOME_W)).flex_none().flex().items_center().gap_1p5().truncate().text_xs().map(|d| match e.running {
                 true => d.text_color(t.warning).child(Spinner::new().xsmall()).child("running"),
