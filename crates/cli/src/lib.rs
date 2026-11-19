@@ -112,7 +112,8 @@ pub fn main_if_cli() -> Option<ExitCode> {
     if !is_cli(&args[1..]) {
         return None;
     }
-    Some(ExitCode::from(run_with(args, &mut std::io::stdout().lock())))
+    // Not `stdout().lock()`: `siesta mcp` writes replies from other threads, which would wait forever.
+    Some(ExitCode::from(run_with(args, &mut std::io::stdout())))
 }
 
 /// Runs the CLI with `args` (program name first), writing results to `out`. Returns the exit code.
