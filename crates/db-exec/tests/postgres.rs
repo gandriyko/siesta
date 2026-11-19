@@ -380,6 +380,21 @@ async fn cancel_returns_quickly_and_session_survives() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn cancel_refuses_a_backend_that_no_longer_looks_like_this_session() {
+    let mut s = open_pg().await;
+    let handle = s.cancel_handle();
+    // A change the session cannot see (as when a pooler hands the backend to another client).
+    run(&mut s, "SELECT set_config('applica' || 'tion_name', 'someone_else', false)").await;
+    let (res, cancelled) = tokio::join!(try_run(&mut s, "SELECT pg_sleep(1)"), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.cancel().await
+    });
+    assert!(cancelled.unwrap_err().message.contains("Nothing cancelled"));
+    assert!(res.is_ok(), "the statement was not cancelled");
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn reconnects_after_the_backend_is_killed() {
     let mut s = open_pg().await;
     run(&mut s, "SET application_name = 'before_kill'").await;
@@ -389,7 +404,7 @@ async fn reconnects_after_the_backend_is_killed() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let o = run(&mut s, "SHOW application_name").await;
     assert!(o.notices.iter().any(|n| n.contains("lost")), "{:?}", o.notices);
-    assert_eq!(texts(&o), ["siesta"]); // fresh connection: session state is gone
+    assert!(texts(&o)[0].starts_with("siesta-"), "{:?}", texts(&o)); // fresh connection: session state is gone
     assert_ne!(s.backend_id(), old);
     assert!(run(&mut s, "SELECT 1").await.notices.is_empty());
 }

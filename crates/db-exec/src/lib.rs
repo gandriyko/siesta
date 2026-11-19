@@ -15,8 +15,8 @@ mod wrap;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use db_conn::{Connection, Driver, Socket, SslMode};
@@ -172,29 +172,58 @@ async fn within<T>(opts: &Opts, timeout: Duration, f: impl Future<Output = Resul
 /// The session stays usable (the cancelled run fails with SQLSTATE `57014` / `70100`).
 /// It follows the session's live connection: after an automatic reconnect it targets the new
 /// backend, and while the connection is being reopened it does nothing (the old id may be reused).
+/// It acts only when the server still shows this session's [`Target`] under that id.
 #[derive(Clone)]
 pub struct CancelHandle {
     opts: std::sync::Arc<Opts>,
-    backend_id: Arc<AtomicU64>,
+    target: Arc<Mutex<Target>>,
     connect_timeout: Duration,
 }
 
+/// What a cancel must find on the server before it acts: the backend id plus a tag the server
+/// reports for it. Postgres: that backend's `application_name`, unique per connection
+/// ([`pg_options`]). MySQL / MariaDB: server identity and the connection's client `HOST`
+/// (host:port). Behind a pooler or load balancer the same id can be another client's connection.
+#[derive(Clone, Default)]
+struct Target {
+    /// `pg_backend_pid()` / `CONNECTION_ID()`; 0 = no live connection.
+    id: u64,
+    tag: String,
+}
+
+/// The [`Target`] tag of MySQL connection `?`, from any connection to the same server.
+const MY_TAG: &str = "SELECT CONCAT_WS('/', @@hostname, @@port, @@server_id, HOST) FROM information_schema.PROCESSLIST WHERE ID = ?";
+
 impl CancelHandle {
     pub async fn cancel(&self) -> Result<(), DbError> {
-        let id = self.backend_id.load(Ordering::SeqCst);
+        let Target { id, tag } = self.target.lock().unwrap().clone();
         if id == 0 {
             return Ok(());
         }
         let e = |e| DbError::from_sqlx(e, 0, 0);
+        let other = || DbError::msg(format!("Nothing cancelled: server connection {id} no longer belongs to this session (a pooler or load balancer in between?)"));
         within(&self.opts, self.connect_timeout, async {
             match &*self.opts {
                 Opts::Pg(o) => {
                     let mut c = PgConnection::connect_with(o).await.map_err(e)?;
-                    sqlx::query("SELECT pg_cancel_backend($1)").bind(id as i32).execute(&mut c).await.map_err(e)?;
+                    // Check and cancel in one statement.
+                    let hit = sqlx::query("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = $1 AND application_name = $2")
+                        .bind(id as i32)
+                        .bind(&tag)
+                        .fetch_optional(&mut c)
+                        .await
+                        .map_err(e)?;
                     let _ = c.close().await;
+                    hit.ok_or_else(other)?;
                 }
                 Opts::My(o) => {
                     let mut c = MySqlConnection::connect_with(o).await.map_err(e)?;
+                    // ponytail: check, then KILL: MySQL has no atomic form; the gap is one round trip.
+                    let now: Option<String> = sqlx::query_scalar(MY_TAG).bind(id).fetch_optional(&mut c).await.map_err(e)?;
+                    if now.as_deref() != Some(tag.as_str()) {
+                        let _ = c.close().await;
+                        return Err(other());
+                    }
                     sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {id}"))).execute(&mut c).await.map_err(e)?;
                     let _ = c.close().await;
                 }
@@ -209,8 +238,8 @@ pub struct Session {
     conn: Conn,
     opts: std::sync::Arc<Opts>,
     spec: Connection,
-    /// Shared with the [`CancelHandle`]s; 0 while there is no live connection.
-    backend_id: Arc<AtomicU64>,
+    /// Shared with the [`CancelHandle`]s; id 0 while there is no live connection.
+    target: Arc<Mutex<Target>>,
     in_tx: bool,
     /// MySQL `SET autocommit = 0`: every statement belongs to an open transaction.
     autocommit_off: bool,
@@ -281,7 +310,14 @@ fn pg_options(c: &Connection) -> Result<PgConnectOptions, DbError> {
     if let Some(p) = &c.ssl.key {
         o = o.ssl_client_key(p);
     }
-    Ok(o.application_name("siesta").disable_statement_logging())
+    Ok(o.application_name(&unique_app_name()).disable_statement_logging())
+}
+
+/// `siesta-<pid>-<time>-<n>`: unique per connection, so a cancel can tell its backend apart ([`Target`]).
+fn unique_app_name() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("siesta-{}-{t:x}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
 fn mysql_options(c: &Connection) -> Result<MySqlConnectOptions, DbError> {
@@ -400,7 +436,7 @@ impl Session {
                 conn,
                 opts: opts.clone(),
                 spec: c.clone(),
-                backend_id: Arc::new(AtomicU64::new(0)),
+                target: Arc::default(),
                 in_tx: false,
                 autocommit_off: false,
                 mariadb: false,
@@ -443,7 +479,6 @@ impl Session {
     async fn init(&mut self) -> SqlxResult<()> {
         match &mut self.conn {
             Conn::Pg(c) => {
-                self.backend_id.store(sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut *c).await?.try_get::<i32, _>(0)? as u64, Ordering::SeqCst);
                 if let Some(s) = &self.spec.schema {
                     sqlx::query("SELECT set_config('search_path', $1, false)").bind(s).execute(&mut *c).await?;
                 }
@@ -452,7 +487,6 @@ impl Session {
                 }
             }
             Conn::My(c) => {
-                self.backend_id.store(sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut *c).await?.try_get::<u64, _>(0)?, Ordering::SeqCst);
                 let version = sqlx::query("SELECT VERSION()").fetch_one(&mut *c).await?.try_get::<String, _>(0)?;
                 self.mariadb = version.to_ascii_lowercase().contains("mariadb");
                 if self.spec.read_only {
@@ -466,6 +500,23 @@ impl Session {
                 self.simple(st.text(&init)).await?;
             }
         }
+        // After `init_sql`: it may set `application_name`.
+        self.read_target().await
+    }
+
+    /// Reads this connection's [`Target`] (shared with the cancel handles).
+    async fn read_target(&mut self) -> SqlxResult<()> {
+        let t = match &mut self.conn {
+            Conn::Pg(c) => {
+                let r = sqlx::query("SELECT pg_backend_pid(), current_setting('application_name')").fetch_one(&mut *c).await?;
+                Target { id: r.try_get::<i32, _>(0)? as u64, tag: r.try_get(1)? }
+            }
+            Conn::My(c) => {
+                let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *c).await?;
+                Target { id, tag: sqlx::query_scalar(MY_TAG).bind(id).fetch_one(&mut *c).await? }
+            }
+        };
+        *self.target.lock().unwrap() = t;
         Ok(())
     }
 
@@ -487,7 +538,7 @@ impl Session {
 
     /// `pg_backend_pid()` / `CONNECTION_ID()` of the current connection.
     pub fn backend_id(&self) -> u64 {
-        self.backend_id.load(Ordering::SeqCst)
+        self.target.lock().unwrap().id
     }
 
     /// An open transaction, tracked from the executed `BEGIN` / `COMMIT` / `ROLLBACK`
@@ -498,19 +549,19 @@ impl Session {
     }
 
     pub fn cancel_handle(&self) -> CancelHandle {
-        CancelHandle { opts: self.opts.clone(), backend_id: self.backend_id.clone(), connect_timeout: self.connect_timeout }
+        CancelHandle { opts: self.opts.clone(), target: self.target.clone(), connect_timeout: self.connect_timeout }
     }
 
     /// Replaces a dead connection with a new one: same settings, same cancel handles.
     async fn reopen(&mut self) -> Result<(), DbError> {
-        let shared = self.backend_id.clone();
-        shared.store(0, Ordering::SeqCst); // a cancel must not hit a reused id
+        let shared = self.target.clone();
+        *shared.lock().unwrap() = Target::default(); // a cancel must not hit a reused id
         let mut new = Session::open_with(&self.spec.clone(), self.connect_timeout).await?;
         new.max_rows = self.max_rows;
         new.timeout_ms = self.timeout_ms;
         new.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
-        shared.store(new.backend_id(), Ordering::SeqCst);
-        new.backend_id = shared;
+        *shared.lock().unwrap() = new.target.lock().unwrap().clone();
+        new.target = shared;
         *self = new;
         Ok(())
     }
@@ -543,7 +594,15 @@ impl Session {
                 out.notices.insert(0, "Connection was lost and reopened; session state (variables, temporary tables, open transaction) was reset.".into());
                 Ok(out)
             }
-            r => r,
+            r => {
+                // The Postgres tag is `application_name`: follow a statement that may change it.
+                // A failed read (aborted transaction) keeps the old tag: cancel then refuses, never misfires.
+                let lower = sql.to_ascii_lowercase();
+                if self.dialect() == Dialect::Postgres && ["application_name", "reset", "discard"].iter().any(|w| lower.contains(w)) {
+                    let _ = self.read_target().await;
+                }
+                r
+            }
         }
     }
 
