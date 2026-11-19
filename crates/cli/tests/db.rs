@@ -256,6 +256,32 @@ fn wrong_driver_fails_fast_with_exit_2() {
     assert!(v.to_string().contains("No response from 127.0.0.1:25432 within 1.5 s"), "{v}");
 }
 
+/// SIGINT (sent to this test process, where the CLI runs) cancels the statement on the server
+/// and stops the run: the second statement never runs (one object, not an array).
+/// MySQL's SLEEP may return 1 on KILL QUERY instead of failing, so no sqlstate there.
+fn signal_cancels(f: &Fixture, sleep: &str, sqlstate: Option<&str>) {
+    let pid = std::process::id().to_string();
+    let kill = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::process::Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    });
+    let t = std::time::Instant::now();
+    let (code, v) = f.json(&["exec", "-c", "c", "--output", "json", &format!("{sleep}; SELECT 1")]);
+    kill.join().unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(6), "took {:?}", t.elapsed());
+    assert!(v.is_object(), "{v}");
+    if let Some(state) = sqlstate {
+        assert_eq!((code, v["error"]["sqlstate"].as_str()), (5, Some(state)), "{v}");
+    }
+}
+
+#[test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+fn signal_cancels_the_statement() {
+    signal_cancels(&Fixture::new("postgres", "SIESTA_TEST_PG_URL"), "SELECT pg_sleep(10)", Some("57014"));
+    signal_cancels(&Fixture::new("mysql", "SIESTA_TEST_MYSQL_URL"), "SELECT SLEEP(10)", None);
+}
+
 #[test]
 #[ignore = "needs docker: scripts/test-db.sh"]
 fn mysql() {

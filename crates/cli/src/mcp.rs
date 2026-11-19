@@ -4,8 +4,10 @@
 //! SQL never runs with `--yes` and stdin is closed: `read_only` connections refuse writes, and
 //! whatever needs confirmation (`prod`, `-- @confirm`, `run.confirm_destructive`) is refused too.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -13,29 +15,83 @@ use serde_json::{Value, json};
 /// (`sql_split::prod_agent_violation`), the latter without confirmation.
 pub(crate) const AGENT_ENV: &str = "SIESTA_MCP";
 
+/// `tools/call` requests in progress: request id (JSON text) → child pid, once spawned.
+type Calls = Arc<Mutex<HashMap<String, Option<u32>>>>;
+
+/// Each `tools/call` runs on its own thread, so `notifications/cancelled` is read while it runs:
+/// the child gets SIGTERM, which cancels its statement on the server, and the request gets no reply.
+/// When the client goes away (stdin closes), every child gets SIGTERM.
 pub(crate) fn serve() -> u8 {
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
+    let out = Arc::new(Mutex::new(std::io::stdout()));
+    let calls: Calls = Arc::default();
+    let send = |out: &Mutex<std::io::Stdout>, r: Value| {
+        let mut o = out.lock().unwrap();
+        writeln!(o, "{r}").is_ok() && o.flush().is_ok()
+    };
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg),
-            Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
+        let msg = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if !send(&out, json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})) {
+                    break;
+                }
+                continue;
+            }
         };
-        if let Some(r) = reply
-            && (writeln!(out, "{r}").is_err() || out.flush().is_err())
-        {
-            break;
+        match (msg["method"].as_str(), msg.get("id")) {
+            (Some("notifications/cancelled"), _) => {
+                // A call not yet spawned is dropped by its thread; a finished one is not in the map.
+                if let Some(Some(pid)) = calls.lock().unwrap().remove(&msg["params"]["requestId"].to_string()) {
+                    terminate(pid);
+                }
+            }
+            (Some("tools/call"), Some(id)) => {
+                let key = id.to_string();
+                calls.lock().unwrap().insert(key.clone(), None);
+                let (out, calls) = (out.clone(), calls.clone());
+                std::thread::spawn(move || {
+                    let on_spawn = |pid| match calls.lock().unwrap().get_mut(&key) {
+                        Some(slot) => *slot = Some(pid),
+                        None => terminate(pid),
+                    };
+                    let reply = handle(&msg, &on_spawn);
+                    // Gone from the map = cancelled: no reply.
+                    if calls.lock().unwrap().remove(&key).is_some()
+                        && let Some(r) = reply
+                    {
+                        send(&out, r);
+                    }
+                });
+            }
+            _ => {
+                if let Some(r) = handle(&msg, &|_| {})
+                    && !send(&out, r)
+                {
+                    break;
+                }
+            }
         }
+    }
+    for pid in calls.lock().unwrap().values().flatten() {
+        terminate(*pid);
     }
     0
 }
 
-/// The reply to one message; `None` for notifications.
-fn handle(msg: &Value) -> Option<Value> {
+/// SIGTERM: the CLI cancels its running statement on the server and exits.
+// ponytail: `kill` command instead of a libc dependency. A pid freed between the child's exit and
+// its removal from `Calls` could be reused; that window is microseconds.
+fn terminate(pid: u32) {
+    let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+}
+
+/// The reply to one message; `None` for notifications. `on_spawn` gets a tool's child pid.
+fn handle(msg: &Value, on_spawn: &dyn Fn(u32)) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let result = match msg["method"].as_str().unwrap_or("") {
@@ -50,7 +106,7 @@ fn handle(msg: &Value) -> Option<Value> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call(params["name"].as_str().unwrap_or(""), &params["arguments"]),
+        "tools/call" => call(params["name"].as_str().unwrap_or(""), &params["arguments"], on_spawn),
         m => Err((-32601, format!("unknown method '{m}'"))),
     };
     Some(match result {
@@ -59,7 +115,7 @@ fn handle(msg: &Value) -> Option<Value> {
     })
 }
 
-fn call(name: &str, args: &Value) -> Result<Value, (i64, String)> {
+fn call(name: &str, args: &Value, on_spawn: &dyn Fn(u32)) -> Result<Value, (i64, String)> {
     let (argv, input) = argv(name, args).map_err(|e| (-32602, e))?;
     let mut child = Command::new(std::env::current_exe().map_err(|e| (-32603, e.to_string()))?)
         .args(&argv)
@@ -69,6 +125,7 @@ fn call(name: &str, args: &Value) -> Result<Value, (i64, String)> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (-32603, e.to_string()))?;
+    on_spawn(child.id());
     // Always close stdin: no command may wait for input (and no prompt can be answered).
     if let Some(mut s) = child.stdin.take() {
         let _ = s.write_all(input.unwrap_or_default().as_bytes());
@@ -178,6 +235,7 @@ mod tests {
 
     #[test]
     fn protocol_and_arguments() {
+        let handle = |m: &Value| handle(m, &|_| {});
         let init = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());

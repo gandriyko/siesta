@@ -73,10 +73,14 @@ Exit codes:
 | `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, bad arguments |
 | `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to run a statement that writes (or switch to read-write) |
 | `5` | SQL error from the server |
+| `130` | A second SIGINT / SIGTERM while the first one's cancel was still waiting for the server |
 
 With several statements the first failure stops the run (setting `run.stop_on_error`); the exit code is
 that of the failure. With `run.stop_on_error` off the run goes on and the exit code is the first
 failure's code.
+
+SIGINT (<kbd>Ctrl</kbd> <kbd>C</kbd>) or SIGTERM while a statement runs cancels it on the server
+(Postgres `57014`, MySQL / MariaDB `70100`, exit `5`) and stops the run: later statements do not run.
 
 ### MCP server
 
@@ -84,7 +88,8 @@ failure's code.
 `connections`, `schema` (`table`, `connection`, `database`, `ddl`), `list_statements` (`path`) and
 `run_sql` — `sql` (as `exec`) or `file` with `statements` (as `run`), plus `connection`, `database`,
 `max_rows`. Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
-appended to the text. `run_sql` never passes `--yes` and cannot answer a prompt. Refused with `4`
+appended to the text. A cancelled tool call (the client's `notifications/cancelled`, e.g. <kbd>Esc</kbd>
+in Claude Code) cancels its statement on the server and gets no reply. `run_sql` never passes `--yes` and cannot answer a prompt. Refused with `4`
 before anything runs — ask the user to run these:
 
 - writes on a `read_only` connection (`read_only_refused`);

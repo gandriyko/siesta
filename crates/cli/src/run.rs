@@ -337,13 +337,38 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
         h.total = env.settings.history.total;
         h
     });
+    // From here SIGINT / SIGTERM cancel the running statement on the server instead of killing the
+    // process (the server would go on running it); the run then stops. A second signal exits at once.
+    let mut signals = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let _rt = rt.enter();
+        signal(SignalKind::interrupt()).ok().zip(signal(SignalKind::terminate()).ok())
+    };
+    let cancel = session.cancel_handle();
+    let mut stopped = false;
     for (n, j) in jobs.iter().enumerate() {
         // Shown as running in the app's History until this iteration ends (after `record`).
         let _running = history.as_ref().and_then(|h| {
             let entry = db_exec::history::Entry { source: source.into(), line: j.line, connection: conn.name.clone(), database: conn.database.clone(), sql: j.text.clone(), ..Default::default() };
             h.begin(&history_file, entry).inspect_err(|e| eprintln!("{} history: {e}", paint("warning:", YELLOW, true))).ok()
         });
-        let result = rt.block_on(session.run(&j.text, j.kind, &page));
+        let result = rt.block_on(async {
+            let run = session.run(&j.text, j.kind, &page);
+            tokio::pin!(run);
+            tokio::select! {
+                r = &mut run => return r,
+                _ = stop_signal(&mut signals) => stopped = true,
+            }
+            // Repeated: a cancel that reaches the server before the statement does is a no-op.
+            loop {
+                let _ = cancel.cancel().await;
+                tokio::select! {
+                    r = &mut run => return r,
+                    _ = stop_signal(&mut signals) => std::process::exit(130),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        });
         let item = Item { file: file_name.as_deref(), name: j.name.as_deref(), line: j.line, connection: &conn.name, database: conn.database.as_deref(), result: &result, max_rows: cap };
         if let Err(e) = &result {
             exit = first_exit(exit, e);
@@ -379,7 +404,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
             Format::Jsonl => put(out, item_json(&item).to_string()),
             Format::Json => items.push(item_json(&item)),
         }
-        if result.is_err() && env.settings.run.stop_on_error {
+        if stopped || (result.is_err() && env.settings.run.stop_on_error) {
             break;
         }
     }
@@ -392,6 +417,14 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     }
     rt.block_on(session.close());
     Ok(exit)
+}
+
+/// SIGINT or SIGTERM; never, if the handlers could not be installed.
+async fn stop_signal(s: &mut Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>) {
+    match s {
+        Some((int, term)) => tokio::select! { _ = int.recv() => {}, _ = term.recv() => {} },
+        None => std::future::pending().await,
+    }
 }
 
 /// `siesta run`.
