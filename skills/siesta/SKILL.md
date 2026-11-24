@@ -198,7 +198,8 @@ POST /_sql?format=json
 - Kinds: `_search` is a query; `GET`, `HEAD` and reading `POST`s (`_count`, `_msearch`, `_mget`, `_sql`,
   `_field_caps`, `_validate`, `_explain`, `_analyze`, …) are reads; everything else writes.
   `read_only` refuses writes on the client only (Elasticsearch has no read-only session).
-  On `prod`, an agent may run reads and `POST <index>/_update/<id>`; nothing else (`prod_refused`).
+  On `prod`, an agent may run reads and `POST <index>/_update/<id>` with a `{"doc": …}` body (no `script`, no
+  upsert); nothing else (`prod_refused`). Paths are judged as sent (`..`, `%2e` resolved; `%2F` is never a read).
   `run.confirm_destructive = always` asks for deleting an index, `_delete_by_query`, `_update_by_query`
   without a query and `_close`.
 - Ctrl+C drops the request; Elasticsearch may still finish it (bounded by `run.statement_timeout_ms`).

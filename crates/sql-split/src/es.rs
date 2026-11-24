@@ -132,7 +132,14 @@ pub(crate) fn prod_agent_violation(r: &Request) -> Option<String> {
     }
     let segs = segments(&r.path);
     let one_doc = r.method == "POST" && segs.len() == 3 && segs[1] == "_update";
-    (!one_doc).then(|| format!("Production connection: {} {} is not allowed; only reads and POST <index>/_update/<id>.", r.method, r.path))
+    if !one_doc {
+        return Some(format!("Production connection: {} {} is not allowed; only reads and POST <index>/_update/<id>.", r.method, r.path));
+    }
+    // Only changing fields of that document: a script can delete it (`ctx.op = 'delete'`), an
+    // upsert creates one. A `\u` escape could spell those keys past this text check.
+    let body = r.body.to_ascii_lowercase();
+    let unsafe_key = ["\"script\"", "\"upsert\"", "\"doc_as_upsert\"", "\"scripted_upsert\""].iter().any(|k| body.contains(k)) || body.contains("\\u");
+    unsafe_key.then(|| format!("Production connection: {} {} with a script or upsert is not allowed; only {{\"doc\": {{…}}}}.", r.method, r.path))
 }
 
 /// Requests of every statement in `text` (an Elastic file or one statement).
@@ -325,6 +332,11 @@ mod tests {
             assert_eq!(split(req).statements[0].kind, Kind::Other, "{req}");
             assert!(read_only_violation(req, ES).is_some(), "{req}");
             assert!(prod_agent_violation(req, ES).is_some(), "{req}");
+        }
+        // On prod an agent's `_update` only changes fields: no script (it can delete), no upsert.
+        assert!(prod_agent_violation("POST /i/_update/1\n{\"doc\": {\"a\": 1}}", ES).is_none());
+        for body in ["{\"script\": {\"source\": \"ctx.op = 'delete'\"}}", "{\"doc\": {}, \"doc_as_upsert\": true}", "{\"doc\": {}, \"upsert\": {}}", "{\"scripted_upsert\": true}", "{\"\\u0073cript\": \"ctx.op='delete'\"}"] {
+            assert!(prod_agent_violation(&format!("POST /i/_update/1\n{body}"), ES).is_some(), "{body}");
         }
         // An encoded slash is never a read.
         assert_eq!(classify("POST", "/_search%2F..%2Fi%2F_delete_by_query"), Kind::Other);

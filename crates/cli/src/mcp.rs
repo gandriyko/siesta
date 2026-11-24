@@ -104,7 +104,7 @@ fn handle(msg: &Value, on_spawn: &dyn Fn(u32)) -> Option<Value> {
                 `connections` (its `driver` tells SQL from `elasticsearch`), then `schema` to see tables and columns (Elasticsearch: \
                 indices and mapping fields) before writing a query. On an Elasticsearch connection `run_sql` takes Kibana console \
                 requests instead of SQL: a `METHOD /path` line, then a JSON body. `run_sql` can write, except on `read_only` \
-                connections; on a `prod` connection only reads and `UPDATE … WHERE` (Elasticsearch: `POST <index>/_update/<id>`) \
+                connections; on a `prod` connection only reads and `UPDATE … WHERE` (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body) \
                 run. Anything refused (exit 4) is for the user to run.",
         })),
         "ping" => Ok(json!({})),
@@ -242,7 +242,7 @@ fn tools() -> Value {
             requests in Kibana console format (`GET /index/_search` then a JSON body); search hits come back as rows (`_id` + `_source` fields), \
             other responses as one `response` JSON cell. Refused with exit 4 before anything runs: \
             writes on a `read_only` connection; on a `prod` connection everything but reads and `UPDATE` with a `WHERE` \
-            (Elasticsearch: `POST <index>/_update/<id>`; DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
+            (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body, no script or upsert; DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
             destructive ones when `run.confirm_destructive` is `always`) — ask the user to run those.",
             json!({"sql": s("SQL text, or Elasticsearch requests on an Elasticsearch connection; one or several statements"), "file": s("A .sql / .es file to run instead of `sql`"),
                    "statements": json!({"type": "array", "items": {"type": "string"}, "description": "Statements of `file`: `@name`, `:LINE` or `#N`; none = all"}),
