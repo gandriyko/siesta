@@ -24,7 +24,7 @@ use gpui_component::{
 
 use crate::{Siesta, format, runner::RT};
 
-const DRIVERS: [(&str, Driver); 3] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql), ("Elasticsearch", Driver::Elastic)];
+const DRIVERS: [(&str, Driver); 4] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql), ("Elasticsearch", Driver::Elastic), ("MongoDB", Driver::Mongo)];
 
 /// The driver's default port (also the Port field's hint).
 fn default_port(d: Driver) -> &'static str {
@@ -32,6 +32,7 @@ fn default_port(d: Driver) -> &'static str {
         Driver::Postgres => "5432",
         Driver::MySql => "3306",
         Driver::Elastic => "9200",
+        Driver::Mongo => "27017",
     }
 }
 
@@ -41,6 +42,7 @@ fn driver_hints(d: Driver) -> [String; 4] {
         Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)".into(), "localhost".into(), format!("{} (your OS user)", db_conn::os_user()), "SET TIME ZONE 'UTC'".into()],
         Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)".into(), "localhost".into(), "root".into(), "SET time_zone = '+00:00'".into()],
         Driver::Elastic => ["https://user:password@host:9200 (fills the fields below)".into(), "localhost".into(), "elastic (empty: the password is an API key)".into(), String::new()],
+        Driver::Mongo => ["mongodb://user:password@host:27017/db, or mongodb+srv://… (kept as the URL)".into(), "localhost (empty: from the URL)".into(), "admin".into(), String::new()],
     }
 }
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
@@ -207,6 +209,8 @@ impl ConnForm {
             self.port.update(cx, |s, cx| s.set_value(default_port(driver), window, cx));
         }
         self.driver = Some(driver);
+        // Only Postgres and MySQL connect through a Unix socket.
+        self.socket &= matches!(driver, Driver::Postgres | Driver::MySql);
         self.driver_hints(window, cx);
         cx.notify();
     }
@@ -240,6 +244,15 @@ impl ConnForm {
         self.url_note = None;
         if !text.trim().is_empty() {
             match db_conn::parse_url(text) {
+                // SRV, several hosts or options: the URL itself is saved (without its password).
+                Err(e) if e == db_conn::MONGO_URL_KEPT => {
+                    if let Some(pw) = db_conn::url_password(text) {
+                        self.password.update(cx, |s, cx| s.set_value(pw, window, cx));
+                    }
+                    self.driver = Some(Driver::Mongo);
+                    self.driver_hints(window, cx);
+                    self.url_note = Some(e);
+                }
                 Err(e) => self.url_note = Some(e),
                 Ok(p) => {
                     let set = |i: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| i.update(cx, |s, cx| s.set_value(v, window, cx));
@@ -548,7 +561,9 @@ impl Render for ConnForm {
         let editing = self.original.is_some();
         let location = format!("Saved to {}; the password is kept only encrypted (key: {}).", db_conn::connections_dir(&self.dir).display(), db_conn::crypto::key_path(&self.keys).display());
         // Elasticsearch is HTTP: no socket, database, schema or init SQL; the password may be an API key.
+        // MongoDB: no socket, schema or init SQL either, but databases.
         let es = self.driver == Some(Driver::Elastic);
+        let sql = self.driver.is_none_or(|d| matches!(d, Driver::Postgres | Driver::MySql));
         let user = div().flex_1().min_w_0().child(field("User", &self.user));
         v_flex()
             .gap_2()
@@ -563,7 +578,7 @@ impl Render for ConnForm {
                     // A MySQL socket is a file: no port.
                     .when(!(self.socket && self.driver == Some(Driver::MySql)), |r| r.child(div().w(px(100.)).child(field("Port", &self.port)))),
             )
-            .when(!es, |f| {
+            .when(sql, |f| {
                 f.child(
                     Checkbox::new("conn-socket")
                         .label("Unix socket")
@@ -579,10 +594,10 @@ impl Render for ConnForm {
             .child(if es { h_flex().child(user) } else { h_flex().gap_2().items_start().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(user) })
             .when(!es, |f| f.children(db_note))
             .child(Self::field(if es { "Password or API key" } else { "Password" }, muted, Input::new(&self.password).mask_toggle()))
-            .child(h_flex().gap_2().child(div().flex_1().child(Self::field(if es { "SSL mode (https)" } else { "SSL mode" }, muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
+            .child(h_flex().gap_2().child(div().flex_1().child(Self::field(if es { "SSL mode (https)" } else if sql { "SSL mode" } else { "SSL mode (TLS)" }, muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
             // `search_path` exists only in Postgres; MySQL's schema is the database.
             .when(self.driver.is_none_or(|d| d == Driver::Postgres), |f| f.child(field("Schema (search_path)", &self.schema)))
-            .when(!es, |f| f.child(field("Init SQL", &self.init_sql)))
+            .when(sql, |f| f.child(field("Init SQL", &self.init_sql)))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))
             .child(div().text_xs().text_color(muted).child(location))
             .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))

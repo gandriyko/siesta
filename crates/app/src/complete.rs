@@ -83,8 +83,8 @@ const RESERVED: &[&str] = &[
 fn plain(d: Dialect, name: &str) -> bool {
     let ok = |i: usize, c: char| match d {
         Dialect::Postgres => c.is_ascii_lowercase() || c == '_' || (i > 0 && (c.is_ascii_digit() || c == '$')),
-        // Elastic: SQL completion is not offered in `.es` files.
-        Dialect::MySql | Dialect::Elastic => c.is_ascii_alphabetic() || c == '_' || (i > 0 && (c.is_ascii_digit() || c == '$')),
+        // Elastic / Mongo: SQL completion is not offered in `.es` / `.mongodb.js` files.
+        Dialect::MySql | Dialect::Elastic | Dialect::Mongo => c.is_ascii_alphabetic() || c == '_' || (i > 0 && (c.is_ascii_digit() || c == '$')),
     };
     !name.is_empty() && name.chars().enumerate().all(|(i, c)| ok(i, c)) && !RESERVED.contains(&name.to_ascii_lowercase().as_str())
 }

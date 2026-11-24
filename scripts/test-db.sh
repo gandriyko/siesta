@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts Postgres, MariaDB and Elasticsearch in Docker and runs the db-exec and siesta-cli integration tests against them.
+# Starts Postgres, MariaDB, Elasticsearch and MongoDB in Docker and runs the db-exec and siesta-cli integration tests against them.
 # Containers stay running afterwards; `scripts/test-db.sh --down` stops and removes them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,4 +16,5 @@ docker compose exec -T mariadb mariadb -uroot -psiesta -e "CREATE DATABASE IF NO
 export SIESTA_TEST_PG_URL="postgres://siesta:siesta@127.0.0.1:25432/siesta"
 export SIESTA_TEST_MYSQL_URL="mysql://siesta:siesta@127.0.0.1:23306/siesta"
 export SIESTA_TEST_ES_URL="http://elastic:siesta@127.0.0.1:29200"
+export SIESTA_TEST_MONGO_URL="mongodb://siesta:siesta@127.0.0.1:27018/siesta?authSource=admin"
 cargo test -p db-exec -p siesta-cli -- --include-ignored "$@"

@@ -79,6 +79,7 @@ pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str) -
                 Some(Driver::Postgres) => "postgres",
                 Some(Driver::MySql) => "mysql mariadb",
                 Some(Driver::Elastic) => "elasticsearch",
+                Some(Driver::Mongo) => "mongodb",
                 None => "",
             };
             filter.is_empty() || [r.name.as_str(), driver, r.target.as_str()].iter().any(|s| s.to_lowercase().contains(&filter))
@@ -185,6 +186,7 @@ impl ConnectionsPage {
             Some(Driver::Postgres) => "Postgres",
             Some(Driver::MySql) => "MySQL",
             Some(Driver::Elastic) => "Elasticsearch",
+            Some(Driver::Mongo) => "MongoDB",
             None => "?",
         };
         let name = r.name.clone();

@@ -5,3 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# MongoDB statements parse into JSON (extended JSON for ObjectId, ISODate…), which the executor turns into BSON.
+serde_json = { version = "1", features = ["preserve_order"] }

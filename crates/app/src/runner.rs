@@ -508,8 +508,9 @@ impl Siesta {
 
     fn execute(&mut self, path: PathBuf, name: String, conn: Connection, specs: Vec<Spec>, window: &mut Window, cx: &mut Context<Self>) {
         let default_size = self.settings.settings.results.page_size.max(1);
-        // The view last picked in this file; Elasticsearch documents open as JSON, SQL rows as a table.
-        let view = self.store.views.get(&path).copied().unwrap_or(if conn.driver == db_conn::Driver::Elastic { Tab::Json } else { Tab::Result });
+        // The view last picked in this file; Elasticsearch / MongoDB documents open as JSON, SQL rows as a table.
+        let documents = matches!(conn.driver, db_conn::Driver::Elastic | db_conn::Driver::Mongo);
+        let view = self.store.views.get(&path).copied().unwrap_or(if documents { Tab::Json } else { Tab::Result });
         let (mut stmts, mut keys) = (vec![], vec![]);
         for s in &specs {
             let key: Key = (path.clone(), s.text.clone());

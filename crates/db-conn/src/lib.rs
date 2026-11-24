@@ -16,9 +16,9 @@ use serde_json::{Map, Value};
 
 mod global;
 pub mod crypto;
-pub use global::{ConnectionForm, delete, has_password, migrate_names, names, read_form, save, set_password};
+pub use global::{ConnectionForm, delete, has_password, migrate_names, names, read_form, save, set_password, without_password};
 mod urlparse;
-pub use urlparse::{ParsedUrl, parse_url};
+pub use urlparse::{MONGO_URL_KEPT, ParsedUrl, parse_url, url_password};
 
 const KEYS: [&str; 14] = ["driver", "url", "host", "port", "database", "user", "ssl", "read_only", "prod", "schema", "init_sql", "color", "password_enc", "socket"];
 const SSL_KEYS: [&str; 4] = ["mode", "ca", "cert", "key"];
@@ -85,6 +85,9 @@ pub enum Driver {
     /// Elasticsearch over HTTP: `http://` without SSL mode, `https://` with one. `user` + password
     /// is basic auth; a password without `user` is an API key.
     Elastic,
+    /// MongoDB through the official driver. A `mongodb+srv://` URL, several hosts or URL options
+    /// (`authSource`, `replicaSet`…) stay in `url`; the fields override its parts.
+    Mongo,
 }
 
 impl Driver {
@@ -94,6 +97,7 @@ impl Driver {
             Driver::Postgres => "postgres",
             Driver::MySql => "mysql",
             Driver::Elastic => "elasticsearch",
+            Driver::Mongo => "mongodb",
         }
     }
 }
@@ -134,7 +138,7 @@ pub fn socket_candidates(driver: Driver) -> &'static [&'static str] {
     match driver {
         Driver::Postgres => &PG_SOCKET_DIRS,
         Driver::MySql => &MYSQL_SOCKETS,
-        Driver::Elastic => &[],
+        Driver::Elastic | Driver::Mongo => &[],
     }
 }
 
@@ -148,7 +152,7 @@ pub fn detect_socket_in(driver: Driver, port: Option<u16>, candidates: &[&str], 
     candidates.iter().map(PathBuf::from).find(|c| match driver {
         Driver::Postgres => exists(&c.join(format!(".s.PGSQL.{}", port.unwrap_or(5432)))),
         Driver::MySql => exists(c),
-        Driver::Elastic => false,
+        Driver::Elastic | Driver::Mongo => false,
     })
 }
 
@@ -412,12 +416,14 @@ fn parse_driver(driver: Option<&str>, url: Option<&str>) -> Result<Driver, Strin
         Some("postgres") => Driver::Postgres,
         Some("mysql") => Driver::MySql,
         Some("elasticsearch") => Driver::Elastic,
-        Some(d) => return Err(format!("unknown driver '{d}' (postgres, mysql or elasticsearch)")),
+        Some("mongodb") => Driver::Mongo,
+        Some(d) => return Err(format!("unknown driver '{d}' (postgres, mysql, elasticsearch or mongodb)")),
         None => match url.and_then(|u| u.split_once("://")).map(|(s, _)| s) {
             Some("postgres" | "postgresql") => Driver::Postgres,
             Some("mysql" | "mariadb") => Driver::MySql,
             Some("http" | "https") => Driver::Elastic,
-            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// / http(s):// url".into()),
+            Some("mongodb" | "mongodb+srv") => Driver::Mongo,
+            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// / http(s):// / mongodb:// url".into()),
         },
     })
 }

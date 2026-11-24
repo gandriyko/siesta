@@ -21,7 +21,7 @@ async fn fixture(driver: Driver) -> (db_exec::Session, String) {
     let db = match driver {
         Driver::Postgres => "public",
         Driver::MySql => "siesta",
-        Driver::Elastic => unreachable!("SQL fixture"),
+        Driver::Elastic | Driver::Mongo => unreachable!("SQL fixture"),
     };
     (s, db.to_string())
 }

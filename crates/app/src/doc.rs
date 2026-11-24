@@ -53,7 +53,7 @@ pub fn default_schema(c: &db_conn::Connection) -> Option<String> {
     match c.driver {
         Driver::Postgres => Some(c.schema.as_deref().and_then(|s| s.split(',').next()).map_or("public", str::trim).to_string()),
         Driver::MySql => c.database.clone(),
-        Driver::Elastic => None,
+        Driver::Elastic | Driver::Mongo => None,
     }
 }
 
@@ -63,8 +63,8 @@ impl Doc {
         let sql = siesta_workspace::is_sql(&path);
         let dialect = siesta_workspace::file_dialect(&path);
         let lang = std::rc::Rc::new(std::cell::RefCell::new(crate::lang::Ctx { dialect, connection: None, default_schema: None, cache }));
-        // ponytail: no completion in `.es` files yet; index / field names from the schema would be next.
-        if sql && dialect != Dialect::Elastic {
+        // ponytail: no completion in `.es` / `.mongodb.js` files yet; names from the schema would be next.
+        if sql && dialect.is_sql() {
             let provider = std::rc::Rc::new(crate::lang::Lang(lang.clone()));
             editor.update(cx, |s, _| s.lsp_mut().completion_provider = Some(provider));
         }
@@ -128,20 +128,20 @@ impl Doc {
         self.effective_connection().as_ref().map(crate::schema_cache::key)
     }
 
-    /// Dialect of the file with a named connection: `.es` files are always Elastic; `.sql` files
-    /// follow their SQL connection, Postgres without one (an Elasticsearch connection on a `.sql`
-    /// file is a mismatch the picker shows, not a reason to split SQL as requests).
+    /// Dialect of the file with a named connection: `.es` / `.mongodb.js` files keep their own;
+    /// `.sql` files follow their SQL connection, Postgres without one (an Elasticsearch or MongoDB
+    /// connection on a `.sql` file is a mismatch the picker shows, not a reason to split it otherwise).
     fn dialect_for(&self, name: Option<&str>) -> Dialect {
-        if self.dialect == Dialect::Elastic {
-            return Dialect::Elastic;
+        if !self.dialect.is_sql() {
+            return self.dialect;
         }
         match name.and_then(|n| self.conns.connections.get(n)).map(|c| dialect_of(c.driver)) {
-            Some(Dialect::Elastic) | None => Dialect::default(),
-            Some(d) => d,
+            Some(d) if d.is_sql() => d,
+            _ => Dialect::default(),
         }
     }
 
-    /// The file's connection exists but speaks another language (`.es` on SQL, `.sql` on Elasticsearch).
+    /// The file's connection exists but speaks another language (`.es` on SQL, `.sql` on Elasticsearch, …).
     pub fn connection_mismatch(&self) -> Option<&'static str> {
         let c = self.conns.connections.get(self.connection()?)?;
         siesta_workspace::mismatch(&self.path, dialect_of(c.driver))

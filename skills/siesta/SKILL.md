@@ -1,6 +1,6 @@
 ---
 name: siesta
-description: Run SQL against Postgres and MySQL / MariaDB and Elasticsearch requests with the Siesta CLI and plain `.sql` / `.es` files, inspect a database schema (tables, columns, indexes, DDL; Elasticsearch indices and mappings) before writing queries, and manage connections in `~/.config/siesta/connections/`. Use when the user asks to query a database or an Elasticsearch cluster, check data, explore tables or indices, run or fix a `.sql` / `.es` file, or set up a connection, and `siesta` is installed or the project has `.sql` / `.es` files.
+description: Run SQL against Postgres and MySQL / MariaDB, Elasticsearch requests and MongoDB (mongosh) calls with the Siesta CLI and plain `.sql` / `.es` / `.mongodb.js` files, inspect a database schema (tables, columns, indexes, DDL; Elasticsearch indices and mappings; MongoDB collections) before writing queries, and manage connections in `~/.config/siesta/connections/`. Use when the user asks to query a database, an Elasticsearch cluster or MongoDB, check data, explore tables, indices or collections, run or fix a `.sql` / `.es` / `.mongodb.js` file, or set up a connection, and `siesta` is installed or the project has such files.
 ---
 
 # Siesta: SQL files and a database CLI
@@ -32,7 +32,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 
 | Command | What it does |
 |---|---|
-| `siesta list [PATH]` | Statements in a `.sql` / `.es` file or directory: file, line, name, first line, kind |
+| `siesta list [PATH]` | Statements in a `.sql` / `.es` / `.mongodb.js` file or directory: file, line, name, first line, kind |
 | `siesta run FILE [STATEMENTS]...` | Run statements of a file (none named = all, in file order) |
 | `siesta exec [SQL]` | Run SQL from the argument, or from stdin when omitted or `-`; may hold several statements |
 | `siesta connections` | Connections of `~/.config/siesta/connections/`, secrets masked, with `password: set` / `none` |
@@ -70,7 +70,7 @@ Exit codes:
 |---|---|
 | `0` | OK |
 | `2` | Connection error: cannot connect, authentication failed, connection lost |
-| `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, a connection of the other kind (`connection_mismatch`: `.es` on SQL, `.sql` on Elasticsearch), bad arguments |
+| `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, a connection of the other kind (`connection_mismatch`: `.es` on SQL, `.sql` on Elasticsearch, `.mongodb.js` on anything but MongoDB), bad arguments |
 | `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to run a statement that writes (or switch to read-write) |
 | `5` | SQL error from the server |
 | `130` | A second SIGINT / SIGTERM while the first one's cancel was still waiting for the server |
@@ -87,7 +87,7 @@ SIGINT (<kbd>Ctrl</kbd> <kbd>C</kbd>) or SIGTERM while a statement runs cancels 
 `siesta mcp` serves the commands as MCP tools over stdio, for clients without a shell:
 `connections`, `schema` (`table`, `connection`, `database`, `ddl`), `list_statements` (`path`) and
 `run_sql` — `sql` (as `exec`) or `file` with `statements` (as `run`), plus `connection`, `database`,
-`max_rows`. On an Elasticsearch connection `run_sql`'s `sql` holds `.es` requests (see below). Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
+`max_rows`. On an Elasticsearch connection `run_sql`'s `sql` holds `.es` requests, on a MongoDB connection mongosh calls (see below). Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
 appended to the text. A cancelled tool call (the client's `notifications/cancelled`, e.g. <kbd>Esc</kbd>
 in Claude Code) cancels its statement on the server and gets no reply. `run_sql` never passes `--yes` and cannot answer a prompt. Refused with `4`
 before anything runs — ask the user to run these:
@@ -205,6 +205,46 @@ POST /_sql?format=json
   without a query and `_close`.
 - Ctrl+C drops the request; Elasticsearch may still finish it (bounded by `run.statement_timeout_ms`).
 
+## MongoDB (`.mongodb.js` files)
+
+A `.mongodb.js` file holds mongosh calls, one per statement: `db.<collection>.<method>(…)` with cursor
+methods after it, `db.<method>(…)`, `show dbs | collections | users`. A statement ends at `;` or at a line
+break outside brackets, unless the next line starts with `.`. Arguments are literals: bare keys, `'…'`,
+regexes, `ObjectId('…')`, `ISODate('…')`, `NumberLong`, `NumberDecimal`, `UUID`, `Timestamp`. Variables,
+functions, loops and `use` are errors (pick the database with `// @database` or `-d`). Directives use `//`.
+
+```js
+// @connection mongo-dev
+// @database shop
+
+// @name new orders
+db.orders.find({ status: 'new' }, { customer: 1, total: 1 })
+  .sort({ at: -1 })
+
+db.orders.aggregate([{ $group: { _id: '$customer', n: { $sum: 1 } } }])
+```
+
+- Methods: `find` (`.sort .limit .skip .projection .hint .collation .count() .explain()`), `findOne`,
+  `aggregate` (`.explain()`), `countDocuments`, `estimatedDocumentCount`, `count`, `distinct`, `getIndexes`,
+  `stats`, `insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`,
+  `findOneAndUpdate` / `Replace` / `Delete`, `createIndex`, `dropIndex(es)`, `drop`, `renameCollection`;
+  `db.runCommand`, `db.adminCommand`, `db.getCollectionNames`, `db.getCollectionInfos`, `db.createCollection`,
+  `db.dropDatabase`, `db.stats`, `db.version`, `db.serverStatus`.
+- Results: documents as rows (columns in first-seen key order; nested documents and arrays as JSON;
+  ObjectId as its hex, dates as RFC 3339). `--max-rows` pages `find` / `aggregate` unless the statement sets
+  `.limit()` / `.skip()`. Writes report `rows_affected`.
+- `schema -c MONGO_CONNECTION` lists collections with fields seen in 20 sample documents (dotted paths) and
+  indexes; `--ddl` prints `db.createCollection(…)` and `createIndex(…)` calls.
+- Errors: exit `5` with `sqlstate` = MongoDB's code name (`Location40324`, `11000` for a duplicate key).
+- Kinds: `find` / `aggregate` are queries; the other reading methods, `show` and `runCommand` of reading
+  commands (`ping`, `find`, `count`, `listCollections`, `dbStats`, …) are reads; an `$out` / `$merge` key
+  anywhere makes a statement a write; everything else writes. `read_only` refuses writes on the client only.
+  On `prod`, an agent may run reads and `updateOne` / `updateMany` with a non-empty filter and update
+  operators (`{$set: …}`; no upsert, replacement or pipeline); nothing else (`prod_refused`).
+  `run.confirm_destructive = always` asks for `drop`, `dropDatabase`, `dropIndex` and `deleteMany` /
+  `updateMany` with an empty filter.
+- Ctrl+C drops the command; MongoDB may still finish it (reads stop at `run.statement_timeout_ms` via `maxTimeMS`).
+
 ## Connections
 
 One JSON file per connection in the user's config dir, `~/.config/siesta/connections/NAME.json`
@@ -224,13 +264,20 @@ on stderr, so JSON on stdout stays clean.
 { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
 // ~/.config/siesta/connections/es-dev.json
 { "driver": "elasticsearch", "url": "https://es.internal:9200", "user": "elastic" }
+// ~/.config/siesta/connections/mongo-dev.json
+{ "driver": "mongodb", "url": "mongodb+srv://app@cluster0.example.net/shop?authSource=admin" }
 ```
+
+- MongoDB: `driver` `mongodb` (or a `mongodb://` / `mongodb+srv://` url), `host` / `port` (27017),
+  `database` (default `test`), `user`. A `mongodb+srv://` url, several hosts or url options stay in `url`
+  (without a password); `host` / `port` / `user` override its parts. `ssl.mode` sets TLS (`require` skips the
+  certificate check; `ssl.cert` is one PEM file with the certificate and key). No `socket`, `schema` or `init_sql`.
 
 - Elasticsearch: `driver` `elasticsearch` (or an `http://` / `https://` url), `host` / `port` (9200);
   `https` when `ssl.mode` is set and not `disable` (`require` skips the certificate check, `ssl.ca` adds a CA).
   `user` + password is basic auth; a password without `user` is an API key. No `database`, `socket`,
   `schema` or `init_sql`.
-- Keys: `driver` (`postgres` | `mysql` | `elasticsearch`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
+- Keys: `driver` (`postgres` | `mysql` | `elasticsearch` | `mongodb`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
   (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs confirmation in a terminal), `schema` (Postgres `search_path`), `init_sql`, `color`.
   `socket`: `true` connects through the local Unix socket found at connect time (Postgres: a folder with `.s.PGSQL.<port>` among `/tmp`,

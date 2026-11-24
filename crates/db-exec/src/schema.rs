@@ -109,6 +109,9 @@ impl Session {
         if self.dialect() == Dialect::Elastic {
             return Ok(Vec::new());
         }
+        if let crate::Conn::Mongo(m) = &self.conn {
+            return m.databases(&self.spec).await;
+        }
         if self.dialect() == Dialect::Postgres {
             let q = "SELECT datname::text FROM pg_database WHERE NOT datistemplate AND datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY 1";
             return Ok(self.catalog(q).await?.iter().map(|r| text(&r[0])).collect());
@@ -134,6 +137,10 @@ impl Session {
                 })
                 .collect();
             return Ok(Schema { schemas: vec![SchemaNode { name: "indices".into(), tables }] });
+        }
+        if let crate::Conn::Mongo(m) = &self.conn {
+            // One node, the session's database: collections with sampled fields and indexes.
+            return Ok(Schema { schemas: vec![SchemaNode { name: m.db.clone(), tables: m.collections(&self.spec).await? }] });
         }
         let pg = self.dialect() == Dialect::Postgres;
         let (tables, columns, indexes) = if pg {
@@ -211,6 +218,9 @@ impl Session {
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let body = serde_json::json!({ "mappings": v[table]["mappings"] });
             return Ok(format!("PUT /{table}\n{}", serde_json::to_string_pretty(&body).unwrap_or_default()));
+        }
+        if let crate::Conn::Mongo(m) = &self.conn {
+            return m.ddl(table, &self.spec).await;
         }
         let d = self.dialect();
         let qualified = format!("{}.{}", quote_ident(d, schema), quote_ident(d, table));

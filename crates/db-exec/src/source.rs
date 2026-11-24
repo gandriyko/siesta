@@ -63,6 +63,7 @@ impl Session {
                 self.my_source(cols).await
             }
             Conn::Es(_) => Err(DbError::msg("Elasticsearch results are not editable here; change documents with a request (POST <index>/_update/<id>)")),
+            Conn::Mongo(_) => Err(DbError::msg("MongoDB results are not editable here; change documents with a statement (db.<collection>.updateOne(…))")),
         }
     }
 

@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// A query file Siesta lists and runs: `.sql`, or an Elasticsearch `.es` file.
+/// A query file Siesta lists and runs: `.sql`, an Elasticsearch `.es` file or a MongoDB
+/// `.mongodb.js` file.
 pub fn is_sql(p: &Path) -> bool {
-    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) || is_es(p)
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) || own_dialect(p).is_some()
 }
 
 /// An Elasticsearch requests file (Kibana console format).
@@ -22,18 +23,39 @@ pub fn is_es(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("es"))
 }
 
-/// The dialect a file is split with before its connection is known: `.es` is always Elastic,
-/// `.sql` is Postgres until the connection says MySQL.
-pub fn file_dialect(p: &Path) -> sql_split::Dialect {
-    if is_es(p) { sql_split::Dialect::Elastic } else { sql_split::Dialect::default() }
+/// A MongoDB file in mongosh syntax.
+pub fn is_mongo(p: &Path) -> bool {
+    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().ends_with(".mongodb.js"))
 }
 
-/// Why a file can't run on a connection of dialect `conn`: `.es` needs Elasticsearch, `.sql` needs SQL.
+/// The dialect a file has whatever its connection: `.es` and `.mongodb.js`; `None` for `.sql`.
+fn own_dialect(p: &Path) -> Option<sql_split::Dialect> {
+    if is_es(p) {
+        Some(sql_split::Dialect::Elastic)
+    } else if is_mongo(p) {
+        Some(sql_split::Dialect::Mongo)
+    } else {
+        None
+    }
+}
+
+/// The dialect a file is split with before its connection is known: `.es` is always Elastic,
+/// `.mongodb.js` always Mongo, `.sql` is Postgres until the connection says MySQL.
+pub fn file_dialect(p: &Path) -> sql_split::Dialect {
+    own_dialect(p).unwrap_or_default()
+}
+
+/// Why a file can't run on a connection of dialect `conn`: `.es` needs Elasticsearch,
+/// `.mongodb.js` MongoDB, `.sql` an SQL server.
 pub fn mismatch(p: &Path, conn: sql_split::Dialect) -> Option<&'static str> {
-    match (is_es(p), conn == sql_split::Dialect::Elastic) {
-        (true, false) => Some(".es files run on Elasticsearch connections"),
-        (false, true) => Some("Elasticsearch connections run .es files"),
-        _ => None,
+    use sql_split::Dialect::{Elastic, Mongo};
+    let server = (!conn.is_sql()).then_some(conn);
+    match (own_dialect(p), server) {
+        (a, b) if a == b => None,
+        (Some(Elastic), _) => Some(".es files run on Elasticsearch connections"),
+        (Some(Mongo), _) => Some(".mongodb.js files run on MongoDB connections"),
+        (_, Some(Elastic)) => Some("Elasticsearch connections run .es files"),
+        _ => Some("MongoDB connections run .mongodb.js files"),
     }
 }
 

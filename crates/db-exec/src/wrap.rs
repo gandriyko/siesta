@@ -81,8 +81,8 @@ fn like_contains(v: &str) -> String {
 
 pub fn quote_ident(d: Dialect, name: &str) -> String {
     match d {
-        // Elastic never builds SQL; its field names are plain JSON keys.
-        Dialect::Postgres | Dialect::Elastic => format!("\"{}\"", name.replace('"', "\"\"")),
+        // Elastic and Mongo never build SQL; their field names are plain JSON keys.
+        Dialect::Postgres | Dialect::Elastic | Dialect::Mongo =>format!("\"{}\"", name.replace('"', "\"\"")),
         Dialect::MySql => format!("`{}`", name.replace('`', "``")),
     }
 }

@@ -44,3 +44,16 @@ services:
       interval: 3s
       timeout: 3s
       retries: 60
+
+  mongo:
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: siesta
+      MONGO_INITDB_ROOT_PASSWORD: siesta
+    ports:
+      - "127.0.0.1:27018:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "-u", "siesta", "-p", "siesta", "--eval", "db.adminCommand('ping').ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

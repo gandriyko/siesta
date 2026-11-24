@@ -211,8 +211,8 @@ impl Siesta {
         let (ok, skipped): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.is_file() && siesta_workspace::is_sql(p));
         if !skipped.is_empty() {
             let names: Vec<String> = skipped.iter().map(|p| name_of(p)).collect();
-            let title = if skipped.len() == 1 { "Not an SQL file" } else { "Not SQL files" };
-            window.push_notification(Notification::warning(format!("{}\nOnly .sql and .es files can be added.", names.join(", "))).title(title), cx);
+            let title = if skipped.len() == 1 { "Not a query file" } else { "Not query files" };
+            window.push_notification(Notification::warning(format!("{}\nOnly .sql, .es and .mongodb.js files can be added.", names.join(", "))).title(title), cx);
         }
         let first = ok.first().cloned();
         for p in ok {
@@ -518,7 +518,7 @@ impl Siesta {
             self.emit_file(&f, 0, query, true, &mut found);
         }
         if found.is_empty() && query.is_empty() {
-            rows.push(Row::Note { text: "+ adds .sql / .es files from anywhere", depth: 0 });
+            rows.push(Row::Note { text: "+ adds .sql / .es / .mongodb.js files from anywhere", depth: 0 });
         }
         rows.extend(found);
         rows

@@ -136,8 +136,14 @@ impl Siesta {
             window.push_notification("Open a .sql file first", cx);
             return false;
         }
-        if self.doc().is_some_and(|d| d.dialect == sql_split::Dialect::Elastic) {
-            return self.insert_statement(&format!("GET /{table}/_search"), window, cx);
+        match self.doc().map(|d| d.dialect) {
+            Some(sql_split::Dialect::Elastic) => return self.insert_statement(&format!("GET /{table}/_search"), window, cx),
+            Some(sql_split::Dialect::Mongo) => {
+                let plain = table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !table.starts_with(|c: char| c.is_ascii_digit());
+                let coll = if plain { format!("db.{table}") } else { format!("db.getCollection({table:?})") };
+                return self.insert_statement(&format!("{coll}.find({{}})"), window, cx);
+            }
+            _ => {}
         }
         let Some(name) = self.table_sql(schema, table) else { return false };
         self.insert_statement(&format!("SELECT * FROM {name};"), window, cx)
@@ -151,8 +157,8 @@ impl Siesta {
             return false;
         };
         let sql = sql.trim();
-        // `.es` requests end at the next request line: no `;`.
-        let es = self.docs[ix].dialect == sql_split::Dialect::Elastic;
+        // `.es` requests end at the next request line, mongosh calls at the line end: no `;`.
+        let es = !self.docs[ix].dialect.is_sql();
         let sql = if sql.ends_with(';') || es { sql.to_string() } else { format!("{sql};") };
         let d = &self.docs[ix];
         let src = d.editor.read(cx).value().to_string();

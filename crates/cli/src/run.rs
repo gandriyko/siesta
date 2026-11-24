@@ -352,7 +352,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
         // An agent's read on prod runs in a read-only session, so a function that writes inside a
         // SELECT (`SELECT purge()`, `setval`) fails on the server; the allowed UPDATE … WHERE gets
         // a writable one. The text check alone can't see what a function does.
-        let guard = if agent_on_prod && conn.driver != db_conn::Driver::Elastic { rt.block_on(session.set_read_only(j.kind != Kind::Other)) } else { Ok(()) };
+        let guard = if agent_on_prod && matches!(conn.driver, db_conn::Driver::Postgres | db_conn::Driver::MySql) { rt.block_on(session.set_read_only(j.kind != Kind::Other)) } else { Ok(()) };
         let result = rt.block_on(async {
             guard?;
             let run = session.run(&j.text, j.kind, &page);

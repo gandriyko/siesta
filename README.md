@@ -2,7 +2,7 @@
 
 # <img src="crates/app/assets/icon.svg" width="48" align="absmiddle" alt="Siesta icon"> Siesta
 
-**A fast, text-first SQL client for Postgres and MySQL / MariaDB, and Elasticsearch. Queries are plain `.sql` and `.es` files.**
+**A fast, text-first SQL client for Postgres and MySQL / MariaDB, plus Elasticsearch and MongoDB. Queries are plain `.sql`, `.es` and `.mongodb.js` files.**
 
 Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No project files, no cloud, no lock-in.
 
@@ -11,6 +11,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 [![Postgres](https://img.shields.io/badge/Postgres-supported-336791?logo=postgresql&logoColor=white)](#connections)
 [![MySQL / MariaDB](https://img.shields.io/badge/MySQL_%2F_MariaDB-supported-00758F?logo=mysql&logoColor=white)](#connections)
 [![Elasticsearch](https://img.shields.io/badge/Elasticsearch-supported-005571?logo=elasticsearch&logoColor=white)](#elasticsearch)
+[![MongoDB](https://img.shields.io/badge/MongoDB-supported-47A248?logo=mongodb&logoColor=white)](#mongodb)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](Cargo.toml)
 
@@ -34,7 +35,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 |---|---|
 | **Editor** | SQL highlighting, completion of tables and columns from the live schema, the statement under the cursor highlighted and run with <kbd>⌘</kbd> <kbd>Enter</kbd>, server errors underlined at their position |
 | **Results** | Server-side paging, sorting and column filters on any query; a JSON tab with the page as foldable JSON and a JSONPath filter; Count all; JSON / JSONB shown as JSON, with a formatted, highlighted preview on hover; a value dialog with search and a JSONPath filter; copy as TSV, JSON or `INSERT` |
-| **Connections** | Postgres, MySQL / MariaDB and Elasticsearch, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
+| **Connections** | Postgres, MySQL / MariaDB, Elasticsearch and MongoDB, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
 | **Safety** | Production connections get a red banner and confirm every non-read statement; read-only connections refuse writes in Siesta and in the server session; open transactions are asked about before a file or the app closes |
 | **Schema** | DB tab: schemas, tables, columns and indexes; insert a `SELECT` for a table or show its DDL |
 | **History** | Every run is stored per project (statement, connection, time, duration, rows or error; never the data), whether it came from the app, the CLI (`cli`) or an agent through MCP (`mcp`). A filterable list (<kbd>⌘</kbd> <kbd>Y</kbd>) to insert or rerun any entry. A CLI or MCP statement still executing shows at the top with a spinner (`running`), and the open page follows new runs live |
@@ -141,6 +142,32 @@ GET /users/_search
 - **Safety.** `prod` and `read_only` work as for SQL. `read_only` is checked only in Siesta: Elasticsearch has no read-only session.
 - **Schema.** The DB tab lists indices with their mapping fields; a double click inserts `GET /index/_search`.
 
+### MongoDB
+
+A `.mongodb.js` file holds mongosh calls, one per statement, as in a MongoDB playground. Comments and directives start with `//`. Siesta runs calls, not JavaScript: variables, functions and loops are errors.
+
+```js
+// @connection mongo-dev
+// @database shop
+
+// @name new orders
+db.orders.find({ status: 'new' })
+  .sort({ at: -1 })
+
+db.orders.aggregate([{ $group: { _id: '$customer', n: { $sum: 1 } } }])
+```
+
+```jsonc
+// ~/.config/siesta/connections/mongo-dev.json
+{ "driver": "mongodb", "url": "mongodb+srv://app@cluster0.example.net/shop" }
+```
+
+- **Results open as JSON.** **JSON** shows the page's documents; **Raw** shows them as extended JSON with their types (`$oid`, `$date`, `$numberDecimal`); **Table** puts them in rows.
+- **Paging, sorting and filters.** `find` and `aggregate` page on the server unless the statement sets `.limit()` / `.skip()`; the column sort and filters go into the command.
+- **URLs.** A plain `mongodb://` URL fills the form's fields; `mongodb+srv://`, several hosts or options stay as the URL, and its password moves to the encrypted password.
+- **Safety.** `prod` and `read_only` work as for SQL, checked only in Siesta. An `$out` / `$merge` stage makes an aggregation a write.
+- **Schema.** The DB tab lists the database's collections with fields from sample documents and indexes; a double click inserts `db.<collection>.find({})`.
+
 ### Passwords
 
 A password is never written in clear. Type it in the connection form, or run `siesta connections set-password NAME`. It is stored as `"password_enc": "v1:…"`, encrypted with XChaCha20-Poly1305 and bound to the connection name. The key is random and lives in `~/.siesta/key` (mode 0600, created on first use), away from the connection files.
@@ -233,7 +260,7 @@ crates/
 
 ```sh
 cargo test --workspace          # unit and GUI tests
-scripts/test-db.sh              # integration tests on Postgres, MariaDB and Elasticsearch in Docker (--down stops them)
+scripts/test-db.sh              # integration tests on Postgres, MariaDB, Elasticsearch and MongoDB in Docker (--down stops them)
 ```
 
 The principles and decisions behind the design are in [the specification](SPEC.md). Siesta is a sibling of [Respite](https://github.com/gandriyko/respite), a text-first REST client built the same way.

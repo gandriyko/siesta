@@ -1,5 +1,6 @@
-//! Splits a query file into statements with positions: `.sql` (Postgres / MySQL dialects) and
-//! Elasticsearch `.es` files (requests, see [`es`]).
+//! Splits a query file into statements with positions: `.sql` (Postgres / MySQL dialects),
+//! Elasticsearch `.es` files (requests, see [`es`]) and MongoDB `.mongodb.js` files (mongosh
+//! calls, see [`mongo`]).
 //!
 //! Splitting never fails: problems go to `diagnostics`. Offsets are byte offsets into the
 //! source, lines are 1-based.
@@ -7,7 +8,9 @@
 use std::ops::Range;
 
 mod es;
+mod mongo;
 pub use es::{Request as EsRequest, kind as es_kind, normalize_path as es_normalize_path, request as es_request};
+pub use mongo::{Call as MongoCall, kind as mongo_kind, parse as mongo_parse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dialect {
@@ -17,12 +20,23 @@ pub enum Dialect {
     MySql,
     /// Elasticsearch requests in Kibana console format (`.es` files).
     Elastic,
+    /// MongoDB calls in mongosh syntax (`.mongodb.js` files).
+    Mongo,
 }
 
 impl Dialect {
-    /// What starts a directive comment: `--` in SQL, `#` in `.es` files.
+    /// What starts a directive comment: `--` in SQL, `#` in `.es` files, `//` in `.mongodb.js`.
     pub fn comment(self) -> &'static str {
-        if self == Dialect::Elastic { "#" } else { "--" }
+        match self {
+            Dialect::Elastic => "#",
+            Dialect::Mongo => "//",
+            Dialect::Postgres | Dialect::MySql => "--",
+        }
+    }
+
+    /// Postgres or MySQL: statements are SQL.
+    pub fn is_sql(self) -> bool {
+        matches!(self, Dialect::Postgres | Dialect::MySql)
     }
 }
 
@@ -177,8 +191,10 @@ fn rewrite_directive_at(src: &str, at: Range<usize>, word: &str, name: Option<&s
 }
 
 pub fn split(src: &str, dialect: Dialect) -> SqlFile {
-    if dialect == Dialect::Elastic {
-        return es::split(src);
+    match dialect {
+        Dialect::Elastic => return es::split(src),
+        Dialect::Mongo => return mongo::split(src),
+        Dialect::Postgres | Dialect::MySql => {}
     }
     split_words(src, dialect, false).0
 }
@@ -509,6 +525,9 @@ pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> 
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().find_map(es::reason);
     }
+    if dialect == Dialect::Mongo {
+        return mongo::split(text).statements.iter().filter_map(|s| mongo::parse(s.text(text)).ok()).find_map(|c| mongo::reason(&c));
+    }
     // The splitter's own lexer (strings, comments, dollar quotes), so both agree on what is a word.
     split_words(text, dialect, true).1.iter().find_map(|w| reason(w))
 }
@@ -519,6 +538,9 @@ pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> 
 pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().any(es::schema_changing);
+    }
+    if dialect == Dialect::Mongo {
+        return mongo::split(text).statements.iter().filter_map(|s| mongo::parse(s.text(text)).ok()).any(|c| mongo::schema_changing(&c));
     }
     fn changes(words: &[(u32, &str)]) -> bool {
         let Some(&(_, first)) = words.first() else { return false };
@@ -540,6 +562,9 @@ pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
 pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().find_map(es::read_only_violation);
+    }
+    if dialect == Dialect::Mongo {
+        return mongo::read_only_violation(text);
     }
     if let Some(m) = executable_comment(text, dialect) {
         return Some(format!("Read-only connection: {m}"));
@@ -574,6 +599,9 @@ pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
 pub fn prod_agent_violation(text: &str, dialect: Dialect) -> Option<String> {
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().find_map(es::prod_agent_violation);
+    }
+    if dialect == Dialect::Mongo {
+        return mongo::prod_agent_violation(text);
     }
     if let Some(m) = executable_comment(text, dialect) {
         return Some(format!("Production connection: {m}"));
@@ -612,7 +640,7 @@ pub struct TopLevel {
 }
 
 pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
-    if dialect == Dialect::Elastic {
+    if !dialect.is_sql() {
         return TopLevel::default();
     }
     let (_, all) = split_words(text, dialect, true);
@@ -629,7 +657,7 @@ pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
 /// (and `DISTINCT` / `ALL`) up to the top-level clause that ends it (`FROM`, `WHERE`, …) or the
 /// end, without surrounding whitespace (empty when the list is). `None` for any other statement.
 pub fn select_list(text: &str, dialect: Dialect) -> Option<Range<usize>> {
-    if dialect == Dialect::Elastic {
+    if !dialect.is_sql() {
         return None;
     }
     let (_, all) = split_words(text, dialect, true);

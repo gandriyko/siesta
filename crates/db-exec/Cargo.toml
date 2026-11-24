@@ -18,6 +18,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["time", "sync", "macros"] }
 # Elasticsearch over HTTP, the same client as Respite's.
 reqwest = "0.13"
+# MongoDB: the official driver (commands, cursors, SRV / TLS / auth from the URI); bson's extended JSON bridges the parsed mongosh literals.
+mongodb = { version = "3", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver"] }
+bson = { version = "3", features = ["serde_json-1"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

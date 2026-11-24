@@ -67,6 +67,14 @@ impl ConnectionForm {
         };
         let driver = self.driver.ok_or("driver is required")?;
         m.insert("driver".into(), driver.name().into());
+        // A MongoDB url the fields can't hold (SRV, several hosts, options) is kept, without its
+        // password (the form moves it to the password field); the URL field owns it.
+        if driver == Driver::Mongo {
+            m.remove("url");
+            if !self.url.trim().is_empty() && parse_url(&self.url).is_err() {
+                m.insert("url".into(), without_password(self.url.trim()).into());
+            }
+        }
         for (k, on) in [("read_only", self.read_only), ("prod", self.prod)] {
             if on {
                 m.insert(k.into(), true.into());
@@ -97,6 +105,15 @@ impl ConnectionForm {
         };
         Ok(c)
     }
+}
+
+/// `url` without the password of its user info (`user:pw@` → `user@`).
+pub fn without_password(url: &str) -> String {
+    let mut out = url.to_string();
+    if let Some(r) = crate::url_passwords(url).into_iter().find(|r| url[..r.start].ends_with(':')) {
+        out.replace_range(r.start - 1..r.end, "");
+    }
+    out
 }
 
 fn path_of(config: &Path, name: &str) -> PathBuf {
@@ -182,10 +199,14 @@ pub fn read_form(config: &Path, name: &str) -> Option<ConnectionForm> {
         }
     }
     let or = |k: &str, v: String| Some(s(k)).filter(|x| !x.is_empty()).unwrap_or(v);
+    let driver = parse_driver(e.get("driver").and_then(Value::as_str), e.get("url").and_then(Value::as_str)).ok();
+    // A kept MongoDB url shows in the URL field; a password written in it moves to the password field.
+    let kept = (driver == Some(Driver::Mongo) && base.contains_key("url")).then(|| s("url"));
+    let p = crate::ParsedUrl { password: kept.as_deref().and_then(crate::url_password).unwrap_or(p.password), ..p };
     Some(ConnectionForm {
         name: name.into(),
-        driver: parse_driver(e.get("driver").and_then(Value::as_str), e.get("url").and_then(Value::as_str)).ok(),
-        url: String::new(),
+        driver,
+        url: kept.unwrap_or_default(),
         host,
         socket,
         socket_path,
@@ -359,6 +380,27 @@ mod tests {
         assert!(json(d, "ok").is_object());
         // Second run: nothing left to do.
         assert_eq!(migrate_names(d, keys), (vec![], vec![]));
+    }
+
+    #[test]
+    fn mongo_url_the_fields_cant_hold_is_kept_without_its_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (d, keys) = (&tmp.path().join("config"), &tmp.path().join("data"));
+        let srv = "mongodb+srv://app:p%40ss@cluster0.example.net/shop?retryWrites=true";
+        let f = ConnectionForm { name: "m".into(), driver: Some(Driver::Mongo), url: srv.into(), password: "p@ss".into(), ..Default::default() };
+        save(d, keys, &f, None).unwrap();
+        assert_eq!(json(d, "m")["url"], "mongodb+srv://app@cluster0.example.net/shop?retryWrites=true");
+        let r = read_form(d, "m").unwrap();
+        assert_eq!((r.driver, r.url.as_str()), (Some(Driver::Mongo), "mongodb+srv://app@cluster0.example.net/shop?retryWrites=true"));
+        // A hand-written url with a password: the form shows it in the password field, saving encrypts it.
+        fs::write(path_of(d, "hand"), format!(r#"{{"url": "{srv}"}}"#)).unwrap();
+        let r = read_form(d, "hand").unwrap();
+        assert_eq!(r.password, "p@ss");
+        save(d, keys, &r, Some("hand")).unwrap();
+        assert!(!json(d, "hand")["url"].as_str().unwrap().contains("p%40ss") && json(d, "hand").get("password_enc").is_some());
+        // Cleared in the form: gone from the file.
+        save(d, keys, &ConnectionForm { url: String::new(), ..r }, Some("hand")).unwrap();
+        assert!(json(d, "hand").get("url").is_none());
     }
 
     #[test]

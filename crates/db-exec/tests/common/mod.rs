@@ -9,6 +9,7 @@ pub fn connection(driver: Driver) -> Connection {
         Driver::Postgres => "SIESTA_TEST_PG_URL",
         Driver::MySql => "SIESTA_TEST_MYSQL_URL",
         Driver::Elastic => "SIESTA_TEST_ES_URL",
+        Driver::Mongo => "SIESTA_TEST_MONGO_URL",
     };
     Connection {
         name: "test".into(),

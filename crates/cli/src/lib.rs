@@ -19,7 +19,7 @@ use output::{Format, RED, emit_objects, paint, put, render_csv, render_table};
 use run::{ConnArgs, Env, ExecArgs, RunArgs, dialect_of, kind_name, line_of};
 
 #[derive(Parser)]
-#[command(name = "siesta", version, about = "Lightweight SQL client: Postgres, MySQL / MariaDB and Elasticsearch")]
+#[command(name = "siesta", version, about = "Lightweight SQL client: Postgres, MySQL / MariaDB, Elasticsearch and MongoDB")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -271,10 +271,10 @@ fn list(path: &Path, format: Format, out: &mut dyn Write) -> Result<u8, CliError
     let mut rows = vec![];
     for f in sql_files(path) {
         let src = std::fs::read_to_string(&f).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&f, None))?;
-        // `.es` is Elastic; a `.sql` file's dialect comes from its `-- @connection`, else Postgres.
+        // `.es` / `.mongodb.js` keep their own; a `.sql` file's dialect comes from its `-- @connection`, else Postgres.
         let dialect = match siesta_workspace::file_dialect(&f) {
-            Dialect::Elastic => Dialect::Elastic,
-            _ => sql_split::split(&src, Dialect::Postgres).connection.and_then(|n| env.conns.connections.get(&n).map(|c| dialect_of(c.driver))).filter(|d| *d != Dialect::Elastic).unwrap_or_default(),
+            d if !d.is_sql() => d,
+            _ => sql_split::split(&src, Dialect::Postgres).connection.and_then(|n| env.conns.connections.get(&n).map(|c| dialect_of(c.driver))).filter(|d| d.is_sql()).unwrap_or_default(),
         };
         let file = sql_split::split(&src, dialect);
         for d in file.diagnostics.iter().filter(|d| d.severity == sql_split::Severity::Error) {
@@ -310,14 +310,19 @@ fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8
     let env = Env::load();
     let started = std::time::Instant::now();
     let (rt, mut s, conn) = open_session(&env, name, None)?;
-    let es = conn.driver == db_conn::Driver::Elastic;
-    let (query, kind) = if es { ("GET /", Kind::Read) } else { ("SELECT version()", Kind::Query) };
-    let version = rt.block_on(s.run(query, kind, &Page::default())).map_err(|e| db_error(&e))?;
-    let first = version.rows.first().and_then(|r| r.first());
-    let version = match first {
+    let (query, kind) = match conn.driver {
+        db_conn::Driver::Elastic => ("GET /", Kind::Read),
+        db_conn::Driver::Mongo => ("db.version()", Kind::Read),
+        db_conn::Driver::Postgres | db_conn::Driver::MySql => ("SELECT version()", Kind::Query),
+    };
+    let o = rt.block_on(s.run(query, kind, &Page::default())).map_err(|e| db_error(&e))?;
+    let first = o.rows.first().and_then(|r| r.first());
+    let version = match (conn.driver, first) {
         // `GET /` answers with the cluster's JSON.
-        Some(db_exec::Value::Json(v)) if es => format!("Elasticsearch {}", v["version"]["number"].as_str().unwrap_or("?")),
-        other => other.map(|v| v.display()).unwrap_or_default(),
+        (db_conn::Driver::Elastic, Some(db_exec::Value::Json(v))) => format!("Elasticsearch {}", v["version"]["number"].as_str().unwrap_or("?")),
+        // `buildInfo`: one row, a `version` column.
+        (db_conn::Driver::Mongo, _) => format!("MongoDB {}", o.columns.iter().position(|c| c.name == "version").and_then(|i| o.rows.first()?.get(i)).map_or("?".into(), |v| v.display())),
+        (_, other) => other.map(|v| v.display()).unwrap_or_default(),
     };
     let ms = started.elapsed().as_millis() as u64;
     rt.block_on(s.close());

@@ -18,6 +18,15 @@ pub struct ParsedUrl {
     pub ignored: Vec<String>,
 }
 
+/// [`parse_url`]'s answer for a MongoDB URL the fields can't hold.
+pub const MONGO_URL_KEPT: &str = "mongodb+srv, several hosts or options: kept as the URL (its password goes to the password field)";
+
+/// The decoded password of a URL's user info (`user:pw@`).
+pub fn url_password(url: &str) -> Option<String> {
+    let r = crate::url_passwords(url).into_iter().find(|r| url[..r.start].ends_with(':'))?;
+    Some(decode(&url[r]))
+}
+
 fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
@@ -46,9 +55,14 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
             "postgres" | "postgresql" | "psycopg" | "psycopg2" | "asyncpg" | "pg8000" => Some(Driver::Postgres),
             "mysql" | "mariadb" | "pymysql" | "mysqldb" | "mysqlconnector" | "aiomysql" | "asyncmy" => Some(Driver::MySql),
             "http" | "https" => Some(Driver::Elastic),
+            "mongodb" => Some(Driver::Mongo),
             _ => None,
         })
         .ok_or("Unsupported scheme")?;
+    // The fields hold one host, a port and a database; anything more stays in the url.
+    if driver == Driver::Mongo && (scheme != "mongodb" || rest.contains('?') || rest.split('/').next().unwrap_or("").contains(',')) {
+        return Err(MONGO_URL_KEPT.into());
+    }
     if driver == Driver::Elastic {
         // `https://` is TLS with the certificate checked; the path (a proxy prefix) is not supported.
         let mut p = parse_url(&format!("postgres://{rest}"))?;
@@ -158,6 +172,10 @@ mod tests {
             ("https://elastic:pw@es.example.com/?pretty", (Some(Elastic), "elastic", "pw", "es.example.com", None, "", Some(SslMode::VerifyFull), none.clone())),
         ] {
             assert_eq!(ok(url), own(want), "{url}");
+        }
+        assert_eq!(ok("mongodb://u:p@m:27018/shop"), own((Some(Mongo), "u", "p", "m", Some(27018), "shop", None, none.clone())));
+        for url in ["mongodb+srv://u:p@c.example.net/shop", "mongodb://m/shop?authSource=admin", "mongodb://a:1,b:2/shop"] {
+            assert_eq!(parse_url(url), Err(MONGO_URL_KEPT.into()), "{url}");
         }
         for (url, err) in [("ftp://h/db", "Unsupported scheme"), ("h/db", "Unsupported scheme"), ("postgres://", "Missing host"), ("postgres://u:p@/db", "Missing host"), ("postgres://h:x/db", "Invalid port")] {
             assert_eq!(parse_url(url), Err(err.into()), "{url}");

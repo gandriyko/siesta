@@ -43,8 +43,10 @@ impl SqlTip {
             Ok(v) => format!("{} {}\n{}", r.method, r.path, serde_json::to_string_pretty(&v).unwrap_or(r.body)),
             Err(_) => sql.trim().to_string(),
         });
-        let lang = if es.is_some() { "json" } else { "sql" };
-        let text = es.unwrap_or_else(|| sqlformat::format(sql.trim(), &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default()));
+        // A mongosh call stays as written (the SQL formatter would break it).
+        let mongo = es.is_none() && sql_split::mongo_parse(sql.trim()).is_ok();
+        let lang = if es.is_some() { "json" } else if mongo { "javascript" } else { "sql" };
+        let text = es.or_else(|| mongo.then(|| sql.trim().to_string())).unwrap_or_else(|| sqlformat::format(sql.trim(), &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default()));
         let mut hl = gpui_component::highlighter::SyntaxHighlighter::new(lang);
         hl.update(None, &gpui_component::input::Rope::from(text.as_str()), None);
         let runs = hl.styles(&(0..text.len()), &*cx.theme().highlight_theme);

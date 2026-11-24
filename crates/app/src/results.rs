@@ -156,7 +156,7 @@ pub enum Tab {
     Result,
     /// The page's rows as a JSON array of objects (Elasticsearch: the documents).
     Json,
-    /// The server's whole JSON response (Elasticsearch only).
+    /// The server's JSON (Elasticsearch: the whole response; MongoDB: the documents as extended JSON).
     Raw,
     Messages,
     Query,
@@ -829,7 +829,11 @@ impl Siesta {
         }
         let (tab, text) = (e.tab, if e.tab == Tab::Messages { messages_text(&done) } else { query_text(&done) });
         self.ui.meta_shown = sig;
-        let query_lang = if done.driver == Driver::Elastic { "json" } else { "sql" };
+        let query_lang = match done.driver {
+            Driver::Elastic => "json",
+            Driver::Mongo => "javascript",
+            Driver::Postgres | Driver::MySql => "sql",
+        };
         self.ui.meta.update(cx, |s, cx| {
             s.set_highlighter(SharedString::from(if tab == Tab::Query { query_lang } else { "text" }), cx);
             s.set_value(text, window, cx);
@@ -1098,8 +1102,8 @@ impl Siesta {
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_filters(window, cx))),
                 )
                 .child(Button::new("copy-result").icon(IconName::Copy).ghost().xsmall().tooltip("Copy the page as TSV").on_click(cx.listener(|this, _, window, cx| this.copy_result(window, cx))));
-            // Elasticsearch documents change through requests, not cell edits.
-            if done.as_ref().is_some_and(|d| d.kind == Kind::Query && d.driver != db_conn::Driver::Elastic) {
+            // Elasticsearch / MongoDB documents change through requests, not cell edits.
+            if done.as_ref().is_some_and(|d| d.kind == Kind::Query && matches!(d.driver, db_conn::Driver::Postgres | db_conn::Driver::MySql)) {
                 let editing = self.shown_edit(cx).is_some();
                 actions = actions.child(
                     Button::new("edit-result")
@@ -1114,7 +1118,11 @@ impl Siesta {
             }
         }
         if let Some(d) = &done {
-            let label = if d.driver == db_conn::Driver::Elastic { "Show page request" } else { "Show page SQL" };
+            let label = match d.driver {
+                db_conn::Driver::Elastic => "Show page request",
+                db_conn::Driver::Mongo => "Show page command",
+                db_conn::Driver::Postgres | db_conn::Driver::MySql => "Show page SQL",
+            };
             actions = actions.child(Button::new("page-sql").label(label).ghost().xsmall().on_click(cx.listener(|this, _, _, cx| {
                 if let Some(e) = this.shown_key(cx).and_then(|k| this.store.entries.get_mut(&k)) {
                     e.tab = Tab::Query;
@@ -1126,7 +1134,7 @@ impl Siesta {
         let batch = self.batch_strip(key.as_ref(), cx);
         let header = v_flex().flex_none().gap_1().px_3().py_1p5().border_b_1().border_color(border).child(line1).child(line2).children(batch);
 
-        // Raw only where the server's JSON response was kept (Elasticsearch).
+        // Raw only where the server's JSON was kept (Elasticsearch, MongoDB).
         let has_raw = done.as_ref().and_then(|d| d.outcome()).is_some_and(|o| o.raw.is_some());
         let tab = if tab == Tab::Raw && !has_raw { Tab::Json } else { tab };
         let shown_tabs: Vec<Tab> = [Tab::Result, Tab::Json, Tab::Raw, Tab::Messages, Tab::Query].into_iter().filter(|t| *t != Tab::Raw || has_raw).collect();

@@ -100,12 +100,14 @@ fn handle(msg: &Value, on_spawn: &dyn Fn(u32)) -> Option<Value> {
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "siesta", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Query Postgres / MySQL databases and Elasticsearch clusters through Siesta connections. Start with \
-                `connections` (its `driver` tells SQL from `elasticsearch`), then `schema` to see tables and columns (Elasticsearch: \
-                indices and mapping fields) before writing a query. On an Elasticsearch connection `run_sql` takes Kibana console \
-                requests instead of SQL: a `METHOD /path` line, then a JSON body. `run_sql` can write, except on `read_only` \
-                connections; on a `prod` connection only reads and `UPDATE … WHERE` (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body) \
-                run. Anything refused (exit 4) is for the user to run.",
+            "instructions": "Query Postgres / MySQL databases, Elasticsearch clusters and MongoDB through Siesta connections. Start with \
+                `connections` (its `driver` tells SQL from `elasticsearch` and `mongodb`), then `schema` to see tables and columns (Elasticsearch: \
+                indices and mapping fields; MongoDB: collections with fields sampled from documents) before writing a query. On an \
+                Elasticsearch connection `run_sql` takes Kibana console requests instead of SQL: a `METHOD /path` line, then a JSON body. \
+                On a MongoDB connection it takes mongosh calls: `db.<collection>.find({…}).sort({…})`, `aggregate([…])`, `updateOne(…)`, \
+                `db.runCommand({…})`, `show collections` (one call per statement; no variables or functions). `run_sql` can write, except on `read_only` \
+                connections; on a `prod` connection only reads and `UPDATE … WHERE` (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body; \
+                MongoDB: `updateOne` / `updateMany` with a filter and update operators) run. Anything refused (exit 4) is for the user to run.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -141,20 +143,20 @@ fn call(name: &str, args: &Value, on_spawn: &dyn Fn(u32)) -> Result<Value, (i64,
         text += &format!("\n\nstderr:\n{}", err.trim_end());
     }
     if code != 0 {
-        text += &format!("\n\nexit code {code} (2 connection error · 3 bad input · 4 refused: read-only connection or needs confirmation, ask the user · 5 SQL / Elasticsearch error)");
+        text += &format!("\n\nexit code {code} (2 connection error · 3 bad input · 4 refused: read-only connection or needs confirmation, ask the user · 5 SQL / Elasticsearch / MongoDB error)");
     }
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0}))
 }
 
-/// The agent may name only query files (`.sql` / `.es`), also behind a symlink: the tools print
-/// statement text, so any other path would read an arbitrary file (`~/.ssh/…`, `.env`).
+/// The agent may name only query files (`.sql` / `.es` / `.mongodb.js`), also behind a symlink:
+/// the tools print statement text, so any other path would read an arbitrary file (`~/.ssh/…`, `.env`).
 fn query_file(p: &str) -> Result<(), String> {
     let path = Path::new(p);
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if siesta_workspace::is_sql(path) && siesta_workspace::is_sql(&target) {
         Ok(())
     } else {
-        Err(format!("'{p}' is not a .sql or .es file"))
+        Err(format!("'{p}' is not a .sql, .es or .mongodb.js file"))
     }
 }
 
@@ -232,19 +234,22 @@ fn tools() -> Value {
     };
     json!([
         tool("connections", "Every connection: name, driver, host, database, user, read_only, prod; secrets masked.", json!({}), &[], true),
-        tool("list_statements", "Statements of a .sql / .es file or every such file under a directory: file, line, name, first line, kind.",
+        tool("list_statements", "Statements of a .sql / .es / .mongodb.js file or every such file under a directory: file, line, name, first line, kind.",
             json!({"path": s("File or directory (default: current directory)")}), &[], true),
-        tool("schema", "Tables and views with columns and indexes of a connection (Elasticsearch: indices with their mapping fields); one table with `table`, its CREATE statement with `ddl` (Elasticsearch: `PUT /index` with the mapping).",
+        tool("schema", "Tables and views with columns and indexes of a connection (Elasticsearch: indices with their mapping fields; MongoDB: collections with fields seen in sample documents); \
+            one table with `table`, its CREATE statement with `ddl` (Elasticsearch: `PUT /index` with the mapping; MongoDB: `db.createCollection` and `createIndex` calls).",
             json!({"table": s("`table` or `schema.table`; none = every table and view"), "connection": connection, "database": database,
                    "ddl": json!({"type": "boolean", "description": "Return the table's CREATE statement"})}), &[], true),
-        tool("run_sql", "Run SQL (or Elasticsearch requests) and return siesta.run/v1 JSON per statement (columns, rows, rows_truncated, rows_affected, duration_ms). \
+        tool("run_sql", "Run SQL (or Elasticsearch requests, or MongoDB calls) and return siesta.run/v1 JSON per statement (columns, rows, rows_truncated, rows_affected, duration_ms). \
             Give `sql` (with `connection`) or a `file` (with optional `statements`). On an Elasticsearch connection `sql` holds \
             requests in Kibana console format (`GET /index/_search` then a JSON body); search hits come back as rows (`_id` + `_source` fields), \
-            other responses as one `response` JSON cell. Refused with exit 4 before anything runs: \
+            other responses as one `response` JSON cell. On a MongoDB connection `sql` holds mongosh calls, one per line or `;` \
+            (`db.orders.find({status: 'new'}).sort({at: -1})`, `db.orders.aggregate([…])`); documents come back as rows. Refused with exit 4 before anything runs: \
             writes on a `read_only` connection; on a `prod` connection everything but reads and `UPDATE` with a `WHERE` \
-            (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body, no script or upsert; DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
+            (Elasticsearch: `POST <index>/_update/<id>` with a `doc` body, no script or upsert; MongoDB: `updateOne` / `updateMany` with a filter and \
+            update operators, no upsert; DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
             destructive ones when `run.confirm_destructive` is `always`) — ask the user to run those.",
-            json!({"sql": s("SQL text, or Elasticsearch requests on an Elasticsearch connection; one or several statements"), "file": s("A .sql / .es file to run instead of `sql`"),
+            json!({"sql": s("SQL text, Elasticsearch requests or MongoDB calls (by the connection's driver); one or several statements"), "file": s("A .sql / .es / .mongodb.js file to run instead of `sql`"),
                    "statements": json!({"type": "array", "items": {"type": "string"}, "description": "Statements of `file`: `@name`, `:LINE` or `#N`; none = all"}),
                    "connection": connection, "database": database,
                    "max_rows": json!({"type": "integer", "description": "Rows per statement (default 100; 0 = the results.max_rows cap)"})}),
@@ -286,11 +291,14 @@ mod tests {
         std::fs::write(p("secret.env"), "TOKEN=x").unwrap();
         std::fs::write(p("q.es"), "GET /").unwrap();
         std::os::unix::fs::symlink(p("secret.env"), p("trap.sql")).unwrap();
+        std::fs::write(p("q.mongodb.js"), "show dbs").unwrap();
+        std::os::unix::fs::symlink(p("secret.env"), p("trap.mongodb.js")).unwrap();
         assert!(argv("run_sql", &json!({"file": p("q.es")})).is_ok());
+        assert!(argv("run_sql", &json!({"file": p("q.mongodb.js")})).is_ok());
         assert!(argv("list_statements", &json!({"path": p("q.es")})).is_ok());
         assert!(argv("list_statements", &json!({"path": dir.path()})).is_ok());
-        for bad in [p("secret.env"), p("trap.sql"), "/etc/hosts".into()] {
-            assert!(argv("run_sql", &json!({"file": bad})).unwrap_err().contains("not a .sql or .es file"), "{bad}");
+        for bad in [p("secret.env"), p("trap.sql"), p("trap.mongodb.js"), "/etc/hosts".into()] {
+            assert!(argv("run_sql", &json!({"file": bad})).unwrap_err().contains("not a .sql, .es or .mongodb.js file"), "{bad}");
             assert!(argv("list_statements", &json!({"path": bad})).is_err(), "{bad}");
         }
     }

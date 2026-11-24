@@ -550,14 +550,18 @@ impl Siesta {
                 let (line_numbers, soft_wrap) = (st.editor.line_numbers, st.editor.soft_wrap);
                 let sql = siesta_workspace::is_sql(&path);
                 let es = siesta_workspace::is_es(&path);
+                let mongo = siesta_workspace::is_mongo(&path);
                 let editor = cx.new(|cx| {
                     let mut s = EditorState::new(window, cx);
                     if sql {
-                        s = s.language(if es { "json" } else { "sql" });
+                        s = s.language(if es { "json" } else if mongo { "javascript" } else { "sql" });
                     }
                     s = s.searchable(true).line_number(line_numbers).soft_wrap(soft_wrap).default_value(text);
                     if es {
                         s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::EsHighlighter::default()) as _)), cx);
+                        s.set_gutter_decorations_width(px(3.), cx);
+                    } else if mongo {
+                        s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::SqlHighlighter::new("javascript", "//")) as _)), cx);
                         s.set_gutter_decorations_width(px(3.), cx);
                     } else if sql {
                         s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::SqlHighlighter::default()) as _)), cx);
@@ -1107,8 +1111,7 @@ impl Siesta {
         // Red too: a connection of the other language (`.es` on SQL, `.sql` on Elasticsearch).
         let mismatch = d.connection_mismatch();
         // Only the connections that run this kind of file.
-        let es = d.dialect == sql_split::Dialect::Elastic;
-        let names: Vec<String> = d.conns.connections.iter().filter(|(_, c)| (c.driver == db_conn::Driver::Elastic) == es).map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = d.conns.connections.iter().filter(|(_, c)| siesta_workspace::mismatch(&d.path, db_exec::dialect(c.driver)).is_none()).map(|(n, _)| n.clone()).collect();
         // Nothing to pick yet: the picker becomes the way to make the first connection.
         if names.is_empty() && unknown.is_none() {
             return Some(
@@ -2082,6 +2085,36 @@ mod tests {
         // The DB tab inserts a search, without `;`.
         cx.update(|window, cx| app.update(cx, |this, cx| assert!(this.insert_select("indices", "logs", window, cx))));
         assert!(state(&mut cx).4.ends_with("{\"query\": {\"match_all\": {}}}\n\nGET /logs/_search\n"), "{:?}", state(&mut cx).4);
+    }
+
+    #[gpui::test]
+    fn mongo_files_split_as_calls_and_take_only_mongodb_connections(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        std::fs::write(ws.path().join("connections/mg.json"), r#"{"driver": "mongodb", "url": "mongodb://127.0.0.1:1/shop"}"#).unwrap();
+        let q = ws.path().join("collections/q.mongodb.js");
+        std::fs::write(&q, "db.orders.find({status: 'new'})\n  .sort({at: -1})\ndb.orders.deleteMany({})\n").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(q.clone()));
+        let state = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let this = app.read(cx);
+                let d = this.doc().unwrap();
+                (d.dialect, d.file.statements.iter().map(|s| s.kind).collect::<Vec<_>>(), d.connection_mismatch(), this.connection_of(&q).err(), d.editor.read(cx).value().to_string())
+            })
+        };
+        let (dialect, kinds, ..) = state(&mut cx);
+        assert_eq!((dialect, kinds), (sql_split::Dialect::Mongo, vec![sql_split::Kind::Query, sql_split::Kind::Other]));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("mg".into()), window, cx)));
+        let (dialect, _, mismatch, err, text) = state(&mut cx);
+        assert_eq!((dialect, mismatch, err), (sql_split::Dialect::Mongo, None, None));
+        assert!(text.starts_with("// @connection mg\ndb.orders.find"), "{text}");
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
+        let (_, _, mismatch, err, _) = state(&mut cx);
+        assert_eq!(mismatch, Some(".mongodb.js files run on MongoDB connections"));
+        assert!(err.unwrap().contains("can't run this file"));
+        // The DB tab inserts a find below the statement under the cursor, without `;`.
+        cx.update(|window, cx| app.update(cx, |this, cx| assert!(this.insert_select("shop", "my orders", window, cx))));
+        assert!(state(&mut cx).4.ends_with(".sort({at: -1})\n\ndb.getCollection(\"my orders\").find({})\ndb.orders.deleteMany({})\n"), "{:?}", state(&mut cx).4);
+        assert_eq!(state(&mut cx).1.len(), 3);
     }
 
     #[gpui::test]
