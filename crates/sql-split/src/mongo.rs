@@ -110,8 +110,9 @@ fn writes_collection(c: &Call) -> bool {
     c.args.iter().chain(c.chain.iter().flat_map(|(_, a)| a)).any(has)
 }
 
+/// No filter, `{}`, or only `$comment` (a note that matches every document).
 fn empty_filter(v: Option<&J>) -> bool {
-    v.is_none_or(|v| v.as_object().is_some_and(Map::is_empty))
+    v.is_none_or(|v| v.as_object().is_some_and(|m| m.keys().all(|k| k == "$comment")))
 }
 
 /// Why a statement needs a confirmation where destructive statements do: dropping a collection,
@@ -739,6 +740,9 @@ mod tests {
             ("db.a.updateOne({_id: 1}, {$set: {x: 2}})", Kind::Other, None, false, true),
             ("db.a.updateMany({x: 1}, {$inc: {n: 1}}, {arrayFilters: []})", Kind::Other, None, false, true),
             ("db.a.updateMany({}, {$set: {x: 1}})", Kind::Other, Some("updateMany without filter"), false, false),
+            // `$comment` alone matches every document: no filter.
+            ("db.a.updateMany({$comment: 'all'}, {$set: {x: 1}})", Kind::Other, Some("updateMany without filter"), false, false),
+            ("db.a.updateMany({x: 1, $comment: 'fix'}, {$set: {x: 2}})", Kind::Other, None, false, true),
             ("db.a.updateOne({_id: 1}, {x: 2})", Kind::Other, None, false, false),
             ("db.a.updateOne({_id: 1}, [{$set: {x: 2}}])", Kind::Other, None, false, false),
             ("db.a.updateOne({_id: 1}, {$set: {x: 2}}, {upsert: true})", Kind::Other, None, false, false),
