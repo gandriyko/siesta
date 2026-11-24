@@ -212,7 +212,7 @@ impl Siesta {
         if !skipped.is_empty() {
             let names: Vec<String> = skipped.iter().map(|p| name_of(p)).collect();
             let title = if skipped.len() == 1 { "Not an SQL file" } else { "Not SQL files" };
-            window.push_notification(Notification::warning(format!("{}\nOnly .sql files can be added.", names.join(", "))).title(title), cx);
+            window.push_notification(Notification::warning(format!("{}\nOnly .sql and .es files can be added.", names.join(", "))).title(title), cx);
         }
         let first = ok.first().cloned();
         for p in ok {

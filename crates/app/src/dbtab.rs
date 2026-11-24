@@ -136,6 +136,9 @@ impl Siesta {
             window.push_notification("Open a .sql file first", cx);
             return false;
         }
+        if self.doc().is_some_and(|d| d.dialect == sql_split::Dialect::Elastic) {
+            return self.insert_statement(&format!("GET /{table}/_search"), window, cx);
+        }
         let Some(name) = self.table_sql(schema, table) else { return false };
         self.insert_statement(&format!("SELECT * FROM {name};"), window, cx)
     }
@@ -148,7 +151,9 @@ impl Siesta {
             return false;
         };
         let sql = sql.trim();
-        let sql = if sql.ends_with(';') { sql.to_string() } else { format!("{sql};") };
+        // `.es` requests end at the next request line: no `;`.
+        let es = self.docs[ix].dialect == sql_split::Dialect::Elastic;
+        let sql = if sql.ends_with(';') || es { sql.to_string() } else { format!("{sql};") };
         let d = &self.docs[ix];
         let src = d.editor.read(cx).value().to_string();
         let cursor = d.cursor_offset(cx).min(src.len());
@@ -158,8 +163,9 @@ impl Siesta {
             Some(st) => {
                 let end = st.range.end;
                 let rest = &src[end..];
-                let semi = rest.trim_start_matches([' ', '\t']).starts_with(';');
-                let after = if semi { end + rest.find(';').unwrap_or(0) + 1 } else { end };
+                let has_semi = rest.trim_start_matches([' ', '\t']).starts_with(';');
+                let after = if has_semi { end + rest.find(';').unwrap_or(0) + 1 } else { end };
+                let semi = es || has_semi;
                 let line_end = after + src[after..].find('\n').unwrap_or(src.len() - after);
                 let mut edits = vec![];
                 if !semi {

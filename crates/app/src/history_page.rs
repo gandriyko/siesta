@@ -38,8 +38,14 @@ struct SqlTip {
 
 impl SqlTip {
     fn new(sql: &str, cx: &App) -> Self {
-        let text = sqlformat::format(sql.trim(), &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default());
-        let mut hl = gpui_component::highlighter::SyntaxHighlighter::new("sql");
+        // An Elasticsearch request: its line, then the body as pretty JSON (highlighted as JSON).
+        let es = sql_split::es_request(sql.trim()).map(|r| match serde_json::from_str::<serde_json::Value>(&r.body) {
+            Ok(v) => format!("{} {}\n{}", r.method, r.path, serde_json::to_string_pretty(&v).unwrap_or(r.body)),
+            Err(_) => sql.trim().to_string(),
+        });
+        let lang = if es.is_some() { "json" } else { "sql" };
+        let text = es.unwrap_or_else(|| sqlformat::format(sql.trim(), &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default()));
+        let mut hl = gpui_component::highlighter::SyntaxHighlighter::new(lang);
         hl.update(None, &gpui_component::input::Rope::from(text.as_str()), None);
         let runs = hl.styles(&(0..text.len()), &*cx.theme().highlight_theme);
         Self { text: text.into(), runs }

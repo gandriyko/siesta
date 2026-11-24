@@ -552,13 +552,17 @@ impl Siesta {
                 let st = &self.settings.settings;
                 let (line_numbers, soft_wrap) = (st.editor.line_numbers, st.editor.soft_wrap);
                 let sql = siesta_workspace::is_sql(&path);
+                let es = siesta_workspace::is_es(&path);
                 let editor = cx.new(|cx| {
                     let mut s = EditorState::new(window, cx);
                     if sql {
-                        s = s.language("sql");
+                        s = s.language(if es { "json" } else { "sql" });
                     }
                     s = s.searchable(true).line_number(line_numbers).soft_wrap(soft_wrap).default_value(text);
-                    if sql {
+                    if es {
+                        s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::EsHighlighter::default()) as _)), cx);
+                        s.set_gutter_decorations_width(px(3.), cx);
+                    } else if sql {
                         s.set_highlighter_factory(Rc::new(|_: &str| Some(Box::new(highlight::SqlHighlighter::default()) as _)), cx);
                         s.set_gutter_decorations_width(px(3.), cx);
                     }
@@ -955,7 +959,8 @@ impl Siesta {
     /// Top-right database picker, next to the connection picker: the databases the credentials can
     /// access, read from the server in the background when the picker opens (and kept until Refresh).
     fn database_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let d = self.doc().filter(|d| d.sql)?;
+        // An Elasticsearch cluster has no databases.
+        let d = self.doc().filter(|d| d.sql && d.dialect != sql_split::Dialect::Elastic)?;
         let label = d.shown_database().unwrap_or_else(|| "(default)".into());
         let build = self.db_menu_builder(cx.entity().downgrade())?;
         let view = cx.entity().downgrade();
@@ -2003,6 +2008,36 @@ mod tests {
         assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().path.as_ref().clone()), a);
         assert_eq!(cursor_line(&app, &mut cx), 5);
         assert_eq!(cx.update(|_, cx| app.read(cx).doc().unwrap().active_statement().map(|s| s.line)), Some(6));
+    }
+
+    #[gpui::test]
+    fn es_files_split_as_requests_and_take_only_elasticsearch_connections(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        std::fs::write(ws.path().join("connections/es.json"), r#"{"driver": "elasticsearch", "url": "http://127.0.0.1:1"}"#).unwrap();
+        let q = ws.path().join("collections/q.es");
+        std::fs::write(&q, "GET /logs/_search\n{\"query\": {\"match_all\": {}}}\n").unwrap();
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(q.clone()));
+        let state = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let this = app.read(cx);
+                let d = this.doc().unwrap();
+                (d.dialect, d.file.statements.iter().map(|s| s.kind).collect::<Vec<_>>(), d.connection_mismatch(), this.connection_of(&q).err(), d.editor.read(cx).value().to_string())
+            })
+        };
+        let (dialect, kinds, ..) = state(&mut cx);
+        assert_eq!((dialect, kinds), (sql_split::Dialect::Elastic, vec![sql_split::Kind::Query]));
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("es".into()), window, cx)));
+        let (dialect, _, mismatch, err, text) = state(&mut cx);
+        assert_eq!((dialect, mismatch, err), (sql_split::Dialect::Elastic, None, None));
+        assert!(text.starts_with("# @connection es\nGET /logs/_search"), "{text}");
+        // A SQL connection on an `.es` file: the dialect stays, running is refused.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.select_connection(Some("dev".into()), window, cx)));
+        let (dialect, _, mismatch, err, _) = state(&mut cx);
+        assert_eq!((dialect, mismatch), (sql_split::Dialect::Elastic, Some(".es files run on Elasticsearch connections")));
+        assert!(err.unwrap().contains("can't run this file"));
+        // The DB tab inserts a search, without `;`.
+        cx.update(|window, cx| app.update(cx, |this, cx| assert!(this.insert_select("indices", "logs", window, cx))));
+        assert!(state(&mut cx).4.ends_with("{\"query\": {\"match_all\": {}}}\n\nGET /logs/_search\n"), "{:?}", state(&mut cx).4);
     }
 
     #[gpui::test]

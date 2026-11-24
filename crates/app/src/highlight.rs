@@ -54,6 +54,91 @@ impl InputHighlighter for SqlHighlighter {
     }
 }
 
+/// `.es` highlighting: JSON bodies by tree-sitter `json` (run over the text with request and
+/// comment lines blanked, so offsets stay), the request line's method and path, `#` / `//`
+/// comments and `# @directives` on top.
+pub struct EsHighlighter {
+    inner: SyntaxHighlighter,
+    /// Disjoint, sorted: (range, theme role).
+    spans: Vec<(Range<usize>, &'static str)>,
+}
+
+impl Default for EsHighlighter {
+    fn default() -> Self {
+        Self { inner: SyntaxHighlighter::new("json"), spans: vec![] }
+    }
+}
+
+impl InputHighlighter for EsHighlighter {
+    fn language(&self) -> SharedString {
+        "json".into()
+    }
+
+    fn update(&mut self, _: Option<InputEdit>, text: &Rope, _: bool, _: &mut Window, _: &mut Context<EditorState>) {
+        let (masked, spans) = es_spans(&text.to_string());
+        self.inner.update(None, &Rope::from(masked.as_str()), None);
+        self.spans = spans;
+    }
+
+    fn update_batch(&mut self, edits: &[(InputEdit, Rope)], folding: bool, window: &mut Window, cx: &mut Context<EditorState>) {
+        if let Some((edit, text)) = edits.last() {
+            self.update(Some(*edit), text, folding, window, cx);
+        }
+    }
+
+    fn styles(&self, range: &Range<usize>, resolver: &dyn HighlightStyleResolver) -> Vec<(Range<usize>, HighlightStyle)> {
+        let mut out = self.inner.styles(range, resolver);
+        for role in ["keyword", "string", "comment", "attribute"] {
+            let spans: Vec<Range<usize>> = self.spans.iter().filter(|(_, r)| *r == role).map(|(s, _)| s.clone()).collect();
+            if let Some(style) = resolver.style(role) {
+                out = overlay(out, &spans, style);
+            }
+        }
+        out
+    }
+
+    fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
+        vec![]
+    }
+}
+
+/// The text with request and comment lines turned into spaces (same byte offsets), and the spans
+/// to paint over the JSON highlighting.
+fn es_spans(src: &str) -> (String, Vec<(Range<usize>, &'static str)>) {
+    const METHODS: [&str; 6] = ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"];
+    let mut masked = String::with_capacity(src.len());
+    let mut spans = vec![];
+    let mut off = 0;
+    for raw in src.split_inclusive('\n') {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        let start = off + indent;
+        let mut blank = true;
+        if t.starts_with('#') || t.starts_with("//") {
+            let directive = t.trim_start_matches(['#', '/']).trim_start().starts_with('@');
+            spans.push((start..off + line.len(), if directive { "attribute" } else { "comment" }));
+        } else if let Some(m) = t.split_whitespace().next().filter(|w| METHODS.iter().any(|x| w.eq_ignore_ascii_case(x))) {
+            spans.push((start..start + m.len(), "keyword"));
+            let path = t[m.len()..].trim_start();
+            if !path.is_empty() {
+                let at = off + line.len() - line.trim_start().len() + (t.len() - path.len());
+                spans.push((at..at + path.trim_end().len(), "string"));
+            }
+        } else {
+            blank = false;
+        }
+        if blank {
+            masked.extend(line.chars().map(|c| if c.is_ascii() { ' ' } else { c }));
+            masked.push_str(&raw[line.len()..]);
+        } else {
+            masked.push_str(raw);
+        }
+        off += raw.len();
+    }
+    (masked, spans)
+}
+
 /// Byte ranges of the lines that are `-- @…` comments (indentation excluded).
 fn directive_spans(src: &str) -> Vec<Range<usize>> {
     let mut out = vec![];
@@ -100,6 +185,16 @@ mod tests {
         let spans = directive_spans(src);
         let text: Vec<&str> = spans.iter().map(|r| &src[r.clone()]).collect();
         assert_eq!(text, ["-- @name users", "--@confirm"]);
+    }
+
+    #[test]
+    fn es_lines_are_found_and_masked() {
+        let src = "# @connection es\n// note\n  get /a/_search?q=1 \n{\"a\": 1}\r\n";
+        let (masked, spans) = es_spans(src);
+        assert_eq!(masked.len(), src.len());
+        assert!(masked.ends_with("\n{\"a\": 1}\r\n") && masked[..src.find('{').unwrap()].trim().is_empty(), "{masked:?}");
+        let got: Vec<(&str, &str)> = spans.iter().map(|(r, role)| (&src[r.clone()], *role)).collect();
+        assert_eq!(got, [("# @connection es", "attribute"), ("// note", "comment"), ("get", "keyword"), ("/a/_search?q=1", "string")]);
     }
 
     #[test]

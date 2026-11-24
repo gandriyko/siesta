@@ -2,7 +2,7 @@
 
 # <img src="crates/app/assets/icon.svg" width="48" align="absmiddle" alt="Siesta icon"> Siesta
 
-**A fast, text-first SQL client for Postgres and MySQL / MariaDB. Queries are plain `.sql` files.**
+**A fast, text-first SQL client for Postgres and MySQL / MariaDB, and Elasticsearch. Queries are plain `.sql` and `.es` files.**
 
 Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No project files, no cloud, no lock-in.
 
@@ -10,6 +10,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 [![GPUI](https://img.shields.io/badge/UI-GPUI-blue)](https://www.gpui.rs)
 [![Postgres](https://img.shields.io/badge/Postgres-supported-336791?logo=postgresql&logoColor=white)](#connections)
 [![MySQL / MariaDB](https://img.shields.io/badge/MySQL_%2F_MariaDB-supported-00758F?logo=mysql&logoColor=white)](#connections)
+[![Elasticsearch](https://img.shields.io/badge/Elasticsearch-supported-005571?logo=elasticsearch&logoColor=white)](#elasticsearch)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](Cargo.toml)
 
@@ -33,7 +34,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 |---|---|
 | **Editor** | SQL highlighting, completion of tables and columns from the live schema, the statement under the cursor highlighted and run with <kbd>⌘</kbd> <kbd>Enter</kbd>, server errors underlined at their position |
 | **Results** | Server-side paging, sorting and column filters on any query; Count all; JSON / JSONB shown as JSON, with a formatted, highlighted preview on hover; a value dialog with search and a JSONPath filter; copy as TSV, JSON or `INSERT` |
-| **Connections** | Postgres and MySQL / MariaDB, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
+| **Connections** | Postgres, MySQL / MariaDB and Elasticsearch, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
 | **Safety** | Production connections get a red banner and confirm every non-read statement; read-only connections refuse writes in Siesta and in the server session; open transactions are asked about before a file or the app closes |
 | **Schema** | DB tab: schemas, tables, columns and indexes; insert a `SELECT` for a table or show its DDL |
 | **History** | Every run is stored per project (statement, connection, time, duration, rows or error; never the data), whether it came from the app, the CLI (`cli`) or an agent through MCP (`mcp`). A filterable list (<kbd>⌘</kbd> <kbd>Y</kbd>) to insert or rerun any entry. A CLI or MCP statement still executing shows at the top with a spinner (`running`), and the open page follows new runs live |
@@ -116,6 +117,29 @@ Each connection is one JSON file in `~/.config/siesta/connections/`, named after
 - **`"prod": true`.** A red banner, and every statement that is not a plain read (DML, DDL, `SET`, …) asks for confirmation. `SELECT`, `SHOW` and `EXPLAIN` run freely.
 - **`"read_only": true`.** Writes are refused before they reach the server, and the session itself is read-only. This is a safety default, not a security boundary.
 - **Environment values.** `${env:SHOP_DB_HOST}` is read from the environment, which is handy in CI.
+
+### Elasticsearch
+
+An `.es` file holds requests in the Kibana Dev Tools console format, so it pastes into Kibana unchanged. Comments and directives start with `#`.
+
+```
+# @connection es-dev
+
+# @name adults
+GET /users/_search
+{ "query": { "range": { "age": { "gte": 18 } } } }
+```
+
+```jsonc
+// ~/.config/siesta/connections/es-dev.json
+{ "driver": "elasticsearch", "url": "https://es.internal:9200", "user": "elastic" }
+```
+
+- **Results are tables.** Search hits become rows (`_id`, then the `_source` fields), `_sql` and `_cat` answers become tables, and any other answer is one JSON cell.
+- **Paging, sorting and filters.** A `_search` without its own `size` / `from` pages on the server; the column sort and filters go into the request.
+- **Credentials.** `user` with a password is basic auth; a password without `user` is an API key.
+- **Safety.** `prod` and `read_only` work as for SQL. `read_only` is checked only in Siesta: Elasticsearch has no read-only session.
+- **Schema.** The DB tab lists indices with their mapping fields; a double click inserts `GET /index/_search`.
 
 ### Passwords
 
@@ -209,7 +233,7 @@ crates/
 
 ```sh
 cargo test --workspace          # unit and GUI tests
-scripts/test-db.sh              # integration tests on Postgres and MariaDB in Docker (--down stops them)
+scripts/test-db.sh              # integration tests on Postgres, MariaDB and Elasticsearch in Docker (--down stops them)
 ```
 
 The principles and decisions behind the design are in [the specification](SPEC.md). Siesta is a sibling of [Respite](https://github.com/gandriyko/respite), a text-first REST client built the same way.
