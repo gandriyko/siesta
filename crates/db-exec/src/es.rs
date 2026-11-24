@@ -139,7 +139,10 @@ impl Es {
         // The safety checks classified the written text; refuse if the URL the client really sends
         // is another kind of request (any path trick the normalization missed).
         let url = reqwest::Url::parse(&format!("{}{path}", self.base)).map_err(|e| DbError::msg(format!("invalid path {path}: {e}")))?;
-        if sql_split::es_kind(&r.method, url.path()) != kind {
+        // The prod rule judged the written path's shape (`<index>/_update/<id>`): the sent one must
+        // have the same segments, else the client changed it in a way the checks did not see.
+        let written = path.split(['?', '#']).next().unwrap_or("");
+        if sql_split::es_kind(&r.method, url.path()) != kind || written.matches('/').count() != url.path().matches('/').count() {
             return Err(DbError { message: format!("Refused: {} {path} is sent as {}, another kind of request than it reads as", r.method, url.path()), refused: true, ..Default::default() });
         }
         let paged = if kind == Kind::Query { paged_body(&r.body, page) } else { None };
@@ -171,6 +174,10 @@ impl Es {
     /// `_count` with the same query and filters as the `_search` in `text`.
     pub(crate) async fn count(&self, text: &str, filters: &[(String, String)]) -> Result<u64, DbError> {
         let r = sql_split::es_request(text).ok_or_else(|| DbError::msg("Not a request"))?;
+        // It POSTs `<path>_count` unchecked: only a `[<target>/]_search` makes that a read.
+        if sql_split::es_kind(&r.method, &r.path) != Kind::Query {
+            return Err(DbError { message: format!("Cannot count: {} {} is not a search", r.method, r.path), refused: true, ..Default::default() });
+        }
         let (path, query) = r.path.split_once('?').map_or((r.path.as_str(), ""), |(p, q)| (p, q));
         let path = format!("{}_count{}", path.strip_suffix("_search").unwrap_or(path), if query.is_empty() { String::new() } else { format!("?{query}") });
         let body: Map<String, J> = serde_json::from_str(if r.body.is_empty() { "{}" } else { &r.body }).map_err(|e| DbError::msg(format!("Cannot count: the body is not a JSON object ({e})")))?;

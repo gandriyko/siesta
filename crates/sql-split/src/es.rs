@@ -36,6 +36,9 @@ pub fn request(text: &str) -> Option<Request> {
 /// segments (also `%2e`) are resolved. Classification must see this path, not the written one:
 /// `POST /_search/../i/_delete_by_query` reaches `/i/_delete_by_query`.
 pub fn normalize_path(path: &str) -> String {
+    // The URL parser drops tab / CR / LF anywhere: `/_bulk/_update/.<TAB>.` is sent as `/_bulk/`.
+    let path: String = path.chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect();
+    let path = path.as_str();
     let at = path.find(['?', '#']).unwrap_or(path.len());
     let (p, suffix) = path.split_at(at);
     let p = p.replace('\\', "/");
@@ -77,8 +80,9 @@ fn segments(path: &str) -> Vec<&str> {
 
 pub(crate) fn classify(method: &str, path: &str) -> Kind {
     let lower = path.to_ascii_lowercase();
-    // An encoded `/` or `\` could split differently on the server: never a read.
-    if lower.contains("%2f") || lower.contains("%5c") {
+    // An encoded `/` or `\` could split differently on the server, and the router decodes `%5F`
+    // into the `_` of an API name (`/%5Fscripts/…` is `/_scripts/…` there): never a read.
+    if lower.contains("%2f") || lower.contains("%5c") || lower.contains("%5f") {
         return Kind::Other;
     }
     let path = normalize_path(path);
@@ -338,6 +342,7 @@ mod tests {
             ("POST /_count/./../../i/_bulk?x=_search", "/i/_bulk?x=_search"),
             ("POST /_search\\..\\i\\_update_by_query", "/i/_update_by_query"),
             ("POST /i/_update/1/../../../j/_delete_by_query", "/j/_delete_by_query"),
+            ("POST /_bulk/_update/.\t.", "/_bulk"),
         ] {
             assert_eq!(request(req).unwrap().path, sent, "{req}");
             assert_eq!(split(req).statements[0].kind, Kind::Other, "{req}");
@@ -360,6 +365,7 @@ mod tests {
         }
         // An encoded slash is never a read.
         assert_eq!(classify("POST", "/_search%2F..%2Fi%2F_delete_by_query"), Kind::Other);
+        assert_eq!(classify("POST", "/%5Fscripts/_search/template"), Kind::Other);
         // Ordinary paths are untouched.
         assert_eq!(normalize_path("/a,b/_search?q=x/../y"), "/a,b/_search?q=x/../y");
         assert_eq!(normalize_path("_cat/indices"), "/_cat/indices");
