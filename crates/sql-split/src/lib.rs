@@ -1,9 +1,13 @@
-//! Splits a `.sql` file into statements with positions (Postgres / MySQL dialects).
+//! Splits a query file into statements with positions: `.sql` (Postgres / MySQL dialects) and
+//! Elasticsearch `.es` files (requests, see [`es`]).
 //!
 //! Splitting never fails: problems go to `diagnostics`. Offsets are byte offsets into the
 //! source, lines are 1-based.
 
 use std::ops::Range;
+
+mod es;
+pub use es::{Request as EsRequest, request as es_request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dialect {
@@ -11,6 +15,15 @@ pub enum Dialect {
     Postgres,
     /// MySQL and MariaDB.
     MySql,
+    /// Elasticsearch requests in Kibana console format (`.es` files).
+    Elastic,
+}
+
+impl Dialect {
+    /// What starts a directive comment: `--` in SQL, `#` in `.es` files.
+    pub fn comment(self) -> &'static str {
+        if self == Dialect::Elastic { "#" } else { "--" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +130,7 @@ pub fn set_connection(src: &str, dialect: Dialect, name: Option<&str>) -> String
     let src = rewrite_database(src, dialect, None).unwrap_or_else(|| src.to_string());
     match (rewrite_connection(&src, dialect, name), name) {
         (Some(s), _) => s,
-        (None, Some(n)) => format!("-- @connection {n}\n{src}"),
+        (None, Some(n)) => format!("{} @connection {n}\n{src}", dialect.comment()),
         (None, None) => src,
     }
 }
@@ -135,7 +148,7 @@ pub fn set_database(src: &str, dialect: Dialect, name: Option<&str>) -> String {
             // After the line holding `-- @connection`, so the two read together.
             let at = file.connection_at.map_or(0, |r| src[r.end..].find('\n').map_or(src.len(), |i| r.end + i + 1));
             let nl = if at == src.len() && !src.is_empty() && !src.ends_with('\n') { "\n" } else { "" };
-            format!("{}{nl}-- @database {n}\n{}", &src[..at], &src[at..])
+            format!("{}{nl}{} @database {n}\n{}", &src[..at], dialect.comment(), &src[at..])
         }
         (None, None) => src.to_string(),
     }
@@ -164,6 +177,9 @@ fn rewrite_directive_at(src: &str, at: Range<usize>, word: &str, name: Option<&s
 }
 
 pub fn split(src: &str, dialect: Dialect) -> SqlFile {
+    if dialect == Dialect::Elastic {
+        return es::split(src);
+    }
     split_words(src, dialect, false).0
 }
 
@@ -404,28 +420,34 @@ impl<'a> Splitter<'a> {
         let Some(rest) = self.src[comment.start + 2..comment.end].trim().strip_prefix('@') else {
             return;
         };
-        let (word, value) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(w, v)| (w, v.trim()));
-        let warn = |s: &mut Self, msg: String| s.diag(comment.clone(), Severity::Warning, msg);
-        match (word, value) {
-            ("connection" | "database" | "name", "") => warn(self, format!("`@{word}` needs a value")),
-            ("database", _) if self.out.statements.is_empty() => {
-                self.out.database = Some(value.into());
-                self.out.database_at = Some(comment);
-            }
-            ("database", _) => warn(self, "`@database` applies only at the top of the file".into()),
-            ("connection", _) if self.out.statements.is_empty() => {
-                self.out.connection = Some(value.into());
-                self.out.connection_at = Some(comment);
-            }
-            ("connection", _) => warn(self, "`@connection` applies only at the top of the file".into()),
-            ("name", _) => self.pending.name = Some(value.into()),
-            ("page-size", _) => match value.parse() {
-                Ok(n) if n > 0 => self.pending.page_size = Some(n),
-                _ => warn(self, "`@page-size` needs a positive number".into()),
-            },
-            ("confirm", _) => self.pending.confirm = true,
-            _ => warn(self, format!("Unknown directive `@{word}`")),
+        let top = self.out.statements.is_empty();
+        directive_word(&mut self.out, &mut self.pending, rest, comment, top);
+    }
+}
+
+/// A directive `rest` (after `@`) in the comment at `comment`; `top`: no statement before it.
+fn directive_word(out: &mut SqlFile, pending: &mut Pending, rest: &str, comment: Range<usize>, top: bool) {
+    let (word, value) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(w, v)| (w, v.trim()));
+    let mut warn = |msg: String| out.diagnostics.push(Diagnostic { range: comment.clone(), severity: Severity::Warning, message: msg });
+    match (word, value) {
+        ("connection" | "database" | "name", "") => warn(format!("`@{word}` needs a value")),
+        ("database", _) if top => {
+            out.database = Some(value.into());
+            out.database_at = Some(comment);
         }
+        ("database", _) => warn("`@database` applies only at the top of the file".into()),
+        ("connection", _) if top => {
+            out.connection = Some(value.into());
+            out.connection_at = Some(comment);
+        }
+        ("connection", _) => warn("`@connection` applies only at the top of the file".into()),
+        ("name", _) => pending.name = Some(value.into()),
+        ("page-size", _) => match value.parse() {
+            Ok(n) if n > 0 => pending.page_size = Some(n),
+            _ => warn("`@page-size` needs a positive number".into()),
+        },
+        ("confirm", _) => pending.confirm = true,
+        _ => warn(format!("Unknown directive `@{word}`")),
     }
 }
 
@@ -484,6 +506,9 @@ pub fn is_destructive(text: &str, dialect: Dialect) -> bool {
 
 /// Why [`is_destructive`] says yes (`"DROP"`, `"UPDATE without WHERE"`, …).
 pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> {
+    if dialect == Dialect::Elastic {
+        return es::requests(text).iter().find_map(es::reason);
+    }
     // The splitter's own lexer (strings, comments, dollar quotes), so both agree on what is a word.
     split_words(text, dialect, true).1.iter().find_map(|w| reason(w))
 }
@@ -492,6 +517,9 @@ pub fn destructive_reason(text: &str, dialect: Dialect) -> Option<&'static str> 
 /// `TRUNCATE`, `COMMENT ON`), so a cached schema is stale after it ran. Same top-level-token
 /// approach as [`is_destructive`]; `EXPLAIN` without `ANALYZE` does not run its statement.
 pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
+    if dialect == Dialect::Elastic {
+        return es::requests(text).iter().any(es::schema_changing);
+    }
     fn changes(words: &[(u32, &str)]) -> bool {
         let Some(&(_, first)) = words.first() else { return false };
         if let Some((inner, runs)) = explain_inner(words) {
@@ -510,6 +538,9 @@ pub fn is_schema_changing(text: &str, dialect: Dialect) -> bool {
 /// the server's read-only session stops it.
 // ponytail: token check, not a parser; a CTE column named `delete` is a false refusal.
 pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
+    if dialect == Dialect::Elastic {
+        return es::requests(text).iter().find_map(es::read_only_violation);
+    }
     split_words(text, dialect, true).1.iter().find_map(|w| {
         let &(_, first) = w.first()?;
         if classify(w) != Kind::Other {
@@ -538,6 +569,9 @@ pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
 /// ALTER, `WITH … UPDATE`, session statements and everything else are refused.
 // ponytail: token check like `read_only_violation`; `WHERE 1=1` passes, a parser couldn't stop that either.
 pub fn prod_agent_violation(text: &str, dialect: Dialect) -> Option<String> {
+    if dialect == Dialect::Elastic {
+        return es::requests(text).iter().find_map(es::prod_agent_violation);
+    }
     split_words(text, dialect, true).1.iter().find_map(|w| {
         let &(_, first) = w.first()?;
         if classify(w) != Kind::Other {
@@ -564,6 +598,9 @@ pub struct TopLevel {
 }
 
 pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
+    if dialect == Dialect::Elastic {
+        return TopLevel::default();
+    }
     let (_, all) = split_words(text, dialect, true);
     let top: Vec<&str> = all.first().map(|w| w.iter().filter(|(d, _)| *d == 0).map(|(_, w)| *w).collect()).unwrap_or_default();
     TopLevel {
@@ -578,6 +615,9 @@ pub fn top_level(text: &str, dialect: Dialect) -> TopLevel {
 /// (and `DISTINCT` / `ALL`) up to the top-level clause that ends it (`FROM`, `WHERE`, …) or the
 /// end, without surrounding whitespace (empty when the list is). `None` for any other statement.
 pub fn select_list(text: &str, dialect: Dialect) -> Option<Range<usize>> {
+    if dialect == Dialect::Elastic {
+        return None;
+    }
     let (_, all) = split_words(text, dialect, true);
     // Words are slices of `text`: their offsets come from the pointers.
     let off = |w: &str| w.as_ptr() as usize - text.as_ptr() as usize;
