@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -145,6 +146,18 @@ fn call(name: &str, args: &Value, on_spawn: &dyn Fn(u32)) -> Result<Value, (i64,
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0}))
 }
 
+/// The agent may name only query files (`.sql` / `.es`), also behind a symlink: the tools print
+/// statement text, so any other path would read an arbitrary file (`~/.ssh/…`, `.env`).
+fn query_file(p: &str) -> Result<(), String> {
+    let path = Path::new(p);
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if siesta_workspace::is_sql(path) && siesta_workspace::is_sql(&target) {
+        Ok(())
+    } else {
+        Err(format!("'{p}' is not a .sql or .es file"))
+    }
+}
+
 /// CLI arguments for a tool call, plus stdin for the child.
 fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> {
     let str_of = |k: &str| a.get(k).and_then(Value::as_str).map(String::from);
@@ -168,7 +181,12 @@ fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> 
         }
         "list_statements" => {
             v.push("list".into());
-            v.extend(str_of("path"));
+            if let Some(p) = str_of("path") {
+                if !Path::new(&p).is_dir() {
+                    query_file(&p)?;
+                }
+                v.push(p);
+            }
             v.extend(json);
         }
         "schema" => {
@@ -188,6 +206,7 @@ fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> 
                     v.extend(["exec".into(), "-".into()]);
                 }
                 (None, Some(file)) => {
+                    query_file(&file)?;
                     v.extend(["run".into(), file]);
                     let sts = a.get("statements").and_then(Value::as_array);
                     v.extend(sts.into_iter().flatten().filter_map(|s| s.as_str().map(String::from)));
@@ -258,5 +277,21 @@ mod tests {
         assert!(argv("run_sql", &json!({})).is_err());
         assert!(argv("run_sql", &json!({"sql": "x", "file": "a.sql"})).is_err());
         assert_eq!(argv("schema", &json!({"table": "t", "ddl": true})).unwrap().0.join(" "), "schema t --ddl --output json");
+    }
+
+    #[test]
+    fn only_query_files_can_be_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
+        std::fs::write(p("secret.env"), "TOKEN=x").unwrap();
+        std::fs::write(p("q.es"), "GET /").unwrap();
+        std::os::unix::fs::symlink(p("secret.env"), p("trap.sql")).unwrap();
+        assert!(argv("run_sql", &json!({"file": p("q.es")})).is_ok());
+        assert!(argv("list_statements", &json!({"path": p("q.es")})).is_ok());
+        assert!(argv("list_statements", &json!({"path": dir.path()})).is_ok());
+        for bad in [p("secret.env"), p("trap.sql"), "/etc/hosts".into()] {
+            assert!(argv("run_sql", &json!({"file": bad})).unwrap_err().contains("not a .sql or .es file"), "{bad}");
+            assert!(argv("list_statements", &json!({"path": bad})).is_err(), "{bad}");
+        }
     }
 }
