@@ -397,7 +397,8 @@ impl Siesta {
     }
 
     /// Open files changed on disk: an unedited tab takes the new text (as an undoable edit), an
-    /// edited one keeps the user's text and says so. A changed connection file reloads connections.
+    /// edited one keeps the user's text, says so, and makes the next save ask first. A changed
+    /// connection file reloads connections.
     fn check_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for ix in 0..self.docs.len() {
             let d = &mut self.docs[ix];
@@ -406,25 +407,21 @@ impl Siesta {
                 continue;
             }
             d.mtime = now;
-            if d.dirty {
-                window.push_notification(format!("{} changed on disk; your unsaved edits are kept (saving overwrites it)", d.name()), cx);
+            let Ok(disk) = std::fs::read_to_string(&*d.path) else { continue };
+            let editing = d.editor.read(cx).value().to_string();
+            if disk == editing {
+                // The disk caught up with the tab (saved elsewhere, or the same text written).
+                (d.saved, d.dirty, d.conflict) = (doc::text_hash(&disk), false, false);
                 continue;
             }
-            let Ok(disk) = std::fs::read_to_string(&*d.path) else { continue };
-            let editor = d.editor.clone();
-            editor.update(cx, |s, cx| {
-                let old = s.value().to_string();
-                if old == disk {
-                    return;
+            if d.dirty {
+                if !d.conflict {
+                    d.conflict = true;
+                    window.push_notification(format!("{} changed on disk; your unsaved edits are kept. Saving asks whether to overwrite it.", d.name()), cx);
                 }
-                let (range, text) = doc::changed(&old, &disk);
-                let rope = s.text();
-                let range = lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end));
-                s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text }], window, cx);
-            });
-            // The edit marks it dirty; it matches the disk.
-            self.docs[ix].dirty = false;
-            self.outlines.remove(&*self.docs[ix].path.clone());
+                continue;
+            }
+            self.load_from_disk(ix, disk, window, cx);
         }
         let conns = self.conns_stamp();
         if self.conns_seen.as_ref().is_some_and(|seen| *seen != conns) {
@@ -576,7 +573,7 @@ impl Siesta {
                         }
                         let d = &mut this.docs[ix];
                         let before = (d.connection().map(str::to_string), d.database().map(str::to_string));
-                        d.dirty = true;
+                        d.refresh_dirty(cx);
                         d.reparse(cx);
                         // Another `-- @connection` / `-- @database` (typed or written by a picker):
                         // the schema of that one loads.
@@ -654,9 +651,55 @@ impl Siesta {
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.current {
+        let Some(ix) = self.current else { return };
+        if !self.docs[ix].conflict {
             self.save_doc(ix, window, cx);
+            return;
         }
+        // The file changed on disk under unsaved edits: never overwrite it silently.
+        let message = format!("{} changed on disk since it was opened", self.docs[ix].name());
+        let detail = "Overwrite it with your edits, or reload it from disk and lose your edits.";
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Overwrite", "Reload from Disk", "Cancel"], cx);
+        let path = self.docs[ix].path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = answer.await else { return };
+            this.update_in(cx, |this, window, cx| {
+                // The tab may have moved or closed while the dialog was open.
+                let Some(ix) = this.docs.iter().position(|d| d.path == path) else { return };
+                match answer {
+                    0 => {
+                        this.save_doc(ix, window, cx);
+                    }
+                    1 => match std::fs::read_to_string(&*path) {
+                        Ok(disk) => this.load_from_disk(ix, disk, window, cx),
+                        Err(e) => window.push_notification(format!("{}: {e}", path.display()), cx),
+                    },
+                    _ => {}
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Tab `ix` takes `disk` as its text (one undoable edit) and is clean.
+    fn load_from_disk(&mut self, ix: usize, disk: String, window: &mut Window, cx: &mut Context<Self>) {
+        let d = &mut self.docs[ix];
+        // Set before the edit: its change event compares against it and leaves the tab clean.
+        (d.saved, d.conflict, d.mtime) = (doc::text_hash(&disk), false, doc::mtime(&d.path));
+        d.editor.clone().update(cx, |s, cx| {
+            let old = s.value().to_string();
+            if old == disk {
+                return;
+            }
+            let (range, text) = doc::changed(&old, &disk);
+            let rope = s.text();
+            let range = lsp_types::Range::new(rope.offset_to_position(range.start), rope.offset_to_position(range.end));
+            s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text }], window, cx);
+        });
+        self.docs[ix].refresh_dirty(cx);
+        self.outlines.remove(&*self.docs[ix].path.clone());
+        cx.notify();
     }
 
     /// Ask before quitting with unsaved files: save them all, discard them, or stay.
@@ -698,7 +741,7 @@ impl Siesta {
         let saved = std::fs::write(&*d.path, text.as_bytes());
         match saved {
             Ok(()) => {
-                d.dirty = false;
+                (d.dirty, d.conflict, d.saved) = (false, false, doc::text_hash(&text));
                 d.mtime = doc::mtime(&d.path);
                 let path = (*d.path).clone();
                 self.outlines.remove(&path);
@@ -2383,6 +2426,61 @@ mod tests {
         assert!(std::fs::read_to_string(&a).unwrap().starts_with("SELECT 1;"));
         assert_eq!(open_names(&app, &mut cx), ["a.sql"]);
         assert_eq!(cx.update(|_, cx| app.read(cx).docs[0].path.as_path().to_path_buf()), a);
+    }
+
+    #[gpui::test]
+    fn disk_changes_reload_clean_tabs_every_time_and_mark_edited_ones(tcx: &mut TestAppContext) {
+        let (ws, base) = (workspace(), tempfile::tempdir().unwrap());
+        let a = ws.path().join("collections/a.sql");
+        let (app, mut cx) = open_app(tcx, ws.path(), base.path(), Some(a.clone()));
+        // A write on disk; `mtime = None` stands for "the poll saw a new mtime".
+        let disk = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(&a, text).unwrap();
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.docs[0].mtime = None;
+                    this.check_files(window, cx);
+                })
+            });
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut VisualTestContext| cx.update(|_, cx| {
+            let d = &app.read(cx).docs[0];
+            (d.editor.read(cx).value().to_string(), d.dirty, d.conflict)
+        });
+        // Twice: the reload's own edit event must not leave the tab dirty (it used to, and the second change was missed).
+        disk(&mut cx, "SELECT 10;\n");
+        assert_eq!(state(&mut cx), ("SELECT 10;\n".into(), false, false));
+        disk(&mut cx, "SELECT 20;\n");
+        assert_eq!(state(&mut cx), ("SELECT 20;\n".into(), false, false));
+        // An edit as the user makes one (an edit event; `set_value` sends none), replacing the whole text.
+        let edit = |cx: &mut VisualTestContext, text: &str| {
+            cx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.docs[0].editor.update(cx, |s, cx| {
+                        use gpui_component::input::RopeExt as _;
+                        let rope = s.text();
+                        let range = lsp_types::Range::new(rope.offset_to_position(0), rope.offset_to_position(rope.len()));
+                        s.apply_lsp_edits(&vec![lsp_types::TextEdit { range, new_text: text.into() }], window, cx);
+                    })
+                })
+            });
+            cx.run_until_parked();
+        };
+        // An edit, then a change on disk: the edit stays, the tab is in conflict (saving asks).
+        edit(&mut cx, "SELECT 'mine';\n");
+        assert_eq!(state(&mut cx), ("SELECT 'mine';\n".into(), true, false));
+        disk(&mut cx, "SELECT 30;\n");
+        assert_eq!(state(&mut cx), ("SELECT 'mine';\n".into(), true, true));
+        // Reload from disk: the disk's text, clean, no conflict.
+        cx.update(|window, cx| app.update(cx, |this, cx| this.load_from_disk(0, "SELECT 30;\n".into(), window, cx)));
+        cx.run_until_parked();
+        assert_eq!(state(&mut cx), ("SELECT 30;\n".into(), false, false));
+        // Editing back to the saved text is clean again.
+        edit(&mut cx, "x");
+        assert!(state(&mut cx).1);
+        edit(&mut cx, "SELECT 30;\n");
+        assert!(!state(&mut cx).1);
     }
 
     #[gpui::test]

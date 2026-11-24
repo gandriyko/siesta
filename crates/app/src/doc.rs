@@ -29,8 +29,13 @@ pub struct Doc {
     /// 0-based first / last line of the active statement, for its background tint.
     stmt_lines: Option<(usize, usize)>,
     stmt_bar: GutterDecorationCollection,
-    /// Edited since load / last save.
+    /// The text differs from the one last read or written (`saved`).
     pub dirty: bool,
+    /// [`text_hash`] of the text last read from or written to disk: `dirty` compares against it, so
+    /// an edit back to that text (undo, a reload's own edit event) is clean again.
+    pub saved: u64,
+    /// The file changed on disk while the tab had unsaved edits: saving asks first.
+    pub conflict: bool,
     /// The file's mtime when it was last read or written: a newer one means it changed on disk.
     pub mtime: Option<std::time::SystemTime>,
     /// What the completion provider reads: connection, dialect, schema cache.
@@ -76,13 +81,21 @@ impl Doc {
             stmt_lines: None,
             stmt_bar,
             dirty: false,
+            saved: 0,
+            conflict: false,
             mtime: None,
             lang,
             _subs: subs,
         };
         doc.mtime = mtime(&doc.path);
+        doc.saved = text_hash(&doc.editor.read(cx).value());
         doc.reparse(cx);
         doc
+    }
+
+    /// After an edit: dirty unless the text is back to what the disk has.
+    pub fn refresh_dirty(&mut self, cx: &App) {
+        self.dirty = text_hash(&self.editor.read(cx).value()) != self.saved;
     }
 
     pub fn name(&self) -> String {
@@ -301,6 +314,14 @@ fn diagnostic(rope: &Rope, d: &sql_split::Diagnostic) -> lsp_types::Diagnostic {
         message: d.message.clone(),
         ..Default::default()
     }
+}
+
+/// A fingerprint of a file's text, to tell an edited tab from one that matches the disk.
+pub fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 pub fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
