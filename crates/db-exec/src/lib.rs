@@ -66,6 +66,9 @@ pub struct Outcome {
     pub params: Vec<String>,
     pub in_transaction: bool,
     pub duration: Duration,
+    /// Elasticsearch: the whole JSON response (hits wrapper, aggregations, shards), for the
+    /// result panel's Raw view. `None` for SQL.
+    pub raw: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -723,6 +726,7 @@ impl Session {
             executed_sql: exec_sql,
             params,
             in_transaction: self.in_transaction(),
+            raw: None,
             duration: started.elapsed(),
         })
     }

@@ -88,6 +88,15 @@ pub fn tsv<'a>(rows: impl IntoIterator<Item = &'a [Value]>) -> String {
     rows.into_iter().map(|r| r.iter().map(tsv_cell).collect::<Vec<_>>().join("\t")).collect::<Vec<_>>().join("\n")
 }
 
+/// The rows as a pretty JSON array of [`row_json`] objects (the result panel's JSON tab).
+pub fn rows_json(cols: &[Column], rows: &[Vec<Value>]) -> String {
+    if rows.is_empty() {
+        return "[]".into();
+    }
+    let items: Vec<String> = rows.iter().map(|r| format!("  {}", row_json(cols, r).replace('\n', "\n  "))).collect();
+    format!("[\n{}\n]", items.join(",\n"))
+}
+
 /// The row as a JSON object, columns in result order (a map would sort them).
 pub fn row_json(cols: &[Column], row: &[Value]) -> String {
     let fields: Vec<String> = cols
@@ -306,6 +315,10 @@ mod tests {
         let json = row_json(&cols, &rows[0]);
         assert_eq!(json, "{\n  \"id\": 1,\n  \"note\": \"it's\",\n  \"data\": {\n    \"k\": 1\n  }\n}");
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+        let all = rows_json(&cols, &rows[..1]);
+        assert_eq!(all, "[\n  {\n    \"id\": 1,\n    \"note\": \"it's\",\n    \"data\": {\n      \"k\": 1\n    }\n  }\n]");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&rows_json(&cols, &rows)).unwrap().as_array().unwrap().len(), rows.len());
+        assert_eq!(rows_json(&cols, &[]), "[]");
     }
 
     #[test]
@@ -360,6 +373,7 @@ mod tests {
             params: vec![],
             in_transaction: false,
             duration: Duration::ZERO,
+            raw: None,
         };
         assert_eq!(rows_label(&o), "3 rows affected");
         o.rows_affected = Some(1);

@@ -210,6 +210,7 @@ mod tests {
             params: vec![],
             in_transaction: false,
             duration: Duration::from_millis(38),
+            raw: None,
         }
     }
 

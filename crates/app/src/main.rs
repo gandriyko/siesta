@@ -1765,6 +1765,7 @@ mod tests {
                 params: vec![],
                 in_transaction: false,
                 duration: std::time::Duration::from_millis(5),
+                raw: None,
             }),
         }
     }

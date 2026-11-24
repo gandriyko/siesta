@@ -508,6 +508,8 @@ impl Siesta {
 
     fn execute(&mut self, path: PathBuf, name: String, conn: Connection, specs: Vec<Spec>, window: &mut Window, cx: &mut Context<Self>) {
         let default_size = self.settings.settings.results.page_size.max(1);
+        // The view last picked in this file; Elasticsearch documents open as JSON, SQL rows as a table.
+        let view = self.store.views.get(&path).copied().unwrap_or(if conn.driver == db_conn::Driver::Elastic { Tab::Json } else { Tab::Result });
         let (mut stmts, mut keys) = (vec![], vec![]);
         for s in &specs {
             let key: Key = (path.clone(), s.text.clone());
@@ -516,7 +518,7 @@ impl Siesta {
             e.page = Page { size: s.page_size.unwrap_or(default_size).max(1) as u64, ..Page::default() };
             e.count = None;
             e.running = Some(Instant::now());
-            e.tab = Tab::Result;
+            e.tab = view;
             stmts.push(Stmt { text: s.text.clone(), kind: s.kind, page: e.page.clone(), range: s.range.clone(), fresh: true });
             keys.push(key);
         }

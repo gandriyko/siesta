@@ -157,6 +157,7 @@ impl Es {
             executed_sql: if body.is_empty() { format!("{} {path}", r.method) } else { format!("{} {path}\n{body}", r.method) },
             params: Vec::new(),
             in_transaction: false,
+            raw: s.raw,
             duration: started.elapsed(),
         })
     }
@@ -277,6 +278,8 @@ pub(crate) struct Shaped {
     pub truncated: bool,
     pub affected: Option<u64>,
     pub notices: Vec<String>,
+    /// The response when it is JSON.
+    pub raw: Option<J>,
 }
 
 pub(crate) fn value(v: &J) -> Value {
@@ -389,6 +392,13 @@ pub(crate) fn shape(r: &EsRequest, status: u16, text: &str, page_size: Option<u6
     if let Some(n) = v["_shards"]["failed"].as_u64().filter(|n| *n > 0) {
         s.notices.push(format!("{n} shard(s) failed: the hits are partial."));
     }
+    let mut v = v;
+    // The extra hit only told whether another page exists: the Raw view shows the page.
+    // `pointer_mut`, not `v["hits"]`: indexing a non-object mutably panics (`_cat` arrays).
+    if let (Some(n), Some(hits)) = (page_size, v.pointer_mut("/hits/hits").and_then(J::as_array_mut)) {
+        hits.truncate(n as usize);
+    }
+    s.raw = Some(v);
     s
 }
 
@@ -491,6 +501,9 @@ mod tests {
         assert_eq!(s.rows[1], vec![Value::Text("2".into()), Value::Text("b".into()), Value::Text("bob".into()), Value::Null, Value::Json(json!(["x"]))]);
         assert!(s.has_more && !s.truncated);
         assert_eq!(s.notices, ["10000+ hits"]);
+        // Raw keeps the whole response, cut to the page.
+        let raw = s.raw.unwrap();
+        assert_eq!((raw["took"].clone(), raw["hits"]["hits"].as_array().unwrap().len()), (json!(1), 2));
         // Unpaged: the row cap, not a page.
         let s = shape(&req("GET /a/_search"), 200, resp, None, 2);
         assert!(s.truncated && !s.has_more);

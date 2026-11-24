@@ -33,7 +33,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 | | |
 |---|---|
 | **Editor** | SQL highlighting, completion of tables and columns from the live schema, the statement under the cursor highlighted and run with <kbd>⌘</kbd> <kbd>Enter</kbd>, server errors underlined at their position |
-| **Results** | Server-side paging, sorting and column filters on any query; Count all; JSON / JSONB shown as JSON, with a formatted, highlighted preview on hover; a value dialog with search and a JSONPath filter; copy as TSV, JSON or `INSERT` |
+| **Results** | Server-side paging, sorting and column filters on any query; a JSON tab with the page as foldable JSON and a JSONPath filter; Count all; JSON / JSONB shown as JSON, with a formatted, highlighted preview on hover; a value dialog with search and a JSONPath filter; copy as TSV, JSON or `INSERT` |
 | **Connections** | Postgres, MySQL / MariaDB and Elasticsearch, one JSON file each; a file's `-- @connection` / `-- @database` lines choose them, and the pickers write those lines |
 | **Safety** | Production connections get a red banner and confirm every non-read statement; read-only connections refuse writes in Siesta and in the server session; open transactions are asked about before a file or the app closes |
 | **Schema** | DB tab: schemas, tables, columns and indexes; insert a `SELECT` for a table or show its DDL |
@@ -135,7 +135,7 @@ GET /users/_search
 { "driver": "elasticsearch", "url": "https://es.internal:9200", "user": "elastic" }
 ```
 
-- **Results are tables.** Search hits become rows (`_id`, then the `_source` fields), `_sql` and `_cat` answers become tables, and any other answer is one JSON cell.
+- **Results open as JSON.** The **JSON** tab shows the page's documents (`_id`, then the `_source` fields) as one foldable, highlighted document with a JSONPath filter; **Raw** shows the whole response (`hits.total`, `aggregations`, `_shards`); **Table** puts the documents in rows. `_sql` and `_cat` answers become tables. The tab you pick is kept for the file.
 - **Paging, sorting and filters.** A `_search` without its own `size` / `from` pages on the server; the column sort and filters go into the request.
 - **Credentials.** `user` with a password is basic auth; a password without `user` is an API key.
 - **Safety.** `prod` and `read_only` work as for SQL. `read_only` is checked only in Siesta: Elasticsearch has no read-only session.

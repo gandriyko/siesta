@@ -151,10 +151,22 @@ pub type Key = (PathBuf, String);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Tab {
+    /// The table.
     #[default]
     Result,
+    /// The page's rows as a JSON array of objects (Elasticsearch: the documents).
+    Json,
+    /// The server's whole JSON response (Elasticsearch only).
+    Raw,
     Messages,
     Query,
+}
+
+impl Tab {
+    /// A way to see the rows (remembered per file), not the run's metadata.
+    pub fn is_view(self) -> bool {
+        matches!(self, Tab::Result | Tab::Json | Tab::Raw)
+    }
 }
 
 /// A finished run of one statement.
@@ -216,6 +228,9 @@ pub struct Store {
     /// The statements of the latest multi-statement run per file (empty: a single statement ran).
     pub batches: HashMap<PathBuf, Vec<Key>>,
     pub last: Option<(PathBuf, Vec<Spec>)>,
+    /// The view (Table / JSON / Raw) last picked per file; a fresh run opens in it.
+    // ponytail: in memory only; persist in state.json if it should survive a restart.
+    pub views: HashMap<PathBuf, Tab>,
 }
 
 impl Store {
@@ -539,6 +554,12 @@ pub struct Ui {
     /// Messages and Query tabs: a read-only editor, loaded when what it shows changes.
     meta: Entity<EditorState>,
     meta_shown: Option<(Key, u64, Tab)>,
+    /// JSON and Raw tabs: a folding read-only JSON viewer with a JSONPath filter (as the value popup).
+    json: Entity<EditorState>,
+    json_filter: Entity<InputState>,
+    /// (statement, result id, tab) the viewer holds, and its unfiltered text.
+    json_shown: Option<(Key, u64, Tab)>,
+    json_source: String,
     filter_cols: Vec<String>,
     filter_subs: Vec<Subscription>,
     pub filters_open: bool,
@@ -573,7 +594,20 @@ impl Ui {
                 _ => {}
             }
         })];
-        Ui { table, meta, meta_shown: None, filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, edit: None, _subs: subs }
+        let json = cx.new(|cx| {
+            let mut s = EditorState::new(window, cx).line_number(false).soft_wrap(true).folding(true).searchable(true).replaceable(false);
+            s.set_readonly(true, cx);
+            s.set_highlighter(SharedString::from("json"), cx);
+            s
+        });
+        let json_filter = cx.new(|cx| InputState::new(window, cx).placeholder("JSONPath filter, e.g. $[*].user.address.city"));
+        let mut subs = subs;
+        subs.push(cx.subscribe_in(&json_filter, window, |this, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.apply_json_filter(window, cx);
+            }
+        }));
+        Ui { table, meta, meta_shown: None, json, json_filter, json_shown: None, json_source: String::new(), filter_cols: vec![], filter_subs: vec![], filters_open: false, shown: None, json_on: None, pinned: None, popup: None, edit: None, _subs: subs }
     }
 }
 
@@ -725,8 +759,44 @@ impl Siesta {
                 t.refresh(cx);
             });
         }
+        self.sync_json(key.clone(), window, cx);
         self.sync_meta(key, window, cx);
         self.sync_edit(cx);
+    }
+
+    /// Loads the JSON viewer when the shown result or tab changed; the filter is kept and applied.
+    fn sync_json(&mut self, key: Option<Key>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(k) = key else { return };
+        let Some(e) = self.entry(&k) else { return };
+        let Some(o) = e.done.as_ref().filter(|_| matches!(e.tab, Tab::Json | Tab::Raw)).and_then(|d| d.outcome()) else { return };
+        let sig = Some((k, e.id, e.tab));
+        if sig == self.ui.json_shown {
+            return;
+        }
+        self.ui.json_source = match (&o.raw, e.tab) {
+            (Some(raw), Tab::Raw) => serde_json::to_string_pretty(raw).unwrap_or_default(),
+            _ => rows_json(&o.columns, &o.rows),
+        };
+        self.ui.json_shown = sig;
+        self.apply_json_filter(window, cx);
+    }
+
+    fn apply_json_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let expr = self.ui.json_filter.read(cx).value().trim().to_string();
+        let text = if expr.is_empty() { self.ui.json_source.clone() } else { crate::value_popup::jsonpath(&self.ui.json_source, &expr).unwrap_or_else(|e| format!("// {e}")) };
+        self.ui.json.update(cx, |s, cx| s.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    /// The JSON / Raw tab: the viewer over the filter field.
+    fn json_view(&self) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            // The element's own `readonly` (default false) overrides the state's on every render.
+            .child(div().flex_1().min_h_0().child(gpui_component::input::Editor::new(&self.ui.json).readonly(true).size_full().bordered(false)))
+            .child(div().flex_none().px_2().py_1().child(Input::new(&self.ui.json_filter).small().cleanable(true)))
+            .into_any_element()
     }
 
     fn grid_filters(&self, cx: &App) -> Vec<Entity<InputState>> {
@@ -752,15 +822,16 @@ impl Siesta {
     fn sync_meta(&mut self, key: Option<Key>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(k) = key else { return };
         let Some(e) = self.entry(&k) else { return };
-        let Some(done) = e.done.clone().filter(|_| e.tab != Tab::Result) else { return };
+        let Some(done) = e.done.clone().filter(|_| !e.tab.is_view()) else { return };
         let sig = Some((k, e.id, e.tab));
         if sig == self.ui.meta_shown {
             return;
         }
         let (tab, text) = (e.tab, if e.tab == Tab::Messages { messages_text(&done) } else { query_text(&done) });
         self.ui.meta_shown = sig;
+        let query_lang = if done.driver == Driver::Elastic { "json" } else { "sql" };
         self.ui.meta.update(cx, |s, cx| {
-            s.set_highlighter(SharedString::from(if tab == Tab::Query { "sql" } else { "text" }), cx);
+            s.set_highlighter(SharedString::from(if tab == Tab::Query { query_lang } else { "text" }), cx);
             s.set_value(text, window, cx);
         });
     }
@@ -1055,24 +1126,41 @@ impl Siesta {
         let batch = self.batch_strip(key.as_ref(), cx);
         let header = v_flex().flex_none().gap_1().px_3().py_1p5().border_b_1().border_color(border).child(line1).child(line2).children(batch);
 
+        // Raw only where the server's JSON response was kept (Elasticsearch).
+        let has_raw = done.as_ref().and_then(|d| d.outcome()).is_some_and(|o| o.raw.is_some());
+        let tab = if tab == Tab::Raw && !has_raw { Tab::Json } else { tab };
+        let shown_tabs: Vec<Tab> = [Tab::Result, Tab::Json, Tab::Raw, Tab::Messages, Tab::Query].into_iter().filter(|t| *t != Tab::Raw || has_raw).collect();
         let tabs = done.as_ref().map(|d| {
             let msgs = match &d.result {
                 Err(_) => Some(danger),
                 Ok(o) if !o.notices.is_empty() => Some(warning),
                 _ => None,
             };
-            TabBar::new("result-tabs").pill().small().selected_index(tab as usize).on_click(cx.listener(|this, ix: &usize, _, cx| {
-                if let Some(e) = this.shown_key(cx).and_then(|k| this.store.entries.get_mut(&k)) {
-                    e.tab = [Tab::Result, Tab::Messages, Tab::Query][(*ix).min(2)];
+            let list = shown_tabs.clone();
+            let bar = TabBar::new("result-tabs").pill().small().selected_index(shown_tabs.iter().position(|t| *t == tab).unwrap_or(0)).on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                let picked = list[(*ix).min(list.len() - 1)];
+                if let Some(k) = this.shown_key(cx) {
+                    if picked.is_view() {
+                        this.store.views.insert(k.0.clone(), picked);
+                    }
+                    if let Some(e) = this.store.entries.get_mut(&k) {
+                        e.tab = picked;
+                    }
                 }
                 cx.notify();
-            }))
-            .child(TabItem::new().label("Result"))
-            .child(match msgs {
-                Some(c) => TabItem::new().label("Messages").suffix(div().size(fs * 0.7).rounded_full().bg(c).mr(fs * 0.4)),
-                None => TabItem::new().label("Messages"),
+            }));
+            shown_tabs.iter().fold(bar, |bar, t| {
+                bar.child(match t {
+                    Tab::Result => TabItem::new().label("Table"),
+                    Tab::Json => TabItem::new().label("JSON"),
+                    Tab::Raw => TabItem::new().label("Raw"),
+                    Tab::Messages => match msgs {
+                        Some(c) => TabItem::new().label("Messages").suffix(div().size(fs * 0.7).rounded_full().bg(c).mr(fs * 0.4)),
+                        None => TabItem::new().label("Messages"),
+                    },
+                    Tab::Query => TabItem::new().label("Query"),
+                })
             })
-            .child(TabItem::new().label("Query"))
         });
 
         let body = match (&done, tab) {
@@ -1084,7 +1172,8 @@ impl Siesta {
                 .child(if running.is_some() { "Running…".to_string() } else { format!("{RUN_KEY} to run") })
                 .into_any_element(),
             (Some(_), Tab::Messages | Tab::Query) => div().flex_1().min_h_0().child(gpui_component::input::Editor::new(&self.ui.meta).readonly(true).size_full().bordered(false)).into_any_element(),
-            (Some(d), Tab::Result) => match &d.result {
+            (Some(d), Tab::Json | Tab::Raw) if d.outcome().is_some_and(|o| !o.columns.is_empty() || o.raw.is_some()) => self.json_view(),
+            (Some(d), Tab::Result | Tab::Json | Tab::Raw) => match &d.result {
                 Err(err) => v_flex()
                     .flex_1()
                     .min_h_0()
@@ -1109,7 +1198,8 @@ impl Siesta {
                 Ok(_) => self.table_view(running.is_some(), primary, window, cx),
             },
         };
-        let footer = (tab == Tab::Result).then(|| self.footer(key.as_ref(), cx)).flatten();
+        // Paging works in every view of the rows.
+        let footer = tab.is_view().then(|| self.footer(key.as_ref(), cx)).flatten();
         let edit_bar = self.edit_bar(cx);
         let panel = v_flex().size_full().child(header).children(edit_bar).children(tabs.map(|t| div().flex_none().px_2().py_1().child(t))).child(body).children(footer);
         panel.into_any_element()
