@@ -1,7 +1,7 @@
 # Siesta: specification of a lightweight SQL client in Rust + GPUI
 
 This file records principles and decisions. It is updated only when a principle or a decision changes — not for every feature or tweak;
-behaviour details live in the code, tests, README.md and skills/siesta/SKILL.md.
+behaviour details live in the code, tests, README.md with its pages in docs/, and skills/siesta/SKILL.md.
 
 ## Purpose and non-goals
 

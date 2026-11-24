@@ -4,7 +4,7 @@ Lightweight desktop SQL client (Postgres, MySQL / MariaDB) on Rust + GPUI + gpui
 The spec is `SPEC.md` (written in English): it records
 principles and decisions with their reasons. Change it **only when a principle or a decision changes**
 (or a new one is made) — not for every feature, tweak, key, setting or message. Behaviour details live in
-the code, the tests, `README.md` and `skills/siesta/SKILL.md`; don't copy them into the spec.
+the code, the tests, `README.md` with its pages in `docs/`, and `skills/siesta/SKILL.md`; don't copy them into the spec.
 
 ## Git
 
