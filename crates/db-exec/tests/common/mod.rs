@@ -8,6 +8,7 @@ pub fn connection(driver: Driver) -> Connection {
     let var = match driver {
         Driver::Postgres => "SIESTA_TEST_PG_URL",
         Driver::MySql => "SIESTA_TEST_MYSQL_URL",
+        Driver::Elastic => "SIESTA_TEST_ES_URL",
     };
     Connection {
         name: "test".into(),

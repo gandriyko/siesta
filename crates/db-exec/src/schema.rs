@@ -106,6 +106,9 @@ impl Session {
     /// Databases the credentials can connect to. Postgres: not templates, `allowconn`, `CONNECT`
     /// privilege; MySQL / MariaDB: `SHOW DATABASES` with the system ones last.
     pub async fn databases(&mut self) -> Result<Vec<String>, DbError> {
+        if self.dialect() == Dialect::Elastic {
+            return Ok(Vec::new());
+        }
         if self.dialect() == Dialect::Postgres {
             let q = "SELECT datname::text FROM pg_database WHERE NOT datistemplate AND datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY 1";
             return Ok(self.catalog(q).await?.iter().map(|r| text(&r[0])).collect());
@@ -117,6 +120,21 @@ impl Session {
 
     /// Reads the whole structure with four catalog queries.
     pub async fn schema(&mut self) -> Result<Schema, DbError> {
+        if let crate::Conn::Es(es) = &self.conn {
+            // One node: indices as tables, mapping fields (dotted paths) as columns.
+            let tables = es
+                .mappings()
+                .await?
+                .into_iter()
+                .map(|(name, fields)| Table {
+                    name,
+                    kind: TableKind::Table,
+                    columns: fields.into_iter().enumerate().map(|(i, (name, data_type))| ColumnInfo { name, data_type, nullable: true, primary_key: false, ordinal: i as u32 + 1 }).collect(),
+                    indexes: vec![],
+                })
+                .collect();
+            return Ok(Schema { schemas: vec![SchemaNode { name: "indices".into(), tables }] });
+        }
         let pg = self.dialect() == Dialect::Postgres;
         let (tables, columns, indexes) = if pg {
             let w = "table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE 'pg\\_%'";
@@ -184,6 +202,16 @@ impl Session {
     /// catalog (columns, defaults, identity, constraints, secondary indexes; no storage options,
     /// ownership, partitions or comments).
     pub async fn table_ddl(&mut self, schema: &str, table: &str) -> Result<String, DbError> {
+        if let crate::Conn::Es(es) = &self.conn {
+            // The index's mapping, as a request that recreates it.
+            let (status, text) = es.send("GET", &format!("/{table}/_mapping"), "").await?;
+            if status >= 400 {
+                return Err(crate::es::http_error(status, &text));
+            }
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let body = serde_json::json!({ "mappings": v[table]["mappings"] });
+            return Ok(format!("PUT /{table}\n{}", serde_json::to_string_pretty(&body).unwrap_or_default()));
+        }
         let d = self.dialect();
         let qualified = format!("{}.{}", quote_ident(d, schema), quote_ident(d, table));
         if d == Dialect::MySql {

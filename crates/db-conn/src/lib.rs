@@ -82,6 +82,20 @@ pub enum Driver {
     Postgres,
     /// MySQL and MariaDB.
     MySql,
+    /// Elasticsearch over HTTP: `http://` without SSL mode, `https://` with one. `user` + password
+    /// is basic auth; a password without `user` is an API key.
+    Elastic,
+}
+
+impl Driver {
+    /// The value of `"driver"` in a connection file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Driver::Postgres => "postgres",
+            Driver::MySql => "mysql",
+            Driver::Elastic => "elasticsearch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +134,7 @@ pub fn socket_candidates(driver: Driver) -> &'static [&'static str] {
     match driver {
         Driver::Postgres => &PG_SOCKET_DIRS,
         Driver::MySql => &MYSQL_SOCKETS,
+        Driver::Elastic => &[],
     }
 }
 
@@ -133,6 +148,7 @@ pub fn detect_socket_in(driver: Driver, port: Option<u16>, candidates: &[&str], 
     candidates.iter().map(PathBuf::from).find(|c| match driver {
         Driver::Postgres => exists(&c.join(format!(".s.PGSQL.{}", port.unwrap_or(5432)))),
         Driver::MySql => exists(c),
+        Driver::Elastic => false,
     })
 }
 
@@ -210,7 +226,7 @@ impl Connection {
     /// that was later saved under the same name. FNV-1a: stable across Rust versions.
     pub fn fingerprint(&self) -> u64 {
         let parts = [
-            Some(if self.driver == Driver::Postgres { "postgres" } else { "mysql" }.to_string()),
+            Some(self.driver.name().to_string()),
             self.url.as_deref().map(mask_url),
             self.host.clone(),
             self.socket.as_ref().map(|s| match s {
@@ -292,7 +308,7 @@ pub fn masked(c: &Connection) -> Value {
     let s = |o: &Option<String>| o.clone().map(Value::from);
     let p = |o: &Option<PathBuf>| o.as_ref().map(|p| Value::from(p.to_string_lossy().into_owned()));
     put("name", Some(c.name.clone().into()));
-    put("driver", Some(if c.driver == Driver::Postgres { "postgres" } else { "mysql" }.into()));
+    put("driver", Some(c.driver.name().into()));
     put("url", c.url.as_ref().map(|u| mask_url(u).into()));
     put("host", s(&c.host));
     put(
@@ -395,11 +411,13 @@ fn parse_driver(driver: Option<&str>, url: Option<&str>) -> Result<Driver, Strin
     Ok(match driver {
         Some("postgres") => Driver::Postgres,
         Some("mysql") => Driver::MySql,
-        Some(d) => return Err(format!("unknown driver '{d}' (postgres or mysql)")),
+        Some("elasticsearch") => Driver::Elastic,
+        Some(d) => return Err(format!("unknown driver '{d}' (postgres, mysql or elasticsearch)")),
         None => match url.and_then(|u| u.split_once("://")).map(|(s, _)| s) {
             Some("postgres" | "postgresql") => Driver::Postgres,
             Some("mysql" | "mariadb") => Driver::MySql,
-            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// url".into()),
+            Some("http" | "https") => Driver::Elastic,
+            _ => return Err("no driver: set \"driver\" or a postgres:// / mysql:// / http(s):// url".into()),
         },
     })
 }

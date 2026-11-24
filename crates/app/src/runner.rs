@@ -332,6 +332,9 @@ impl Siesta {
     pub(crate) fn connection_of(&self, path: &Path) -> Result<(String, Connection), String> {
         let d = self.docs.iter().find(|d| *d.path == path).ok_or("The file is not open")?;
         let name = d.connection().ok_or("No connection: pick one in the top-right corner")?;
+        if let Some(m) = d.connection_mismatch() {
+            return Err(format!("Connection '{name}' can't run this file: {m}"));
+        }
         match d.effective_connection() {
             Some(c) => Ok((name.to_string(), c)),
             None => Err(match d.conns.errors.get(name) {

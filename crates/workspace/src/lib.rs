@@ -12,8 +12,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// A query file Siesta lists and runs: `.sql`, or an Elasticsearch `.es` file.
 pub fn is_sql(p: &Path) -> bool {
-    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) || is_es(p)
+}
+
+/// An Elasticsearch requests file (Kibana console format).
+pub fn is_es(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("es"))
+}
+
+/// The dialect a file is split with before its connection is known: `.es` is always Elastic,
+/// `.sql` is Postgres until the connection says MySQL.
+pub fn file_dialect(p: &Path) -> sql_split::Dialect {
+    if is_es(p) { sql_split::Dialect::Elastic } else { sql_split::Dialect::default() }
 }
 
 /// Folders and `.sql` files under the central folder `root` (`~/.config/siesta/collections`),
@@ -43,9 +55,10 @@ pub fn rewrite_connection_refs(collections: &Path, base: Option<&Path>, renames:
     let (mut changed, mut errors) = (0, Vec::new());
     for f in files.iter().filter(|f| is_sql(f)) {
         let Ok(text) = std::fs::read_to_string(f) else { continue };
-        let Some(old) = sql_split::split(&text, Default::default()).connection else { continue };
+        let d = file_dialect(f);
+        let Some(old) = sql_split::split(&text, d).connection else { continue };
         let Some((_, new)) = renames.iter().find(|(o, _)| *o == old) else { continue };
-        let Some(rewritten) = sql_split::rewrite_connection(&text, Default::default(), Some(new)) else { continue };
+        let Some(rewritten) = sql_split::rewrite_connection(&text, d, Some(new)) else { continue };
         match std::fs::write(f, rewritten) {
             Ok(()) => changed += 1,
             Err(e) => errors.push(format!("{}: {e}", f.display())),

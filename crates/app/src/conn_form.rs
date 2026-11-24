@@ -24,13 +24,14 @@ use gpui_component::{
 
 use crate::{Siesta, format, runner::RT};
 
-const DRIVERS: [(&str, Driver); 2] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql)];
+const DRIVERS: [(&str, Driver); 3] = [("Postgres", Driver::Postgres), ("MySQL / MariaDB", Driver::MySql), ("Elasticsearch", Driver::Elastic)];
 
 /// The driver's default port (also the Port field's hint).
 fn default_port(d: Driver) -> &'static str {
     match d {
         Driver::Postgres => "5432",
         Driver::MySql => "3306",
+        Driver::Elastic => "9200",
     }
 }
 
@@ -39,6 +40,7 @@ fn driver_hints(d: Driver) -> [String; 4] {
     match d {
         Driver::Postgres => ["postgres://user:password@host:5432/db (fills the fields below)".into(), "localhost".into(), format!("{} (your OS user)", db_conn::os_user()), "SET TIME ZONE 'UTC'".into()],
         Driver::MySql => ["mysql://user:password@host:3306/db (fills the fields below)".into(), "localhost".into(), "root".into(), "SET time_zone = '+00:00'".into()],
+        Driver::Elastic => ["https://user:password@host:9200 (fills the fields below)".into(), "localhost".into(), "elastic (empty: the password is an API key)".into(), String::new()],
     }
 }
 const SSL_MODES: [(&str, Option<SslMode>); 6] = [
@@ -545,6 +547,9 @@ impl Render for ConnForm {
         let status = self.status(cx);
         let editing = self.original.is_some();
         let location = format!("Saved to {}; the password is kept only encrypted (key: {}).", db_conn::connections_dir(&self.dir).display(), db_conn::crypto::key_path(&self.keys).display());
+        // Elasticsearch is HTTP: no socket, database, schema or init SQL; the password may be an API key.
+        let es = self.driver == Some(Driver::Elastic);
+        let user = div().flex_1().min_w_0().child(field("User", &self.user));
         v_flex()
             .gap_2()
             .child(field("Name", &self.name))
@@ -558,24 +563,26 @@ impl Render for ConnForm {
                     // A MySQL socket is a file: no port.
                     .when(!(self.socket && self.driver == Some(Driver::MySql)), |r| r.child(div().w(px(100.)).child(field("Port", &self.port)))),
             )
-            .child(
-                Checkbox::new("conn-socket")
-                    .label("Unix socket")
-                    .checked(self.socket)
-                    .tooltip("Connect through the server's local Unix socket instead of TCP. Leave the path empty to use the detected one, or type your own.")
-                    .on_click(cx.listener(|this, v: &bool, window, cx| {
-                        this.socket = *v;
-                        this.socket_hint(window, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(h_flex().gap_2().items_start().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(div().flex_1().min_w_0().child(field("User", &self.user))))
-            .children(db_note)
-            .child(Self::field("Password", muted, Input::new(&self.password).mask_toggle()))
-            .child(h_flex().gap_2().child(div().flex_1().child(Self::field("SSL mode", muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
+            .when(!es, |f| {
+                f.child(
+                    Checkbox::new("conn-socket")
+                        .label("Unix socket")
+                        .checked(self.socket)
+                        .tooltip("Connect through the server's local Unix socket instead of TCP. Leave the path empty to use the detected one, or type your own.")
+                        .on_click(cx.listener(|this, v: &bool, window, cx| {
+                            this.socket = *v;
+                            this.socket_hint(window, cx);
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(if es { h_flex().child(user) } else { h_flex().gap_2().items_start().child(div().flex_1().min_w_0().child(Self::field("Database", muted, database))).child(user) })
+            .when(!es, |f| f.children(db_note))
+            .child(Self::field(if es { "Password or API key" } else { "Password" }, muted, Input::new(&self.password).mask_toggle()))
+            .child(h_flex().gap_2().child(div().flex_1().child(Self::field(if es { "SSL mode (https)" } else { "SSL mode" }, muted, ssl))).child(div().flex_1().child(Self::field("Color", muted, color))))
             // `search_path` exists only in Postgres; MySQL's schema is the database.
-            .when(self.driver != Some(Driver::MySql), |f| f.child(field("Schema (search_path)", &self.schema)))
-            .child(field("Init SQL", &self.init_sql))
+            .when(self.driver.is_none_or(|d| d == Driver::Postgres), |f| f.child(field("Schema (search_path)", &self.schema)))
+            .when(!es, |f| f.child(field("Init SQL", &self.init_sql)))
             .child(h_flex().gap_4().child(flag("conn-ro", "Read only", self.read_only, |t, v| t.read_only = v, cx)).child(flag("conn-prod", "Production", self.prod, |t, v| t.prod = v, cx)))
             .child(div().text_xs().text_color(muted).child(location))
             .children(self.error.clone().map(|e| div().text_sm().text_color(danger).child(e)))

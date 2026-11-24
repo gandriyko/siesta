@@ -62,6 +62,7 @@ impl Session {
                     .collect();
                 self.my_source(cols).await
             }
+            Conn::Es(_) => Err(DbError::msg("Elasticsearch results are not editable here; change documents with a request (POST <index>/_update/<id>)")),
         }
     }
 

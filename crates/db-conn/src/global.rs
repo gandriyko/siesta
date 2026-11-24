@@ -66,7 +66,7 @@ impl ConnectionForm {
             p => m.insert("port".into(), p.parse::<u16>().map_err(|_| format!("port is not a number: '{p}'"))?.into()),
         };
         let driver = self.driver.ok_or("driver is required")?;
-        m.insert("driver".into(), if driver == Driver::Postgres { "postgres" } else { "mysql" }.into());
+        m.insert("driver".into(), driver.name().into());
         for (k, on) in [("read_only", self.read_only), ("prod", self.prod)] {
             if on {
                 m.insert(k.into(), true.into());

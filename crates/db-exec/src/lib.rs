@@ -7,6 +7,7 @@
 //! Notices: MySQL warnings are read with `SHOW WARNINGS` after non-query statements. Postgres
 //! `NOTICE`s are not reachable (sqlx only logs them), so `notices` stays empty for Postgres.
 
+mod es;
 pub mod history;
 mod schema;
 mod source;
@@ -128,11 +129,14 @@ impl DbError {
 enum Conn {
     Pg(PgConnection),
     My(MySqlConnection),
+    Es(es::Es),
 }
 
 enum Opts {
     Pg(PgConnectOptions),
     My(MySqlConnectOptions),
+    /// The base url, and what a cancel wakes to drop the request in flight.
+    Es(String, Arc<tokio::sync::Notify>),
 }
 
 /// Default connect timeout (setting `run.connect_timeout_ms`).
@@ -144,6 +148,7 @@ impl Opts {
         let (host, port, socket) = match self {
             Opts::Pg(o) => (o.get_host(), o.get_port(), o.get_socket().is_some()),
             Opts::My(o) => (o.get_host(), o.get_port(), o.get_socket().is_some()),
+            Opts::Es(base, _) => return Some(base.clone()),
         };
         (!socket && !host.starts_with('/')).then(|| format!("{host}:{port}"))
     }
@@ -155,7 +160,7 @@ fn connect_timeout_error(target: Option<&str>, timeout: Duration) -> DbError {
     let secs = if ms.is_multiple_of(1000) { (ms / 1000).to_string() } else { format!("{:.1}", ms as f64 / 1000.0) };
     DbError {
         message: format!(
-            "No response from {} within {secs} s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306).",
+            "No response from {} within {secs} s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306, Elasticsearch on 9200).",
             target.unwrap_or("the server")
         ),
         connection_lost: true,
@@ -196,6 +201,10 @@ const MY_TAG: &str = "SELECT CONCAT_WS('/', @@hostname, @@port, @@server_id, HOS
 
 impl CancelHandle {
     pub async fn cancel(&self) -> Result<(), DbError> {
+        if let Opts::Es(_, abort) = &*self.opts {
+            abort.notify_waiters();
+            return Ok(());
+        }
         let Target { id, tag } = self.target.lock().unwrap().clone();
         if id == 0 {
             return Ok(());
@@ -227,6 +236,7 @@ impl CancelHandle {
                     sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {id}"))).execute(&mut c).await.map_err(e)?;
                     let _ = c.close().await;
                 }
+                Opts::Es(..) => {}
             }
             Ok(())
         })
@@ -363,10 +373,11 @@ fn mysql_options(c: &Connection) -> Result<MySqlConnectOptions, DbError> {
     Ok(o.disable_statement_logging())
 }
 
-fn dialect(d: Driver) -> Dialect {
+pub fn dialect(d: Driver) -> Dialect {
     match d {
         Driver::Postgres => Dialect::Postgres,
         Driver::MySql => Dialect::MySql,
+        Driver::Elastic => Dialect::Elastic,
     }
 }
 
@@ -380,6 +391,10 @@ fn sql_str(s: &str) -> sqlx::SqlStr {
 /// the default one (the user's name) often doesn't exist: on SQLSTATE `3D000` it retries on
 /// `postgres`, then `template1`.
 pub async fn list_databases(c: &Connection, connect_timeout: Duration) -> Result<Vec<String>, DbError> {
+    if c.driver == Driver::Elastic {
+        // A cluster has no databases; `@database` does not apply.
+        return Ok(Vec::new());
+    }
     let mut tried: Vec<Option<String>> = vec![c.database.clone().filter(|d| !d.is_empty())];
     let mut conn = c.clone();
     conn.database = tried[0].clone();
@@ -424,6 +439,7 @@ impl Session {
         let opts: Arc<Opts> = match c.driver {
             Driver::Postgres => Opts::Pg(pg_options(c)?),
             Driver::MySql => Opts::My(mysql_options(c)?),
+            Driver::Elastic => Opts::Es(es::base_url(c)?, Arc::default()),
         }
         .into();
         // sqlx 0.9 has no connect timeout on the connect options: this one is the guarantee.
@@ -431,6 +447,11 @@ impl Session {
             let conn = match &*opts {
                 Opts::Pg(o) => Conn::Pg(PgConnection::connect_with(o).await.map_err(e)?),
                 Opts::My(o) => Conn::My(MySqlConnection::connect_with(o).await.map_err(e)?),
+                Opts::Es(_, abort) => {
+                    let mut es = es::Es::open(c).await?;
+                    es.abort = abort.clone();
+                    Conn::Es(es)
+                }
             };
             let mut s = Session {
                 conn,
@@ -465,11 +486,17 @@ impl Session {
             return Ok(());
         }
         let ms = self.timeout_ms.unwrap_or(0);
-        let sql = match (&self.conn, self.mariadb) {
+        let sql = match (&mut self.conn, self.mariadb) {
             (Conn::Pg(_), _) => format!("SET statement_timeout = {ms}"),
             (Conn::My(_), false) => format!("SET SESSION max_execution_time = {ms}"),
             // Seconds, fractions allowed.
             (Conn::My(_), true) => format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0),
+            // The whole HTTP request.
+            (Conn::Es(es), _) => {
+                es.timeout = (ms > 0).then(|| Duration::from_millis(ms));
+                self.timeout_applied = self.timeout_ms;
+                return Ok(());
+            }
         };
         self.simple(&sql).await?;
         self.timeout_applied = self.timeout_ms;
@@ -493,6 +520,8 @@ impl Session {
                     sqlx::raw_sql("SET SESSION TRANSACTION READ ONLY").execute(&mut *c).await?;
                 }
             }
+            // No session state on the server: `read_only` is the client check, `init_sql` is SQL.
+            Conn::Es(_) => return Ok(()),
         }
         if let Some(init) = self.spec.init_sql.clone() {
             // One statement at a time: works the same on both servers.
@@ -515,6 +544,7 @@ impl Session {
                 let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *c).await?;
                 Target { id, tag: sqlx::query_scalar(MY_TAG).bind(id).fetch_one(&mut *c).await? }
             }
+            Conn::Es(_) => Target::default(),
         };
         *self.target.lock().unwrap() = t;
         Ok(())
@@ -525,6 +555,7 @@ impl Session {
         match &mut self.conn {
             Conn::Pg(c) => q.execute(c).await.map(drop)?,
             Conn::My(c) => q.execute(c).await.map(drop)?,
+            Conn::Es(_) => return Ok(()),
         }
         if let Some(on) = autocommit_setting(sql, self.dialect()) {
             self.autocommit_off = !on;
@@ -570,6 +601,7 @@ impl Session {
         match self.conn {
             Conn::Pg(c) => drop(c.close().await),
             Conn::My(c) => drop(c.close().await),
+            Conn::Es(_) => {}
         }
     }
 
@@ -608,6 +640,9 @@ impl Session {
 
     /// `SELECT count(*)` over the same statement and filters (no paging).
     pub async fn count(&mut self, sql: &str, filters: &[(String, String)]) -> Result<u64, DbError> {
+        if let Conn::Es(es) = &self.conn {
+            return es.count(sql, filters).await;
+        }
         let d = self.dialect();
         let filtered = filters.iter().any(|f| wrap::parse_filter(&f.1).is_some());
         let cols = if filtered || d == Dialect::MySql { self.columns_of(strip(sql)).await? } else { Vec::new() };
@@ -624,6 +659,9 @@ impl Session {
     }
 
     async fn run_once(&mut self, sql: &str, kind: Kind, page: &Page) -> Result<Outcome, DbError> {
+        if let Conn::Es(es) = &self.conn {
+            return es.run(sql, kind, page, self.max_rows).await;
+        }
         let started = Instant::now();
         let d = self.dialect();
         let mut notices = Vec::new();
@@ -697,6 +735,7 @@ impl Session {
         let cols = match &mut self.conn {
             Conn::Pg(c) => c.prepare(sql).await.map_err(e)?.columns().iter().map(|c| (c.name().to_string(), pg_name(c.type_info()), c.type_info().oid().map(|o| o.0))).collect(),
             Conn::My(c) => c.prepare(sql).await.map_err(e)?.columns().iter().map(|c| (c.name().to_string(), c.type_info().name().to_string(), None)).collect(),
+            Conn::Es(_) => Vec::new(),
         };
         Ok(self.name_columns(cols).await)
     }
@@ -791,6 +830,8 @@ impl Session {
                 let rows = rows.iter().map(|r| columns.iter().enumerate().map(|(i, c)| my_value(r, i, &c.type_name)).collect()).collect();
                 Ok(Raw { columns, rows, affected, truncated, extra_sets })
             }
+            // `run_once` / `count` answer Elasticsearch before any SQL is built.
+            Conn::Es(_) => Ok(Raw { columns: Vec::new(), rows: Vec::new(), affected: 0, truncated: false, extra_sets: 0 }),
         }
     }
 
@@ -1100,7 +1141,7 @@ mod tests {
         assert!(e.connection_lost);
         assert_eq!(
             e.message,
-            "No response from localhost:25432 within 10 s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306)."
+            "No response from localhost:25432 within 10 s. Check the driver and port (Postgres usually listens on 5432, MySQL / MariaDB on 3306, Elasticsearch on 9200)."
         );
         assert!(connect_timeout_error(None, Duration::from_millis(1500)).message.starts_with("No response from the server within 1.5 s."));
     }

@@ -45,9 +45,17 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
         .find_map(|part| match part {
             "postgres" | "postgresql" | "psycopg" | "psycopg2" | "asyncpg" | "pg8000" => Some(Driver::Postgres),
             "mysql" | "mariadb" | "pymysql" | "mysqldb" | "mysqlconnector" | "aiomysql" | "asyncmy" => Some(Driver::MySql),
+            "http" | "https" => Some(Driver::Elastic),
             _ => None,
         })
         .ok_or("Unsupported scheme")?;
+    if driver == Driver::Elastic {
+        // `https://` is TLS with the certificate checked; the path (a proxy prefix) is not supported.
+        let mut p = parse_url(&format!("postgres://{rest}"))?;
+        (p.driver, p.database, p.ssl_mode) = (Some(driver), String::new(), (scheme == "https").then_some(SslMode::VerifyFull));
+        p.ignored.clear();
+        return Ok(p);
+    }
     let rest = rest.split('#').next().unwrap_or_default();
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
@@ -146,10 +154,12 @@ mod tests {
             ("postgres://u@%2Fvar%2Frun%2Fpostgresql/db", (Some(Postgres), "u", "", "/var/run/postgresql", None, "db", None, none.clone())),
             ("mysql://u@localhost/db?socket=/tmp/mysql.sock", (Some(MySql), "u", "", "/tmp/mysql.sock", None, "db", None, none.clone())),
             ("postgres://h/db?application_name=a&sslmode=require", (Some(Postgres), "", "", "h", None, "db", Some(SslMode::Require), vec!["application_name".into()])),
+            ("http://localhost:9200", (Some(Elastic), "", "", "localhost", Some(9200), "", None, none.clone())),
+            ("https://elastic:pw@es.example.com/?pretty", (Some(Elastic), "elastic", "pw", "es.example.com", None, "", Some(SslMode::VerifyFull), none.clone())),
         ] {
             assert_eq!(ok(url), own(want), "{url}");
         }
-        for (url, err) in [("http://h/db", "Unsupported scheme"), ("h/db", "Unsupported scheme"), ("postgres://", "Missing host"), ("postgres://u:p@/db", "Missing host"), ("postgres://h:x/db", "Invalid port")] {
+        for (url, err) in [("ftp://h/db", "Unsupported scheme"), ("h/db", "Unsupported scheme"), ("postgres://", "Missing host"), ("postgres://u:p@/db", "Missing host"), ("postgres://h:x/db", "Invalid port")] {
             assert_eq!(parse_url(url), Err(err.into()), "{url}");
         }
     }

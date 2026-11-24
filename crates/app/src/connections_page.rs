@@ -78,6 +78,7 @@ pub(crate) fn build_rows(c: &Connections, current: Option<&str>, filter: &str) -
             let driver = match r.driver {
                 Some(Driver::Postgres) => "postgres",
                 Some(Driver::MySql) => "mysql mariadb",
+                Some(Driver::Elastic) => "elasticsearch",
                 None => "",
             };
             filter.is_empty() || [r.name.as_str(), driver, r.target.as_str()].iter().any(|s| s.to_lowercase().contains(&filter))
@@ -183,6 +184,7 @@ impl ConnectionsPage {
         let driver = match r.driver {
             Some(Driver::Postgres) => "Postgres",
             Some(Driver::MySql) => "MySQL",
+            Some(Driver::Elastic) => "Elasticsearch",
             None => "?",
         };
         let name = r.name.clone();

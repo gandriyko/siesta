@@ -1056,7 +1056,11 @@ impl Siesta {
         let current = d.connection().map(str::to_string);
         // A directive naming a connection that does not exist: shown in red.
         let unknown = d.connection().filter(|n| !d.conns.connections.contains_key(*n)).map(str::to_string);
-        let names: Vec<String> = d.conns.names().iter().map(|n| n.to_string()).collect();
+        // Red too: a connection of the other language (`.es` on SQL, `.sql` on Elasticsearch).
+        let mismatch = d.connection_mismatch();
+        // Only the connections that run this kind of file.
+        let es = d.dialect == sql_split::Dialect::Elastic;
+        let names: Vec<String> = d.conns.connections.iter().filter(|(_, c)| (c.driver == db_conn::Driver::Elastic) == es).map(|(n, _)| n.clone()).collect();
         // Nothing to pick yet: the picker becomes the way to make the first connection.
         if names.is_empty() && unknown.is_none() {
             return Some(
@@ -1097,11 +1101,12 @@ impl Siesta {
                 .child(h_flex().gap_1p5().child(dot(status_color)).child(label))
                 .dropdown_caret(true)
                 .small()
-                .when(prod || unknown.is_some(), |b| b.danger())
-                .when(!(prod || unknown.is_some()), |b| b.ghost())
-                .tooltip(match &unknown {
-                    Some(n) => format!("Unknown connection `{n}` (from `-- @connection`)"),
-                    None => "Writes `-- @connection` in this file".to_string(),
+                .when(prod || unknown.is_some() || mismatch.is_some(), |b| b.danger())
+                .when(!(prod || unknown.is_some() || mismatch.is_some()), |b| b.ghost())
+                .tooltip(match (&unknown, mismatch) {
+                    (Some(n), _) => format!("Unknown connection `{n}` (from `@connection`)"),
+                    (None, Some(m)) => format!("Wrong kind of connection: {m}"),
+                    (None, None) => "Writes `@connection` in this file".to_string(),
                 })
                 .dropdown_menu(move |menu, _, cx| {
                     let pick = |name: Option<String>| {

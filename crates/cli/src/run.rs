@@ -133,10 +133,7 @@ impl Env {
 }
 
 pub(crate) fn dialect_of(d: Driver) -> Dialect {
-    match d {
-        Driver::Postgres => Dialect::Postgres,
-        Driver::MySql => Dialect::MySql,
-    }
+    db_exec::dialect(d)
 }
 
 /// A statement ready to run.
