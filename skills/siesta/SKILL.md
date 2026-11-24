@@ -95,7 +95,8 @@ before anything runs — ask the user to run these:
 - writes on a `read_only` connection (`read_only_refused`);
 - on a `prod` connection, everything except reads and `UPDATE` with a top-level `WHERE`
   (`prod_refused`: `DELETE`, `INSERT`, `DROP`, `TRUNCATE`, `ALTER`, `WITH … UPDATE`, `SET`…);
-  `UPDATE … WHERE` runs there without confirmation;
+  `UPDATE … WHERE` runs there without confirmation; reads run in a read-only session, so a function
+  that writes inside a `SELECT` fails with SQLSTATE `25006`; MySQL `/*! … */` comments are refused;
 - statements that need confirmation (`confirmation_required`: `-- @confirm`, and destructive ones
   under `run.confirm_destructive = always`, see Safety). Relative paths resolve against the
 directory the client starts the server in. Register it, for example in Claude Code (`siesta` must be on `PATH`: `cargo install --path crates/app`):

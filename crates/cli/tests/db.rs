@@ -243,6 +243,33 @@ fn postgres() {
     assert_eq!(v["columns"][0]["type"], "jsonb");
 }
 
+/// An agent's read on prod runs in a read-only session: a function that writes inside a SELECT
+/// fails on the server (the text check sees only "SELECT"); the allowed UPDATE … WHERE still writes.
+#[test]
+#[ignore = "needs docker: scripts/test-db.sh"]
+fn agent_reads_on_prod_cannot_write_through_functions() {
+    let f = Fixture::new("postgres", "SIESTA_TEST_PG_URL");
+    for sql in [
+        "DROP TABLE IF EXISTS siesta_canary CASCADE",
+        "CREATE TABLE siesta_canary(v int)",
+        "INSERT INTO siesta_canary VALUES (1)",
+        "CREATE OR REPLACE FUNCTION siesta_purge() RETURNS int LANGUAGE sql AS 'DELETE FROM siesta_canary RETURNING 1'",
+    ] {
+        assert_eq!(f.go(&["exec", "-c", "c", sql]).0, 0, "{sql}");
+    }
+    unsafe { std::env::set_var("SIESTA_MCP", "1") };
+    let purge = f.json(&["exec", "-c", "prod-c", "SELECT siesta_purge()", "--output", "json"]);
+    // A batch: the UPDATE writes, the read after it is read-only again.
+    let batch = f.json(&["exec", "-c", "prod-c", "UPDATE siesta_canary SET v = 2 WHERE v = 1; SELECT siesta_purge()", "--output", "json"]);
+    unsafe { std::env::remove_var("SIESTA_MCP") };
+    assert_eq!(purge.0, 5, "{}", purge.1);
+    assert_eq!(purge.1["error"]["sqlstate"], "25006", "{}", purge.1);
+    assert_eq!((batch.0, &batch.1[0]["rows_affected"], &batch.1[1]["error"]["sqlstate"]), (5, &json!(1), &json!("25006")), "{}", batch.1);
+    let (_, left) = f.json(&["exec", "-c", "c", "SELECT count(*) AS n, sum(v) AS s FROM siesta_canary", "--output", "json"]);
+    assert_eq!(left["rows"][0], json!([1, 2]), "{left}");
+    f.go(&["exec", "-c", "c", "DROP TABLE siesta_canary CASCADE"]);
+}
+
 #[test]
 #[ignore = "needs docker: scripts/test-db.sh"]
 fn wrong_driver_fails_fast_with_exit_2() {

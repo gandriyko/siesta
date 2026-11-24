@@ -541,6 +541,9 @@ pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().find_map(es::read_only_violation);
     }
+    if let Some(m) = executable_comment(text, dialect) {
+        return Some(format!("Read-only connection: {m}"));
+    }
     split_words(text, dialect, true).1.iter().find_map(|w| {
         let &(_, first) = w.first()?;
         if classify(w) != Kind::Other {
@@ -572,6 +575,9 @@ pub fn prod_agent_violation(text: &str, dialect: Dialect) -> Option<String> {
     if dialect == Dialect::Elastic {
         return es::requests(text).iter().find_map(es::prod_agent_violation);
     }
+    if let Some(m) = executable_comment(text, dialect) {
+        return Some(format!("Production connection: {m}"));
+    }
     split_words(text, dialect, true).1.iter().find_map(|w| {
         let &(_, first) = w.first()?;
         if classify(w) != Kind::Other {
@@ -583,6 +589,14 @@ pub fn prod_agent_violation(text: &str, dialect: Dialect) -> Option<String> {
         }
         Some(format!("Production connection: {} is not allowed; only reads and UPDATE … WHERE.", first.to_ascii_uppercase()))
     })
+}
+
+/// MySQL / MariaDB run the text of `/*! … */` and `/*M! … */` as code, while the lexer here skips
+/// it as a comment: the safety checks would not see a statement hidden there.
+// ponytail: also catches `/*!` inside a string literal (a false refusal, never a miss).
+fn executable_comment(text: &str, dialect: Dialect) -> Option<String> {
+    (dialect == Dialect::MySql && (text.contains("/*!") || text.contains("/*M!") || text.contains("/*m!")))
+        .then(|| "executable comments (/*! … */) are not allowed: the checks can't see the code inside.".into())
 }
 
 /// What the top level of a SELECT-like statement has, for the page wrapper.
@@ -732,6 +746,13 @@ mod tests {
             assert_eq!(read_only_violation(sql, d).is_none(), want, "{sql}");
         }
         assert_eq!(read_only_violation("update t set a = 1", PG).unwrap(), "Read-only connection: UPDATE is not allowed.");
+        // MySQL runs executable comments; the lexer skips them, so the checks refuse them.
+        for sql in ["SELECT 1 /*! ; DELETE FROM t */", "SHOW TABLES /*!50000 ; DROP TABLE t */", "SELECT 1 /*M! ; DELETE FROM t */"] {
+            assert!(read_only_violation(sql, MY).unwrap().contains("executable comments"), "{sql}");
+            assert!(prod_agent_violation(sql, MY).unwrap().contains("executable comments"), "{sql}");
+        }
+        assert!(read_only_violation("SELECT 1 /* plain */", MY).is_none());
+        assert!(read_only_violation("SELECT 1 /*! not mysql */", PG).is_none());
     }
 
     fn texts(src: &str, d: Dialect) -> Vec<&str> {

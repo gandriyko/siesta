@@ -261,6 +261,9 @@ pub struct Session {
     /// Wanted statement timeout; `timeout_applied` is what the server has.
     timeout_ms: Option<u64>,
     timeout_applied: Option<u64>,
+    /// [`set_read_only`](Self::set_read_only): the session's read-only state set on top of the
+    /// connection's, kept across a reconnect.
+    ro_wanted: Option<bool>,
     pg_types: HashMap<u32, String>,
     connect_timeout: Duration,
     /// Row cap for statements that cannot be wrapped (default [`MAX_ROWS`]).
@@ -466,6 +469,7 @@ impl Session {
                 mariadb: false,
                 timeout_ms: None,
                 timeout_applied: None,
+                ro_wanted: None,
                 pg_types: HashMap::new(),
                 connect_timeout,
                 max_rows: MAX_ROWS,
@@ -482,6 +486,29 @@ impl Session {
     pub async fn set_statement_timeout(&mut self, ms: Option<u64>) -> Result<(), DbError> {
         self.timeout_ms = ms;
         self.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))
+    }
+
+    /// Makes the server refuse writes in this session (`true`) or allow them again (`false`) for
+    /// the transactions that follow: Postgres `SET SESSION CHARACTERISTICS AS TRANSACTION …`, MySQL
+    /// `SET SESSION TRANSACTION …`; nothing for Elasticsearch. A function that writes inside a
+    /// `SELECT` then fails on the server. Re-applied after a reconnect.
+    pub async fn set_read_only(&mut self, on: bool) -> Result<(), DbError> {
+        if self.ro_wanted == Some(on) {
+            return Ok(());
+        }
+        self.ro_wanted = Some(on);
+        self.apply_read_only().await.map_err(|e| DbError::from_sqlx(e, 0, 0))
+    }
+
+    async fn apply_read_only(&mut self) -> SqlxResult<()> {
+        let Some(on) = self.ro_wanted else { return Ok(()) };
+        let mode = if on { "READ ONLY" } else { "READ WRITE" };
+        let sql = match self.conn {
+            Conn::Pg(_) => format!("SET SESSION CHARACTERISTICS AS TRANSACTION {mode}"),
+            Conn::My(_) => format!("SET SESSION TRANSACTION {mode}"),
+            Conn::Es(_) => return Ok(()),
+        };
+        self.simple(&sql).await
     }
 
     async fn apply_timeout(&mut self) -> SqlxResult<()> {
@@ -594,6 +621,9 @@ impl Session {
         new.max_rows = self.max_rows;
         new.timeout_ms = self.timeout_ms;
         new.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
+        // A read retried after the reconnect must not run in a writable session.
+        new.ro_wanted = self.ro_wanted;
+        new.apply_read_only().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
         *shared.lock().unwrap() = new.target.lock().unwrap().clone();
         new.target = shared;
         *self = new;
