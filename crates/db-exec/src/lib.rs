@@ -267,7 +267,7 @@ pub struct Session {
     timeout_ms: Option<u64>,
     timeout_applied: Option<u64>,
     /// [`set_read_only`](Self::set_read_only): the session's read-only state set on top of the
-    /// connection's, kept across a reconnect.
+    /// connection's, kept across a reconnect; applied by [`guard`](Self::guard).
     ro_wanted: Option<bool>,
     pg_types: HashMap<u32, String>,
     connect_timeout: Duration,
@@ -500,27 +500,44 @@ impl Session {
         self.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))
     }
 
-    /// Makes the server refuse writes in this session (`true`) or allow them again (`false`) for
-    /// the transactions that follow: Postgres `SET SESSION CHARACTERISTICS AS TRANSACTION …`, MySQL
-    /// `SET SESSION TRANSACTION …`; nothing for Elasticsearch. A function that writes inside a
-    /// `SELECT` then fails on the server. Re-applied after a reconnect.
-    pub async fn set_read_only(&mut self, on: bool) -> Result<(), DbError> {
-        if self.ro_wanted == Some(on) {
-            return Ok(());
-        }
+    /// Makes the server refuse writes (`true`) or allow them (`false`) for the statements that
+    /// follow; [`guard`](Self::guard) applies it before each one. A function that writes inside a
+    /// `SELECT` then fails on the server. Nothing for Elasticsearch / MongoDB.
+    pub fn set_read_only(&mut self, on: bool) {
         self.ro_wanted = Some(on);
-        self.apply_read_only().await.map_err(|e| DbError::from_sqlx(e, 0, 0))
     }
 
-    async fn apply_read_only(&mut self) -> SqlxResult<()> {
-        let Some(on) = self.ro_wanted else { return Ok(()) };
+    /// Before every statement of a guarded session (`read_only`, or [`set_read_only`](Self::set_read_only)):
+    /// the read-only state again, since a statement the text checks let through can lift it
+    /// (`SET U&"…"`, `set_config('default_transaction_' || 'read_only', …)`); and the server must
+    /// read string literals as the checks' lexer does, or `'x\'' …; DELETE …` hides a statement
+    /// (Postgres `standard_conforming_strings = off`, MySQL `NO_BACKSLASH_ESCAPES` / `ANSI_QUOTES`).
+    /// Skipped for `COMMIT` / `ROLLBACK`: a failed Postgres transaction accepts nothing else, and
+    /// the next statement's guard undoes whatever that transaction set.
+    async fn guard(&mut self, sql: &str) -> Result<(), DbError> {
+        let Some(on) = (if self.spec.read_only { Some(true) } else { self.ro_wanted }) else { return Ok(()) };
+        let file = sql_split::split(sql, self.dialect());
+        let first = file.statements.first().and_then(|s| s.text(sql).split(|c: char| !c.is_ascii_alphabetic()).next()).unwrap_or("");
+        if ["commit", "rollback", "end", "abort"].iter().any(|w| first.eq_ignore_ascii_case(w)) {
+            return Ok(());
+        }
         let mode = if on { "READ ONLY" } else { "READ WRITE" };
-        let sql = match self.conn {
-            Conn::Pg(_) => format!("SET SESSION CHARACTERISTICS AS TRANSACTION {mode}"),
-            Conn::My(_) => format!("SET SESSION TRANSACTION {mode}"),
-            Conn::Es(_) | Conn::Mongo(_) => return Ok(()),
-        };
-        self.simple(&sql).await
+        let e = |e| DbError::from_sqlx(e, 0, 0);
+        match &mut self.conn {
+            Conn::Pg(c) => {
+                let set = format!("SET SESSION CHARACTERISTICS AS TRANSACTION {mode}; SET standard_conforming_strings = on");
+                sqlx::raw_sql(AssertSqlSafe(set)).execute(&mut *c).await.map_err(e)?;
+            }
+            Conn::My(c) => {
+                sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION TRANSACTION {mode}"))).execute(&mut *c).await.map_err(e)?;
+                let m: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *c).await.map_err(e)?;
+                if let Some(flag) = mysql_ambiguous(sql, &m) {
+                    return Err(DbError { message: format!("Refused: sql_mode {flag} reads this statement's quotes differently from siesta's checks; run it without `\\` / `\"` in literals or without {flag}"), refused: true, ..Default::default() });
+                }
+            }
+            Conn::Es(_) | Conn::Mongo(_) => {}
+        }
+        Ok(())
     }
 
     async fn apply_timeout(&mut self) -> SqlxResult<()> {
@@ -639,9 +656,8 @@ impl Session {
         new.max_rows = self.max_rows;
         new.timeout_ms = self.timeout_ms;
         new.apply_timeout().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
-        // A read retried after the reconnect must not run in a writable session.
+        // A read retried after the reconnect must not run in a writable session (`guard` applies it).
         new.ro_wanted = self.ro_wanted;
-        new.apply_read_only().await.map_err(|e| DbError::from_sqlx(e, 0, 0))?;
         *shared.lock().unwrap() = new.target.lock().unwrap().clone();
         new.target = shared;
         *self = new;
@@ -719,6 +735,8 @@ impl Session {
         if let Conn::Mongo(m) = &self.conn {
             return m.run(sql, kind, page, self.max_rows, &self.spec).await;
         }
+        // Here, not in `run`: the retry after a reconnect needs it too.
+        self.guard(sql).await?;
         let started = Instant::now();
         let d = self.dialect();
         let mut notices = Vec::new();
@@ -1069,13 +1087,16 @@ pub fn read_only_check(sql: &str, d: Dialect) -> Result<(), DbError> {
 /// `read_only`): `BEGIN` / `START TRANSACTION` / `SET … TRANSACTION` `READ WRITE`,
 /// `SET [default_]transaction_read_only`, `SET SESSION CHARACTERISTICS … READ WRITE`,
 /// `RESET ALL` / `DISCARD ALL`, `set_config('…transaction_read_only', …)`.
+// ponytail: words of the raw text, comments included: `READ /* x */ WRITE` still has both words,
+// and a comment saying "read write" is a false refusal, never a miss.
 pub(crate) fn read_write_switch(sql: &str, d: Dialect) -> bool {
     sql_split::split(sql, d).statements.iter().any(|st| {
         let text = st.text(sql).to_ascii_lowercase();
         let w: Vec<&str> = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
         let has = |x: &str| w.contains(&x);
-        let read_write = w.windows(2).any(|p| p == ["read", "write"]);
-        let ro_var = has("transaction_read_only") || has("default_transaction_read_only") || has("tx_read_only");
+        let read_write = has("read") && has("write");
+        // A name spelled with `U&"…"` escapes (`transaction\005fread\005fonly`) hides from `has`.
+        let ro_var = has("transaction_read_only") || has("default_transaction_read_only") || has("tx_read_only") || text.contains("u&\"");
         match w.first().copied() {
             Some("begin" | "start") => read_write,
             Some("set") => read_write || ro_var,
@@ -1085,6 +1106,19 @@ pub(crate) fn read_write_switch(sql: &str, d: Dialect) -> bool {
             _ => false,
         }
     })
+}
+
+/// The `sql_mode` flag under which MySQL splits `sql` differently from siesta's lexer (backslash
+/// escapes in strings, `"` as a string): `NO_BACKSLASH_ESCAPES` with a `\`, `ANSI_QUOTES` with a `"`.
+fn mysql_ambiguous(sql: &str, sql_mode: &str) -> Option<&'static str> {
+    let on = |f: &str| sql_mode.split(',').any(|m| m.eq_ignore_ascii_case(f));
+    if on("NO_BACKSLASH_ESCAPES") && sql.contains('\\') {
+        Some("NO_BACKSLASH_ESCAPES")
+    } else if on("ANSI_QUOTES") && sql.contains('"') {
+        Some("ANSI_QUOTES")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1127,6 +1161,11 @@ mod tests {
             ("DISCARD ALL", PG, true),
             ("SELECT set_config('default_transaction_read_only', 'off', false)", PG, true),
             ("SELECT 1; BEGIN READ WRITE; DROP TABLE t", PG, true),
+            ("SET SESSION CHARACTERISTICS AS TRANSACTION READ /* x */ WRITE", PG, true),
+            ("BEGIN READ -- x\n WRITE", PG, true),
+            ("SET SESSION TRANSACTION READ /* x */ WRITE", MY, true),
+            (r#"SET U&"default\005ftransaction\005fread\005fonly" = off"#, PG, true),
+            (r#"BEGIN; SET u&"transaction\005fread\005fonly" = off"#, PG, true),
             ("BEGIN", PG, false),
             ("BEGIN READ ONLY", PG, false),
             ("START TRANSACTION READ ONLY", MY, false),

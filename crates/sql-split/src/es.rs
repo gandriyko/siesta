@@ -84,11 +84,22 @@ pub(crate) fn classify(method: &str, path: &str) -> Kind {
     let path = normalize_path(path);
     let segs = segments(&path);
     let m = method.to_ascii_uppercase();
-    if matches!(m.as_str(), "GET" | "POST") && segs.last() == Some(&"_search") {
+    // `[<target>] _api [sub]`: a read endpoint only at its own place. Anywhere else the same word is
+    // a document id (`POST /i/_doc/_search` indexes one, `POST /i/_update/_count` runs a script) or
+    // an index the router takes as a target (`POST /_count/_bulk` is a bulk).
+    let api = if segs.first().is_some_and(|s| !s.starts_with('_')) { &segs[1..] } else { &segs[..] };
+    let targeted = api.len() < segs.len();
+    if matches!(m.as_str(), "GET" | "POST") && api == ["_search"] {
         // The executor pages it with `from` / `size`.
         return Kind::Query;
     }
-    if matches!(m.as_str(), "GET" | "HEAD") || (m == "POST" && segs.iter().any(|s| READ_POST.contains(s))) {
+    let read_post = match api {
+        [one] => READ_POST.contains(one),
+        ["_search", "template" | "scroll"] | ["_msearch", "template"] | ["_validate", "query"] | ["_eql", "search"] | ["_sql", "translate"] | ["_query", "async"] => true,
+        ["_explain", _] => targeted,
+        _ => false,
+    };
+    if matches!(m.as_str(), "GET" | "HEAD") || (m == "POST" && read_post) {
         return Kind::Read;
     }
     Kind::Other
@@ -337,6 +348,15 @@ mod tests {
         assert!(prod_agent_violation("POST /i/_update/1\n{\"doc\": {\"a\": 1}}", ES).is_none());
         for body in ["{\"script\": {\"source\": \"ctx.op = 'delete'\"}}", "{\"doc\": {}, \"doc_as_upsert\": true}", "{\"doc\": {}, \"upsert\": {}}", "{\"scripted_upsert\": true}", "{\"\\u0073cript\": \"ctx.op='delete'\"}"] {
             assert!(prod_agent_violation(&format!("POST /i/_update/1\n{body}"), ES).is_some(), "{body}");
+        }
+        // A read word is a read only at its own place: elsewhere it is a document id or a target.
+        for req in ["POST /_count/_bulk", "POST /_search/_bulk", "POST /i/_doc/_search", "POST /i/_doc/_count", "POST /i/_update/_count\n{\"script\": \"ctx.op = 'delete'\"}", "POST /i/_search/x/_bulk", "POST /_explain/x"] {
+            assert_eq!(split(req).statements[0].kind, Kind::Other, "{req}");
+            assert!(read_only_violation(req, ES).is_some(), "{req}");
+            assert!(prod_agent_violation(req, ES).is_some(), "{req}");
+        }
+        for (req, kind) in [("POST /i/_search/template", Kind::Read), ("POST /_search/scroll", Kind::Read), ("POST /i/_explain/1", Kind::Read), ("POST /_query/async", Kind::Read), ("POST /i/_validate/query", Kind::Read), ("POST _search", Kind::Query)] {
+            assert_eq!(split(req).statements[0].kind, kind, "{req}");
         }
         // An encoded slash is never a read.
         assert_eq!(classify("POST", "/_search%2F..%2Fi%2F_delete_by_query"), Kind::Other);

@@ -494,6 +494,31 @@ async fn read_only_refuses_switching_to_read_write() {
 
 #[tokio::test]
 #[ignore = "needs docker: scripts/test-db.sh"]
+async fn read_only_and_lexer_state_reapplied_before_every_statement() {
+    let mut c = connection(PG);
+    c.read_only = true;
+    let mut s = Session::open(&c).await.unwrap();
+    // Lifts the text check can't spell out are undone before the next statement.
+    run(&mut s, "SELECT set_config('default_transaction_' || 'read_only', 'off', false)").await;
+    assert_eq!(texts(&run(&mut s, "SHOW default_transaction_read_only").await), ["on"]);
+    run(&mut s, "SELECT set_config('standard_conforming_strings', 'off', false)").await;
+    assert_eq!(texts(&run(&mut s, "SHOW standard_conforming_strings").await), ["on"]);
+    // A failed transaction still ends: COMMIT / ROLLBACK skip the guard.
+    run(&mut s, "BEGIN").await;
+    assert!(try_run(&mut s, "SELECT 1/0").await.is_err());
+    run(&mut s, "ROLLBACK").await;
+    assert_eq!(ints(&run(&mut s, "SELECT 1").await), [1]);
+    // An agent's prod session: read-only for reads, writable for its UPDATE, re-applied each time.
+    let mut p = open_pg().await;
+    p.set_read_only(true);
+    run(&mut p, "SELECT set_config('default_transaction_read_only', 'off', false)").await;
+    assert_eq!(texts(&run(&mut p, "SHOW transaction_read_only").await), ["on"]);
+    p.set_read_only(false);
+    assert_eq!(texts(&run(&mut p, "SHOW transaction_read_only").await), ["off"]);
+}
+
+#[tokio::test]
+#[ignore = "needs docker: scripts/test-db.sh"]
 async fn statement_timeout_survives_a_reconnect_and_cancel_follows_it() {
     let mut s = open_pg().await;
     s.set_statement_timeout(Some(1500)).await.unwrap();

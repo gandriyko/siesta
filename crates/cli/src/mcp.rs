@@ -165,9 +165,9 @@ fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> 
     let str_of = |k: &str| a.get(k).and_then(Value::as_str).map(String::from);
     let mut v: Vec<String> = vec![];
     let opt = |v: &mut Vec<String>, k: &str, flag: &str| {
+        // One `--flag=value` argument: a value starting with `-` stays a value, never a flag.
         if let Some(x) = a.get(k).filter(|x| !x.is_null()) {
-            v.push(flag.into());
-            v.push(x.as_str().map_or_else(|| x.to_string(), String::from));
+            v.push(format!("{flag}={}", x.as_str().map_or_else(|| x.to_string(), String::from)));
         }
     };
     let conn = |v: &mut Vec<String>| {
@@ -210,8 +210,13 @@ fn argv(name: &str, a: &Value) -> Result<(Vec<String>, Option<String>), String> 
                 (None, Some(file)) => {
                     query_file(&file)?;
                     v.extend(["run".into(), file]);
-                    let sts = a.get("statements").and_then(Value::as_array);
-                    v.extend(sts.into_iter().flatten().filter_map(|s| s.as_str().map(String::from)));
+                    // Only `@name`, `:LINE`, `#N`: anything else (`--yes`) would reach the CLI as a flag.
+                    for s in a.get("statements").and_then(Value::as_array).into_iter().flatten() {
+                        match s.as_str() {
+                            Some(s) if s.starts_with(['@', ':', '#']) => v.push(s.into()),
+                            _ => return Err(format!("statement {s} is not @name, :LINE or #N")),
+                        }
+                    }
                 }
                 _ => return Err("give exactly one of 'sql' or 'file'".into()),
             }
@@ -274,11 +279,14 @@ mod tests {
             assert!(argv(n, &json!({"sql": "SELECT 1"})).is_ok(), "{n}");
         }
         let (v, input) = argv("run_sql", &json!({"sql": "-- x\nSELECT 1", "connection": "dev", "max_rows": 5})).unwrap();
-        assert_eq!(v.join(" "), "exec - --connection dev --max-rows 5 --output json");
+        assert_eq!(v.join(" "), "exec - --connection=dev --max-rows=5 --output json");
         assert_eq!(input.as_deref(), Some("-- x\nSELECT 1"));
         let (v, _) = argv("run_sql", &json!({"file": "a.sql", "statements": ["@users", ":3"]})).unwrap();
         assert_eq!(v.join(" "), "run a.sql @users :3 --output json");
         assert!(!v.contains(&"--yes".to_string()));
+        // No flag gets in through a value: `--yes` would skip confirmations.
+        assert!(argv("run_sql", &json!({"file": "a.sql", "statements": ["--yes"]})).is_err());
+        assert_eq!(argv("run_sql", &json!({"sql": "x", "connection": "--yes"})).unwrap().0[2], "--connection=--yes");
         assert!(argv("run_sql", &json!({})).is_err());
         assert!(argv("run_sql", &json!({"sql": "x", "file": "a.sql"})).is_err());
         assert_eq!(argv("schema", &json!({"table": "t", "ddl": true})).unwrap().0.join(" "), "schema t --ddl --output json");
