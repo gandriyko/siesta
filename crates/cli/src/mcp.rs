@@ -99,10 +99,12 @@ fn handle(msg: &Value, on_spawn: &dyn Fn(u32)) -> Option<Value> {
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "siesta", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Query Postgres / MySQL databases through Siesta connections. Start with `connections`, \
-                then `schema` to see tables and columns before writing SQL. `run_sql` can write, except on `read_only` \
-                connections; on a `prod` connection only reads and `UPDATE … WHERE` run. Anything refused (exit 4) is \
-                for the user to run.",
+            "instructions": "Query Postgres / MySQL databases and Elasticsearch clusters through Siesta connections. Start with \
+                `connections` (its `driver` tells SQL from `elasticsearch`), then `schema` to see tables and columns (Elasticsearch: \
+                indices and mapping fields) before writing a query. On an Elasticsearch connection `run_sql` takes Kibana console \
+                requests instead of SQL: a `METHOD /path` line, then a JSON body. `run_sql` can write, except on `read_only` \
+                connections; on a `prod` connection only reads and `UPDATE … WHERE` (Elasticsearch: `POST <index>/_update/<id>`) \
+                run. Anything refused (exit 4) is for the user to run.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -138,7 +140,7 @@ fn call(name: &str, args: &Value, on_spawn: &dyn Fn(u32)) -> Result<Value, (i64,
         text += &format!("\n\nstderr:\n{}", err.trim_end());
     }
     if code != 0 {
-        text += &format!("\n\nexit code {code} (2 connection error · 3 bad input · 4 refused: read-only connection or needs confirmation, ask the user · 5 SQL error)");
+        text += &format!("\n\nexit code {code} (2 connection error · 3 bad input · 4 refused: read-only connection or needs confirmation, ask the user · 5 SQL / Elasticsearch error)");
     }
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": code != 0}))
 }
@@ -211,17 +213,19 @@ fn tools() -> Value {
     };
     json!([
         tool("connections", "Every connection: name, driver, host, database, user, read_only, prod; secrets masked.", json!({}), &[], true),
-        tool("list_statements", "Statements of a .sql file or every .sql file under a directory: file, line, name, first line, kind.",
+        tool("list_statements", "Statements of a .sql / .es file or every such file under a directory: file, line, name, first line, kind.",
             json!({"path": s("File or directory (default: current directory)")}), &[], true),
-        tool("schema", "Tables and views with columns and indexes of a connection; one table with `table`, its CREATE statement with `ddl`.",
+        tool("schema", "Tables and views with columns and indexes of a connection (Elasticsearch: indices with their mapping fields); one table with `table`, its CREATE statement with `ddl` (Elasticsearch: `PUT /index` with the mapping).",
             json!({"table": s("`table` or `schema.table`; none = every table and view"), "connection": connection, "database": database,
                    "ddl": json!({"type": "boolean", "description": "Return the table's CREATE statement"})}), &[], true),
-        tool("run_sql", "Run SQL and return siesta.run/v1 JSON per statement (columns, rows, rows_truncated, rows_affected, duration_ms). \
-            Give `sql` (with `connection`) or a `file` (with optional `statements`). Refused with exit 4 before anything runs: \
+        tool("run_sql", "Run SQL (or Elasticsearch requests) and return siesta.run/v1 JSON per statement (columns, rows, rows_truncated, rows_affected, duration_ms). \
+            Give `sql` (with `connection`) or a `file` (with optional `statements`). On an Elasticsearch connection `sql` holds \
+            requests in Kibana console format (`GET /index/_search` then a JSON body); search hits come back as rows (`_id` + `_source` fields), \
+            other responses as one `response` JSON cell. Refused with exit 4 before anything runs: \
             writes on a `read_only` connection; on a `prod` connection everything but reads and `UPDATE` with a `WHERE` \
-            (DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
+            (Elasticsearch: `POST <index>/_update/<id>`; DELETE, INSERT, DROP, TRUNCATE, ALTER…: `prod_refused`); statements that need confirmation (`-- @confirm`, \
             destructive ones when `run.confirm_destructive` is `always`) — ask the user to run those.",
-            json!({"sql": s("SQL text, one or several statements"), "file": s("A .sql file to run instead of `sql`"),
+            json!({"sql": s("SQL text, or Elasticsearch requests on an Elasticsearch connection; one or several statements"), "file": s("A .sql / .es file to run instead of `sql`"),
                    "statements": json!({"type": "array", "items": {"type": "string"}, "description": "Statements of `file`: `@name`, `:LINE` or `#N`; none = all"}),
                    "connection": connection, "database": database,
                    "max_rows": json!({"type": "integer", "description": "Rows per statement (default 100; 0 = the results.max_rows cap)"})}),

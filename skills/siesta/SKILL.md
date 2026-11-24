@@ -87,7 +87,7 @@ SIGINT (<kbd>Ctrl</kbd> <kbd>C</kbd>) or SIGTERM while a statement runs cancels 
 `siesta mcp` serves the commands as MCP tools over stdio, for clients without a shell:
 `connections`, `schema` (`table`, `connection`, `database`, `ddl`), `list_statements` (`path`) and
 `run_sql` — `sql` (as `exec`) or `file` with `statements` (as `run`), plus `connection`, `database`,
-`max_rows`. Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
+`max_rows`. On an Elasticsearch connection `run_sql`'s `sql` holds `.es` requests (see below). Each tool returns the command's JSON output; a non-zero exit code sets `isError` and is
 appended to the text. A cancelled tool call (the client's `notifications/cancelled`, e.g. <kbd>Esc</kbd>
 in Claude Code) cancels its statement on the server and gets no reply. `run_sql` never passes `--yes` and cannot answer a prompt. Refused with `4`
 before anything runs — ask the user to run these:
