@@ -1027,7 +1027,8 @@ impl Siesta {
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_filters(window, cx))),
                 )
                 .child(Button::new("copy-result").icon(IconName::Copy).ghost().xsmall().tooltip("Copy the page as TSV").on_click(cx.listener(|this, _, window, cx| this.copy_result(window, cx))));
-            if done.as_ref().is_some_and(|d| d.kind == Kind::Query) {
+            // Elasticsearch documents change through requests, not cell edits.
+            if done.as_ref().is_some_and(|d| d.kind == Kind::Query && d.driver != db_conn::Driver::Elastic) {
                 let editing = self.shown_edit(cx).is_some();
                 actions = actions.child(
                     Button::new("edit-result")
@@ -1041,8 +1042,9 @@ impl Siesta {
                 );
             }
         }
-        if done.is_some() {
-            actions = actions.child(Button::new("page-sql").label("Show page SQL").ghost().xsmall().on_click(cx.listener(|this, _, _, cx| {
+        if let Some(d) = &done {
+            let label = if d.driver == db_conn::Driver::Elastic { "Show page request" } else { "Show page SQL" };
+            actions = actions.child(Button::new("page-sql").label(label).ghost().xsmall().on_click(cx.listener(|this, _, _, cx| {
                 if let Some(e) = this.shown_key(cx).and_then(|k| this.store.entries.get_mut(&k)) {
                     e.tab = Tab::Query;
                 }

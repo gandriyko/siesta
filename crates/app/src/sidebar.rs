@@ -518,7 +518,7 @@ impl Siesta {
             self.emit_file(&f, 0, query, true, &mut found);
         }
         if found.is_empty() && query.is_empty() {
-            rows.push(Row::Note { text: "+ adds .sql files from anywhere", depth: 0 });
+            rows.push(Row::Note { text: "+ adds .sql / .es files from anywhere", depth: 0 });
         }
         rows.extend(found);
         rows
