@@ -2,6 +2,8 @@
 
 # Desktop app
 
+<img src="screenshot.png" width="900" alt="Siesta: the sidebar with query files, a Postgres query in the editor, its rows in the result table">
+
 ## The window
 
 | Part | What it does |

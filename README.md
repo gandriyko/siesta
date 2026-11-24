@@ -17,7 +17,7 @@ Write a statement, press <kbd>⌘</kbd> <kbd>Enter</kbd>, read the result. No pr
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](Cargo.toml)
 
-<img src="docs/screenshot.png" width="900" alt="Siesta: statement tree, .sql editor, connection and database pickers, result panel">
+<img src="docs/screenshot.png" width="900" alt="Siesta: .sql, .es and .mongodb.js files in the sidebar, a Postgres query in the editor, its rows in the result table">
 
 </div>
 
