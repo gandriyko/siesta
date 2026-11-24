@@ -7,7 +7,7 @@
 use std::ops::Range;
 
 mod es;
-pub use es::{Request as EsRequest, request as es_request};
+pub use es::{Request as EsRequest, kind as es_kind, normalize_path as es_normalize_path, request as es_request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dialect {

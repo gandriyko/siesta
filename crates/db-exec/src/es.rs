@@ -136,6 +136,12 @@ impl Es {
         let started = Instant::now();
         let r = sql_split::es_request(text).ok_or_else(|| DbError::msg("Not a request: the first line must be METHOD /path"))?;
         let path = cat_as_json(&r.path);
+        // The safety checks classified the written text; refuse if the URL the client really sends
+        // is another kind of request (any path trick the normalization missed).
+        let url = reqwest::Url::parse(&format!("{}{path}", self.base)).map_err(|e| DbError::msg(format!("invalid path {path}: {e}")))?;
+        if sql_split::es_kind(&r.method, url.path()) != kind {
+            return Err(DbError { message: format!("Refused: {} {path} is sent as {}, another kind of request than it reads as", r.method, url.path()), refused: true, ..Default::default() });
+        }
         let paged = if kind == Kind::Query { paged_body(&r.body, page) } else { None };
         let body = paged.clone().unwrap_or_else(|| r.body.clone());
         let (status, resp) = self.send(&r.method, &path, &body).await?;

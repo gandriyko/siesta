@@ -29,8 +29,33 @@ pub fn request(text: &str) -> Option<Request> {
     let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
     let (method, path) = request_line(first)?;
     let body: Vec<&str> = rest.lines().filter(|l| !is_comment(l)).collect();
-    let path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
-    Some(Request { method: method.to_ascii_uppercase(), path, body: triple_quotes(body.join("\n").trim()) })
+    Some(Request { method: method.to_ascii_uppercase(), path: normalize_path(path), body: triple_quotes(body.join("\n").trim()) })
+}
+
+/// The path as the HTTP client sends it (WHATWG URL rules for `http`): `\` is `/`, `.` / `..`
+/// segments (also `%2e`) are resolved. Classification must see this path, not the written one:
+/// `POST /_search/../i/_delete_by_query` reaches `/i/_delete_by_query`.
+pub fn normalize_path(path: &str) -> String {
+    let at = path.find(['?', '#']).unwrap_or(path.len());
+    let (p, suffix) = path.split_at(at);
+    let p = p.replace('\\', "/");
+    let mut out: Vec<&str> = Vec::new();
+    for s in p.trim_start_matches('/').split('/') {
+        match s.to_ascii_lowercase().replace("%2e", ".").as_str() {
+            "." => {}
+            ".." => {
+                out.pop();
+            }
+            _ => out.push(s),
+        }
+    }
+    format!("/{}{suffix}", out.join("/"))
+}
+
+/// The kind of a request by method and path, as [`crate::split`] gives it; the executor checks
+/// the URL it really sends with it.
+pub fn kind(method: &str, path: &str) -> Kind {
+    classify(method, path)
 }
 
 /// `METHOD path` at the start of a line (indentation allowed).
@@ -51,7 +76,13 @@ fn segments(path: &str) -> Vec<&str> {
 }
 
 pub(crate) fn classify(method: &str, path: &str) -> Kind {
-    let segs = segments(path);
+    let lower = path.to_ascii_lowercase();
+    // An encoded `/` or `\` could split differently on the server: never a read.
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return Kind::Other;
+    }
+    let path = normalize_path(path);
+    let segs = segments(&path);
     let m = method.to_ascii_uppercase();
     if matches!(m.as_str(), "GET" | "POST") && segs.last() == Some(&"_search") {
         // The executor pages it with `from` / `size`.
@@ -278,6 +309,28 @@ mod tests {
             assert_eq!(prod_agent_violation(req, ES).is_none(), agent_prod_ok, "{req}");
         }
         assert_eq!(read_only_violation("GET /a\nDELETE /a", ES).unwrap(), "Read-only connection: DELETE /a is not allowed.");
+    }
+
+    #[test]
+    fn path_tricks_are_classified_as_sent() {
+        // The HTTP client resolves dot segments and `\`: the checks must see the same path.
+        for (req, sent) in [
+            ("POST /_search/../i/_delete_by_query", "/i/_delete_by_query"),
+            ("POST /_search/%2e%2e/i/_delete_by_query", "/i/_delete_by_query"),
+            ("POST /_count/./../../i/_bulk?x=_search", "/i/_bulk?x=_search"),
+            ("POST /_search\\..\\i\\_update_by_query", "/i/_update_by_query"),
+            ("POST /i/_update/1/../../../j/_delete_by_query", "/j/_delete_by_query"),
+        ] {
+            assert_eq!(request(req).unwrap().path, sent, "{req}");
+            assert_eq!(split(req).statements[0].kind, Kind::Other, "{req}");
+            assert!(read_only_violation(req, ES).is_some(), "{req}");
+            assert!(prod_agent_violation(req, ES).is_some(), "{req}");
+        }
+        // An encoded slash is never a read.
+        assert_eq!(classify("POST", "/_search%2F..%2Fi%2F_delete_by_query"), Kind::Other);
+        // Ordinary paths are untouched.
+        assert_eq!(normalize_path("/a,b/_search?q=x/../y"), "/a,b/_search?q=x/../y");
+        assert_eq!(normalize_path("_cat/indices"), "/_cat/indices");
     }
 
     #[test]
