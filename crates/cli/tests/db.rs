@@ -51,6 +51,8 @@ impl Fixture {
 }
 
 fn scenario(f: &Fixture, sql_error_state: &str) {
+    // A person's CLI: run from a Claude Code shell, the agent rules would answer instead.
+    unsafe { std::env::remove_var("CLAUDECODE") };
     fn with<'a>(a: &[&'a str]) -> Vec<&'a str> {
         [a, &["--output", "json"]].concat()
     }

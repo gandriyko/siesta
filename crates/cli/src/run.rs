@@ -224,7 +224,7 @@ fn ask(question: &str) -> bool {
 /// Runs before anything executes, so a refusal never leaves a half-run batch.
 fn confirm(env: &Env, conn: &Connection, jobs: &[Job], file: Option<&Path>, yes: bool, agent_on_prod: bool) -> Result<(), CliError> {
     let policy = env.settings.run.confirm_destructive;
-    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let interactive = !agent() && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     for j in jobs {
         // `prod` connections confirm every non-read statement; the policy only matters elsewhere
         // (`prod` in the policy means that same flag, so it adds nothing for the others).
@@ -275,6 +275,15 @@ fn agent_on_mcp() -> bool {
     std::env::var_os(crate::mcp::AGENT_ENV).is_some()
 }
 
+/// An agent runs this process: `siesta mcp`, or a Claude Code shell (`CLAUDECODE`). It gets the MCP
+/// rules there too: on prod only reads and `UPDATE … WHERE`, and nobody answers a confirmation for
+/// it — not `--yes`, not a terminal faked with `script`, which made `--yes` pass on prod.
+// ponytail: one agent's variable; `env -u CLAUDECODE` is a deliberate way around it, which only a
+// read-only database user stops.
+fn agent() -> bool {
+    agent_on_mcp() || std::env::var_os("CLAUDECODE").is_some()
+}
+
 /// Effective row limit: the flag (default 100), never above `results.max_rows`.
 pub(crate) fn row_limit(flag: Option<usize>, hard: usize) -> usize {
     let hard = hard.max(1);
@@ -306,7 +315,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
     }
     // An agent (MCP) on prod: reads and `UPDATE … WHERE` only, checked up front like `read_only`;
     // those then need no prod confirmation (nobody could give it), `-- @confirm` still refuses.
-    let agent_on_prod = conn.prod && agent_on_mcp();
+    let agent_on_prod = conn.prod && agent();
     if agent_on_prod {
         for j in &jobs {
             if let Some(m) = sql_split::prod_agent_violation(&j.text, dialect_of(conn.driver)) {
@@ -318,7 +327,7 @@ pub(crate) fn execute(env: &Env, mut conn: Connection, file: Option<&Path>, jobs
             }
         }
     }
-    confirm(env, &conn, &jobs, file, o.yes, agent_on_prod)?;
+    confirm(env, &conn, &jobs, file, o.yes && !agent(), agent_on_prod)?;
     let cap = row_limit(o.max_rows, env.settings.results.max_rows);
     let rt = runtime();
     let mut session = rt.block_on(Session::open_with(&conn, Duration::from_millis(env.settings.run.connect_timeout_ms))).map_err(|e| CliError::new("connection_failed", format!("connection '{}': {e}", conn.name), 2))?;

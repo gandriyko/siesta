@@ -519,8 +519,12 @@ impl Session {
     async fn guard(&mut self, sql: &str) -> Result<(), DbError> {
         let Some(on) = (if self.spec.read_only { Some(true) } else { self.ro_wanted }) else { return Ok(()) };
         let file = sql_split::split(sql, self.dialect());
-        let first = file.statements.first().and_then(|s| s.text(sql).split(|c: char| !c.is_ascii_alphabetic()).next()).unwrap_or("");
-        if ["commit", "rollback", "end", "abort"].iter().any(|w| first.eq_ignore_ascii_case(w)) {
+        let text = file.statements.first().map_or("", |s| s.text(sql));
+        let first = text.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+        // Only a bare one (`ROLLBACK TO SAVEPOINT s`): no literal or comment that a skipped guard
+        // would let the server read differently from the checks.
+        let bare = text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c.is_ascii_whitespace());
+        if bare && ["commit", "rollback", "end", "abort"].iter().any(|w| first.eq_ignore_ascii_case(w)) {
             return Ok(());
         }
         let mode = if on { "READ ONLY" } else { "READ WRITE" };

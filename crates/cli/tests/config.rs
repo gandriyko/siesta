@@ -75,7 +75,13 @@ fn agent_on_prod_runs_only_reads_and_update_where() {
     }
     assert_eq!(code_of("-- @confirm\nUPDATE t SET a = 1 WHERE id = 1"), (4, Some("confirmation_required".into())));
     unsafe { std::env::remove_var("SIESTA_MCP") };
-    // Without MCP the CLI's own rule is unchanged: prod writes need --yes.
+    // A Claude Code shell is an agent too: same rules, and --yes answers nothing for it.
+    unsafe { std::env::set_var("CLAUDECODE", "1") };
+    assert_eq!(code_of("DELETE FROM t WHERE id = 1"), (4, Some("prod_refused".into())));
+    let (code, v, _) = e.go(&["exec", "-c", "live", "--yes", "--output", "json", "--", "-- @confirm\nSELECT 1"]);
+    assert_eq!((code, v["error"]["code"].as_str()), (4, Some("confirmation_required")));
+    unsafe { std::env::remove_var("CLAUDECODE") };
+    // A person's CLI keeps its own rule: prod writes need --yes.
     assert_eq!(code_of("UPDATE t SET a = 1 WHERE id = 1"), (4, Some("confirmation_required".into())));
 }
 

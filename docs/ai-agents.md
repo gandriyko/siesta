@@ -35,7 +35,7 @@ claude mcp get siesta                    # should say Connected
 
 ## What an agent may run
 
-An agent never skips a confirmation. Siesta refuses these before anything runs (exit `4`); the user runs them:
+An agent never skips a confirmation. Siesta refuses these before anything runs (exit `4`); the user runs them. The same rules apply to the CLI run from a Claude Code shell (`CLAUDECODE` set): `--yes` and prompts count for nothing there.
 
 | Connection | The agent runs |
 |---|---|

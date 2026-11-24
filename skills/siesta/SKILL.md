@@ -16,10 +16,10 @@ From an agent, use the CLI only; never launch the GUI.
 - Prefer a read-only connection. Add `--read-only` to anything that must not change data: the
   client refuses writes before sending (and the server session is read-only). Use it for every exploratory query. It is a safety default, not a security
   boundary; a read-only database user is the real protection.
-- Never pass `--yes` on your own. A refused statement (exit `4`) is a question for the user: show them
-  the statement and the connection, and run it with `--yes` only after they agree. On a `prod`
-  connection `--yes` does not work without a terminal (exit `4`, `prod_needs_terminal`): the user runs it
-  themselves in a terminal.
+- A refused statement (exit `4`) is a question for the user: show them the statement and the
+  connection; they run it themselves. In a Claude Code shell (`CLAUDECODE` set) the CLI applies the
+  same rules as the MCP tools (see MCP below): `--yes` and prompts are ignored, and on a `prod`
+  connection only reads and `UPDATE … WHERE` run.
 - Never write passwords into a connection file; they live only encrypted (`password_enc`, local key in
   `~/.siesta/key`; `siesta connections set-password NAME`, done by the user). Never read or print the key. `siesta connections` shows connections
   with secrets masked and whether a password is set.

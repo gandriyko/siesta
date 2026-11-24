@@ -579,7 +579,8 @@ pub fn read_only_violation(text: &str, dialect: Dialect) -> Option<String> {
         }
         let second = w.get(1).map_or("", |&(_, s)| s);
         let ok = match first.to_ascii_lowercase().as_str() {
-            "set" => !w.iter().any(|(_, s)| is(s, &["password", "global", "persist", "persist_only"])),
+            // MariaDB `SET STATEMENT … FOR <any statement>` runs the statement after FOR.
+            "set" => !w.iter().any(|(_, s)| is(s, &["password", "global", "persist", "persist_only", "statement"])),
             "start" => is(second, &["transaction"]),
             "reset" | "begin" | "commit" | "rollback" | "end" | "abort" | "savepoint" | "release" | "use" | "listen" | "unlisten" => true,
             _ => false,
@@ -777,6 +778,8 @@ mod tests {
             assert_eq!(read_only_violation(sql, d).is_none(), want, "{sql}");
         }
         assert_eq!(read_only_violation("update t set a = 1", PG).unwrap(), "Read-only connection: UPDATE is not allowed.");
+        assert!(read_only_violation("SET STATEMENT max_statement_time = 1 FOR DELETE FROM t", MY).is_some());
+        assert!(read_only_violation("SET statement_timeout = 1000", PG).is_none());
         // MySQL runs executable comments; the lexer skips them, so the checks refuse them.
         for sql in ["SELECT 1 /*! ; DELETE FROM t */", "SHOW TABLES /*!50000 ; DROP TABLE t */", "SELECT 1 /*M! ; DELETE FROM t */"] {
             assert!(read_only_violation(sql, MY).unwrap().contains("executable comments"), "{sql}");
