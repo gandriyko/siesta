@@ -11,11 +11,16 @@ A desktop SQL client (Postgres, MySQL / MariaDB) in Rust + GPUI where queries ar
 - Native speed: cold start under 300 ms, the first result page shows without noticeable delay beyond the query itself, scrolling does not depend on result size.
 - The connection is always visible at the top right (like the environment picker in Respite).
 
+**MongoDB and Elasticsearch are engines of Siesta, not a third product** (decided 2026-11-24). They are used as databases: connections with `prod` / `read_only`, a tree of databases / indices, documents as a table, the JSON popup, history, CLI and MCP — all of which Siesta already has. A third copy of the Respite shell would cost more than an engine switch inside Siesta. Elasticsearch is not left to Respite because Respite has no object tree, no document table and no `prod` guard. SQL-only parts (wrapper paging, transactions, cell editing by primary key) stay SQL-only; each engine gets its own lexer, execution, paging and safety classification. Each engine keeps the rule "a file runs in the native client unchanged", and the file extension picks the language:
+  - **MongoDB: `.mongodb.js` in `mongosh` syntax** (`db.users.find({…}).sort({…})`, `db.orders.aggregate([…])`), the same as MongoDB playgrounds in VS Code. A hand-written lexer covers the subset Siesta runs (`db.<collection>.<method>(…)` chains, relaxed JSON, `ObjectId()` / `ISODate()`), not JavaScript.
+  - **Elasticsearch: `.es` in Kibana Dev Tools console format** (a `METHOD /path` line, then a JSON body), so a file pastes into Kibana unchanged and covers the whole API, not only what ES SQL can express.
+  - A file whose connection is of another engine is a red picker, not a silent run.
+
 **Siesta deliberately is not:**
 
 - a visual query builder, an ER-diagram tool, a schema-diff or migration tool;
 - a row insert / delete grid (cell editing exists, see below);
-- a client for SQLite, MSSQL, Oracle, ClickHouse or NoSQL (considered later);
+- a client for SQLite, MSSQL, Oracle, ClickHouse or other NoSQL beyond MongoDB and Elasticsearch (considered later);
 - a place where project files configure connections or settings.
 
 ## Shell shared with Respite
@@ -26,7 +31,7 @@ Respite (`/Users/andrew/Projects/respite`) is the reference implementation. Sies
 - **The editor stays plain text:** no CodeLens, no inline statuses in lines. The only button is the gutter ▶ next to the line number. Status lives in the result header and the sidebar tree.
 - **Settings are global only** (`~/.config/siesta/settings.json`, snake_case); there is no per-project layer. The Settings page, `settings.json` and README list the keys; the defaults for shortcuts live in the keymap file, overridable in `keymap.json`.
 - **Two folders, one role each, nothing is written to both.** `~/.config/siesta/` holds only what the user writes (settings, keymap, `connections/`, `collections/`) and can live in dotfiles. `~/.siesta/` holds only what Siesta writes itself (state, added-files list, history, schema cache, password key) and never goes to dotfiles: it contains the key, the full text of executed SQL and database structure. `SIESTA_CONFIG_DIR` / `SIESTA_DATA_DIR` override them (tests, sandboxes). Siesta keeps nothing inside projects.
-- **The sidebar shows only `.sql` files and folders.** COLLECTIONS is the central folder `~/.config/siesta/collections`; FILES lists `.sql` files added from anywhere (added files are only referenced; removing one from the list keeps the file, tab and history). The sidebar file list updates by polling mtimes (files, settings, keymap, connections) once a second.
+- **The sidebar shows only query files (`.sql`, `.mongodb.js`, `.es`) and folders.** COLLECTIONS is the central folder `~/.config/siesta/collections`; FILES lists query files added from anywhere (added files are only referenced; removing one from the list keeps the file, tab and history). The sidebar file list updates by polling mtimes (files, settings, keymap, connections) once a second.
 - **Nothing is ever overwritten.** Import skips existing names, New File only opens an existing file, rename is refused if the target exists (except a case-only rename of the same file), delete goes to the system Trash. A rename is also refused while a transaction is open or a statement runs in an affected tab; after it, tabs, results, history entries and added files follow the new path.
 - **Restore:** open tabs, cursors and the active tab are saved in `state.json`. The connection and database of a file are not in state (see directives).
 - **`siesta [file[:line]]`** opens a file in the GUI; the same binary is the CLI and the MCP server (`siesta mcp`) over one core.
@@ -139,6 +144,8 @@ Data flow: `app` / `cli` → `sql-split` (what to run) → `db-conn` (where) →
 **Phase 2:** MCP server (done); passwords encrypted with a local key (done). Open: SSH tunnel, streamed export of large results and `EXPLAIN` as a tree, query parameters (`:name` / `{{var}}` with a prompt).
 
 **Phase 3:** cell editing with `UPDATE` by primary key (done). Open: SQLite, ClickHouse, MSSQL.
+
+**Phase 4:** MongoDB and Elasticsearch engines: connections, files, execution with paging, safety classification, DB tab, CLI / MCP.
 
 ## Decisions and open questions
 
