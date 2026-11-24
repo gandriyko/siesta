@@ -4,6 +4,8 @@
 
 A `.mongodb.js` file holds mongosh calls, as in a MongoDB playground.
 
+<img src="mongodb.png" width="900" alt="Siesta with a .mongodb.js file: find, aggregate and updateOne statements, the documents of the find in the JSON tab">
+
 ```js
 // @connection mongo-dev
 // @database shop

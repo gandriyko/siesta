@@ -4,6 +4,8 @@
 
 An `.es` file holds requests in the Kibana Dev Tools console format, so it pastes into Kibana unchanged.
 
+<img src="elasticsearch.png" width="900" alt="Siesta with an .es file: a search, an aggregation and an update request, the hits of the search in the JSON tab">
+
 ```
 # @connection es-dev
 
