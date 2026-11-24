@@ -28,6 +28,15 @@ pub fn file_dialect(p: &Path) -> sql_split::Dialect {
     if is_es(p) { sql_split::Dialect::Elastic } else { sql_split::Dialect::default() }
 }
 
+/// Why a file can't run on a connection of dialect `conn`: `.es` needs Elasticsearch, `.sql` needs SQL.
+pub fn mismatch(p: &Path, conn: sql_split::Dialect) -> Option<&'static str> {
+    match (is_es(p), conn == sql_split::Dialect::Elastic) {
+        (true, false) => Some(".es files run on Elasticsearch connections"),
+        (false, true) => Some("Elasticsearch connections run .es files"),
+        _ => None,
+    }
+}
+
 /// Folders and `.sql` files under the central folder `root` (`~/.config/siesta/collections`),
 /// sorted. Folders are listed so that an empty new one shows up. Respects `.gitignore` and skips
 /// hidden entries.

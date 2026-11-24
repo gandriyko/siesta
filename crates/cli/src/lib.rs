@@ -19,7 +19,7 @@ use output::{Format, RED, emit_objects, paint, put, render_csv, render_table};
 use run::{ConnArgs, Env, ExecArgs, RunArgs, dialect_of, kind_name, line_of};
 
 #[derive(Parser)]
-#[command(name = "siesta", version, about = "Lightweight SQL client: Postgres and MySQL / MariaDB")]
+#[command(name = "siesta", version, about = "Lightweight SQL client: Postgres, MySQL / MariaDB and Elasticsearch")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -253,12 +253,12 @@ fn open_session(env: &Env, name: &str, database: Option<&str>) -> Result<(tokio:
     Ok((rt, s, conn))
 }
 
-/// `.sql` files under `path` (respects .gitignore), or `path` itself.
+/// `.sql` and `.es` files under `path` (respects .gitignore), or `path` itself.
 fn sql_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
     }
-    let mut files: Vec<PathBuf> = ignore::Walk::new(path).flatten().map(|e| e.into_path()).filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "sql")).collect();
+    let mut files: Vec<PathBuf> = ignore::Walk::new(path).flatten().map(|e| e.into_path()).filter(|p| p.is_file() && siesta_workspace::is_sql(p)).collect();
     files.sort();
     files
 }
@@ -271,8 +271,11 @@ fn list(path: &Path, format: Format, out: &mut dyn Write) -> Result<u8, CliError
     let mut rows = vec![];
     for f in sql_files(path) {
         let src = std::fs::read_to_string(&f).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&f, None))?;
-        // The dialect comes from the file's `-- @connection`, else Postgres.
-        let dialect = sql_split::split(&src, Dialect::Postgres).connection.and_then(|n| env.conns.connections.get(&n).map(|c| dialect_of(c.driver))).unwrap_or_default();
+        // `.es` is Elastic; a `.sql` file's dialect comes from its `-- @connection`, else Postgres.
+        let dialect = match siesta_workspace::file_dialect(&f) {
+            Dialect::Elastic => Dialect::Elastic,
+            _ => sql_split::split(&src, Dialect::Postgres).connection.and_then(|n| env.conns.connections.get(&n).map(|c| dialect_of(c.driver))).filter(|d| *d != Dialect::Elastic).unwrap_or_default(),
+        };
         let file = sql_split::split(&src, dialect);
         for d in file.diagnostics.iter().filter(|d| d.severity == sql_split::Severity::Error) {
             eprintln!("{} {}:{}: {}", paint("warning:", output::YELLOW, true), f.display(), line_of(&src, d.range.start), d.message);
@@ -306,9 +309,16 @@ fn connections(format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
 fn test_connection(name: &str, format: Format, out: &mut dyn Write) -> Result<u8, CliError> {
     let env = Env::load();
     let started = std::time::Instant::now();
-    let (rt, mut s, _) = open_session(&env, name, None)?;
-    let version = rt.block_on(s.run("SELECT version()", Kind::Query, &Page::default())).map_err(|e| db_error(&e))?;
-    let version = version.rows.first().and_then(|r| r.first()).map(|v| v.display()).unwrap_or_default();
+    let (rt, mut s, conn) = open_session(&env, name, None)?;
+    let es = conn.driver == db_conn::Driver::Elastic;
+    let (query, kind) = if es { ("GET /", Kind::Read) } else { ("SELECT version()", Kind::Query) };
+    let version = rt.block_on(s.run(query, kind, &Page::default())).map_err(|e| db_error(&e))?;
+    let first = version.rows.first().and_then(|r| r.first());
+    let version = match first {
+        // `GET /` answers with the cluster's JSON.
+        Some(db_exec::Value::Json(v)) if es => format!("Elasticsearch {}", v["version"]["number"].as_str().unwrap_or("?")),
+        other => other.map(|v| v.display()).unwrap_or_default(),
+    };
     let ms = started.elapsed().as_millis() as u64;
     rt.block_on(s.close());
     if format.human() {

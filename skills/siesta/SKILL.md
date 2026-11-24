@@ -1,6 +1,6 @@
 ---
 name: siesta
-description: Run SQL against Postgres and MySQL / MariaDB with the Siesta CLI and plain `.sql` files, inspect a database schema (tables, columns, indexes, DDL) before writing queries, and manage connections in `~/.config/siesta/connections/`. Use when the user asks to query a database, check data, explore tables, run or fix a `.sql` file, or set up a database connection, and `siesta` is installed or the project has `.sql` files.
+description: Run SQL against Postgres and MySQL / MariaDB and Elasticsearch requests with the Siesta CLI and plain `.sql` / `.es` files, inspect a database schema (tables, columns, indexes, DDL; Elasticsearch indices and mappings) before writing queries, and manage connections in `~/.config/siesta/connections/`. Use when the user asks to query a database or an Elasticsearch cluster, check data, explore tables or indices, run or fix a `.sql` / `.es` file, or set up a connection, and `siesta` is installed or the project has `.sql` / `.es` files.
 ---
 
 # Siesta: SQL files and a database CLI
@@ -32,7 +32,7 @@ Statements are addressed by `@name`, `:LINE` (any line of the statement) or `#N`
 
 | Command | What it does |
 |---|---|
-| `siesta list [PATH]` | Statements in a `.sql` file or directory: file, line, name, first line, kind |
+| `siesta list [PATH]` | Statements in a `.sql` / `.es` file or directory: file, line, name, first line, kind |
 | `siesta run FILE [STATEMENTS]...` | Run statements of a file (none named = all, in file order) |
 | `siesta exec [SQL]` | Run SQL from the argument, or from stdin when omitted or `-`; may hold several statements |
 | `siesta connections` | Connections of `~/.config/siesta/connections/`, secrets masked, with `password: set` / `none` |
@@ -70,7 +70,7 @@ Exit codes:
 |---|---|
 | `0` | OK |
 | `2` | Connection error: cannot connect, authentication failed, connection lost |
-| `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, bad arguments |
+| `3` | Parse error (unclosed string / comment), unknown connection, statement or table, no connection chosen, a connection of the other kind (`connection_mismatch`: `.es` on SQL, `.sql` on Elasticsearch), bad arguments |
 | `4` | Refused: confirmation needed and `--yes` not given, or a `read_only` connection was asked to run a statement that writes (or switch to read-write) |
 | `5` | SQL error from the server |
 | `130` | A second SIGINT / SIGTERM while the first one's cancel was still waiting for the server |
@@ -169,6 +169,40 @@ DELETE FROM sessions WHERE expires_at < now();
 | `-- @page-size N` | Page size in the GUI; the CLI uses `--max-rows` instead |
 | `-- @confirm` | Always ask before running; the CLI refuses with exit `4` unless `--yes` |
 
+## Elasticsearch (`.es` files)
+
+An `.es` file is Kibana Dev Tools console text: a `METHOD /path` line starts a request, the lines up to the
+next request line are its JSON body (NDJSON for `_bulk` / `_msearch`; Kibana's `"""…"""` strings work).
+Comments are `#` or `//`; directives are the same words with `#`: `# @connection`, `# @name`,
+`# @page-size`, `# @confirm` (`@database` does not apply). A file pastes into Kibana unchanged.
+
+```
+# @connection es-dev
+
+# @name adults
+GET /users/_search
+{ "query": { "range": { "age": { "gte": 18 } } } }
+
+POST /_sql?format=json
+{ "query": "SELECT name, age FROM users ORDER BY age DESC" }
+```
+
+- Results are tables: `_search` hits as rows (`_id`, `_index` when several indices, then the `_source`
+  fields; nested objects stay JSON), `_sql` columns / rows, `_cat/*` lists (Siesta adds `format=json`);
+  any other response is one `response` cell with the whole JSON. `HEAD` gives the `status`.
+- `--max-rows` pages a `_search` with `from` / `size` unless its body sets `size` or `from` itself
+  (aggregations: `"size": 0`, then the response cell holds `aggregations`). `notices` gives the hit total.
+- `exec -c ES_CONNECTION 'GET /_cat/indices'` runs requests too. `schema -c ES_CONNECTION` lists indices as
+  tables with their mapping fields (dotted paths) as columns; `--ddl` prints `PUT /index` with the mapping.
+- Errors: exit `5` with `sqlstate` = Elasticsearch's error type (`index_not_found_exception`) and its `reason`.
+- Kinds: `_search` is a query; `GET`, `HEAD` and reading `POST`s (`_count`, `_msearch`, `_mget`, `_sql`,
+  `_field_caps`, `_validate`, `_explain`, `_analyze`, …) are reads; everything else writes.
+  `read_only` refuses writes on the client only (Elasticsearch has no read-only session).
+  On `prod`, an agent may run reads and `POST <index>/_update/<id>`; nothing else (`prod_refused`).
+  `run.confirm_destructive = always` asks for deleting an index, `_delete_by_query`, `_update_by_query`
+  without a query and `_close`.
+- Ctrl+C drops the request; Elasticsearch may still finish it (bounded by `run.statement_timeout_ms`).
+
 ## Connections
 
 One JSON file per connection in the user's config dir, `~/.config/siesta/connections/NAME.json`
@@ -186,9 +220,15 @@ on stderr, so JSON on stdout stays clean.
 { "driver": "postgres", "host": "localhost", "port": 5432, "database": "app", "user": "app" }
 // ~/.config/siesta/connections/prod-mysql.json
 { "driver": "mysql", "url": "mysql://ro@db.internal:3306/shop", "read_only": true, "prod": true }
+// ~/.config/siesta/connections/es-dev.json
+{ "driver": "elasticsearch", "url": "https://es.internal:9200", "user": "elastic" }
 ```
 
-- Keys: `driver` (`postgres` | `mysql`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
+- Elasticsearch: `driver` `elasticsearch` (or an `http://` / `https://` url), `host` / `port` (9200);
+  `https` when `ssl.mode` is set and not `disable` (`require` skips the certificate check, `ssl.ca` adds a CA).
+  `user` + password is basic auth; a password without `user` is an API key. No `database`, `socket`,
+  `schema` or `init_sql`.
+- Keys: `driver` (`postgres` | `mysql` | `elasticsearch`; MariaDB is `mysql`), or `url`, or `host` / `socket` / `port` / `database`
   (the default database, optional: a file or `-d` can pick any other the credentials can access) / `user`; `ssl` (`mode`, `ca`, `cert`, `key`), `read_only`, `prod` (production: every
   non-read statement needs confirmation in a terminal), `schema` (Postgres `search_path`), `init_sql`, `color`.
   `socket`: `true` connects through the local Unix socket found at connect time (Postgres: a folder with `.s.PGSQL.<port>` among `/tmp`,

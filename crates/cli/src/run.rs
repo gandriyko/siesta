@@ -429,9 +429,12 @@ pub(crate) fn run(a: RunArgs, out: &mut dyn Write) -> Result<u8, CliError> {
     let format = Format::resolve(a.opts.output);
     let src = std::fs::read_to_string(&a.file).map_err(|e| CliError::new("file_not_found", e.to_string(), 3).at(&a.file, None))?;
     let env = Env::load();
-    // The directive is the same in both dialects; the real dialect needs the connection.
-    let top = sql_split::split(&src, Dialect::Postgres);
+    // The directive is the same in both SQL dialects; the real dialect needs the connection.
+    let top = sql_split::split(&src, siesta_workspace::file_dialect(&a.file));
     let conn = env.resolve(a.opts.conn.connection.as_deref(), top.connection.as_deref()).map_err(|e| e.at(&a.file, None))?;
+    if let Some(m) = siesta_workspace::mismatch(&a.file, dialect_of(conn.driver)) {
+        return Err(CliError::new("connection_mismatch", format!("connection '{}' can't run this file: {m}", conn.name), 3).at(&a.file, None));
+    }
     // Flag, else `-- @database`, else the connection's own default.
     let conn = conn.with_database(a.opts.conn.database.as_deref().or(top.database.as_deref()));
     let file = sql_split::split(&src, dialect_of(conn.driver));

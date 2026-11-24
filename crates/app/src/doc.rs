@@ -131,11 +131,7 @@ impl Doc {
     /// The file's connection exists but speaks another language (`.es` on SQL, `.sql` on Elasticsearch).
     pub fn connection_mismatch(&self) -> Option<&'static str> {
         let c = self.conns.connections.get(self.connection()?)?;
-        match (self.dialect == Dialect::Elastic, c.driver == Driver::Elastic) {
-            (true, false) => Some(".es files run on Elasticsearch connections"),
-            (false, true) => Some("Elasticsearch connections run .es files"),
-            _ => None,
-        }
+        siesta_workspace::mismatch(&self.path, dialect_of(c.driver))
     }
 
     /// Split the text again (after an edit or a connection change) and refresh the underlines and
