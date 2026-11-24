@@ -511,7 +511,9 @@ impl Session {
     /// the read-only state again, since a statement the text checks let through can lift it
     /// (`SET U&"…"`, `set_config('default_transaction_' || 'read_only', …)`); and the server must
     /// read string literals as the checks' lexer does, or `'x\'' …; DELETE …` hides a statement
-    /// (Postgres `standard_conforming_strings = off`, MySQL `NO_BACKSLASH_ESCAPES` / `ANSI_QUOTES`).
+    /// (Postgres `standard_conforming_strings = off`, MySQL `NO_BACKSLASH_ESCAPES` / `ANSI_QUOTES`;
+    /// a client encoding like SJIS / GBK takes the `\` of `丁\'` as part of a character). The
+    /// client encoding goes back to UTF-8, which is what siesta sends anyway.
     /// Skipped for `COMMIT` / `ROLLBACK`: a failed Postgres transaction accepts nothing else, and
     /// the next statement's guard undoes whatever that transaction set.
     async fn guard(&mut self, sql: &str) -> Result<(), DbError> {
@@ -525,11 +527,11 @@ impl Session {
         let e = |e| DbError::from_sqlx(e, 0, 0);
         match &mut self.conn {
             Conn::Pg(c) => {
-                let set = format!("SET SESSION CHARACTERISTICS AS TRANSACTION {mode}; SET standard_conforming_strings = on");
+                let set = format!("SET SESSION CHARACTERISTICS AS TRANSACTION {mode}; SET standard_conforming_strings = on; SET client_encoding = 'UTF8'");
                 sqlx::raw_sql(AssertSqlSafe(set)).execute(&mut *c).await.map_err(e)?;
             }
             Conn::My(c) => {
-                sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION TRANSACTION {mode}"))).execute(&mut *c).await.map_err(e)?;
+                sqlx::raw_sql(AssertSqlSafe(format!("SET SESSION TRANSACTION {mode}; SET character_set_client = utf8mb4"))).execute(&mut *c).await.map_err(e)?;
                 let m: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *c).await.map_err(e)?;
                 if let Some(flag) = mysql_ambiguous(sql, &m) {
                     return Err(DbError { message: format!("Refused: sql_mode {flag} reads this statement's quotes differently from siesta's checks; run it without `\\` / `\"` in literals or without {flag}"), refused: true, ..Default::default() });

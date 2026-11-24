@@ -271,7 +271,8 @@ impl<'a> Splitter<'a> {
                 // MySQL: `--` starts a comment only before whitespace or a control char.
                 && (self.pg || b.get(i + 2).is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
             {
-                let end = line_end(b, i);
+                // Postgres ends it at `\r` too: past it the server runs code this lexer would skip.
+                let end = if self.pg { b[i..].iter().position(|&c| c == b'\n' || c == b'\r').map_or(b.len(), |p| i + p) } else { line_end(b, i) };
                 self.directive(i..end);
                 i = end;
                 continue;
@@ -399,8 +400,10 @@ impl<'a> Splitter<'a> {
     fn dollar(&mut self, i: usize) -> usize {
         let b = self.b;
         let mut j = i + 1;
-        if b.get(j).is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_') {
-            while b.get(j).is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_') {
+        // Postgres tags take non-ASCII letters too (`$é$`): read as a lone `$`, the string's text
+        // would look like code here (a `WHERE` that is only text on the server).
+        if b.get(j).is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_' || c >= 0x80) {
+            while b.get(j).is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80) {
                 j += 1;
             }
         }
@@ -1136,6 +1139,10 @@ mod tests {
             ("SELECT 1 INTO x", PG, false),
             ("SET search_path = x", PG, false),
             ("SELECT 1; DROP TABLE t", PG, false),
+            // The lexer reads as the server does: a WHERE inside `$é$…$é$` is text, and `--` ends at `\r`.
+            ("UPDATE t SET a = $é$ WHERE id = 1 $é$", PG, false),
+            ("UPDATE t SET a = 1 --\r, b = 1; DELETE FROM t; SELECT 1\n WHERE true", PG, false),
+            ("UPDATE t SET a = 1 -- note\n WHERE id = 1", PG, true),
         ] {
             assert_eq!(prod_agent_violation(sql, d).is_none(), ok, "{sql}");
         }
