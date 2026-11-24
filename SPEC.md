@@ -130,6 +130,8 @@ Data flow: `app` / `cli` → `sql-split` (what to run) → `db-conn` (where) →
 
 **Driver: `sqlx`.** One API for Postgres and MySQL / MariaDB, pure Rust, rustls. Its missing cancellation is covered by `pg_cancel_backend` / `KILL QUERY` from a separate connection.
 
+**Elasticsearch: `reqwest` inside the same `Session`,** not a separate executor, so sessions, history, cancel, paging and the result panel need no second path; `.es` requests are a `sql-split` dialect for the same reason (one lexer for editor, CLI and safety). Responses become the same `Outcome` tables. Two deliberate gaps: `read_only` is only the client check (the server has no read-only session), and cancel drops the request on the client while the server may finish it (server-side `_tasks/_cancel` when long searches need it).
+
 ### Testing
 
 - `sql-split`: table of cases with `assert_eq!` (strings, comments, `$$`, `DELIMITER`, CRLF), no snapshot libraries (as in Respite).
