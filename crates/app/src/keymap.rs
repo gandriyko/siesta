@@ -57,6 +57,7 @@ fn defaults() -> Vec<Spec> {
         spec("ctrl-space", gpui_component::input::ShowCompletions, Editor),
         spec("alt-up", PrevStatement, Editor),
         spec("alt-down", NextStatement, Editor),
+        spec("shift-alt-f", FormatFile, Editor),
         spec(key("s"), SaveFile, Both),
         spec(key("w"), CloseTab, Both),
         spec("f2", RenameFile, Both),

@@ -269,9 +269,250 @@ pub fn parse_color(s: &str, dark: bool) -> Option<gpui::Hsla> {
     (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(|v| gpui::rgb(v).into())
 }
 
+/// The file with each statement laid out; comments, directives and blank lines between
+/// statements stay as written. SQL goes through `sqlformat` (keyword case kept), except a
+/// statement with a dollar quote (`$$ … $$`, `$tag$`): `sqlformat` rewrites the text inside it.
+/// An `.es` request gets its JSON body indented (an NDJSON or commented body stays); a mongosh
+/// call gets its arguments indented, kept only when it parses to the same call.
+pub fn format_file(text: &str, dialect: Dialect) -> String {
+    let options = sqlformat::FormatOptions {
+        dialect: if dialect == Dialect::Postgres { sqlformat::Dialect::PostgreSql } else { sqlformat::Dialect::Generic },
+        ..Default::default()
+    };
+    let dollar_quote = |s: &str| s.match_indices('$').any(|(i, _)| !s[i + 1..].starts_with(|c: char| c.is_ascii_digit()));
+    let one = |st: &str| -> Option<String> {
+        match dialect {
+            Dialect::Postgres | Dialect::MySql => (!dollar_quote(st)).then(|| sqlformat::format(st, &sqlformat::QueryParams::None, &options).trim().to_string()),
+            Dialect::Elastic => {
+                let (line, body) = st.split_once('\n')?;
+                // One JSON value only: NDJSON (`_bulk`), comments and `"""` stay as written.
+                serde_json::from_str::<serde_json::Value>(body).ok()?;
+                Some(format!("{}\n{}", line.trim_end(), pretty_js(body)?))
+            }
+            Dialect::Mongo => {
+                let new = pretty_js(st)?;
+                (sql_split::mongo_parse(&new).ok()? == sql_split::mongo_parse(st).ok()?).then_some(new)
+            }
+        }
+    };
+    let (mut out, mut at) = (String::with_capacity(text.len()), 0);
+    for st in sql_split::split(text, dialect).statements {
+        let src = st.text(text);
+        out.push_str(&text[at..st.range.start]);
+        out.push_str(&one(src).unwrap_or_else(|| src.to_string()));
+        at = st.range.end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tok<'a> {
+    /// `{ } [ ] ( ) , : ;`
+    Punct(u8),
+    /// A word, number, string or regex literal: written as is.
+    Atom(&'a str),
+    /// `// …` (to the line end) or `/* … */`.
+    Comment(&'a str),
+}
+
+/// JavaScript / JSON literals split into tokens; whitespace only separates atoms. `None` for an
+/// unterminated string, regex or comment.
+fn js_tokens(s: &str) -> Option<Vec<(Tok<'_>, bool)>> {
+    let b = s.as_bytes();
+    // The bool: whitespace came before the token (two atoms keep one space between them).
+    let (mut out, mut i, mut space) = (Vec::new(), 0, false);
+    let close = |from: usize, end: u8| -> Option<usize> {
+        let mut j = from;
+        let mut class = false;
+        while j < b.len() {
+            match b[j] {
+                b'\\' => j += 1,
+                b'[' if end == b'/' => class = true,
+                b']' if end == b'/' => class = false,
+                c if c == end && !class => return Some(j + 1),
+                _ => {}
+            }
+            j += 1;
+        }
+        None
+    };
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        let tok = match c {
+            c if c.is_ascii_whitespace() => {
+                space = true;
+                i += 1;
+                continue;
+            }
+            b'{' | b'}' | b'[' | b']' | b'(' | b')' | b',' | b':' | b';' => {
+                i += 1;
+                Tok::Punct(c)
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i = s[i..].find('\n').map_or(b.len(), |n| i + n);
+                Tok::Comment(s[start..i].trim_end())
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = s[i + 2..].find("*/").map(|n| i + n + 4)?;
+                Tok::Comment(&s[start..i])
+            }
+            // A regex where a value starts: `{re: /a,b/i}`.
+            b'/' if matches!(out.iter().rev().find(|(t, _)| !matches!(t, Tok::Comment(_))), None | Some((Tok::Punct(b'(' | b',' | b':' | b'[' | b'{'), _))) => {
+                i = close(i + 1, b'/')?;
+                while b.get(i).is_some_and(u8::is_ascii_alphabetic) {
+                    i += 1;
+                }
+                Tok::Atom(&s[start..i])
+            }
+            b'"' | b'\'' | b'`' => {
+                i = close(i + 1, c)?;
+                Tok::Atom(&s[start..i])
+            }
+            _ => {
+                while i < b.len() && !b[i].is_ascii_whitespace() && !b"{}[](),:;\"'`".contains(&b[i]) && !s[i..].starts_with("//") && !s[i..].starts_with("/*") {
+                    i += 1;
+                }
+                Tok::Atom(&s[start..i])
+            }
+        };
+        out.push((tok, space));
+        space = false;
+    }
+    Some(out)
+}
+
+/// Objects and arrays that fit this many characters stay on one line.
+const INLINE_WIDTH: usize = 72;
+
+/// JavaScript / JSON literals re-indented by two spaces: an object or array that fits
+/// [`INLINE_WIDTH`] stays on one line (`{ a: 1, b: [1, 2] }`), a longer one gets one entry per
+/// line. Only whitespace outside strings, regexes and comments changes.
+fn pretty_js(s: &str) -> Option<String> {
+    let toks = js_tokens(s)?;
+    // The matching close of each open bracket.
+    let mut close = vec![0; toks.len()];
+    let mut stack = Vec::new();
+    for (i, (t, _)) in toks.iter().enumerate() {
+        match t {
+            Tok::Punct(b'{' | b'[' | b'(') => stack.push(i),
+            Tok::Punct(c @ (b'}' | b']' | b')')) => {
+                let o = stack.pop()?;
+                (toks[o].0 == Tok::Punct(match c { b'}' => b'{', b']' => b'[', _ => b'(' })).then_some(())?;
+                close[o] = i;
+            }
+            _ => {}
+        }
+    }
+    stack.is_empty().then_some(())?;
+    let mut out = String::new();
+    write_js(&toks, &close, 0..toks.len(), None, &mut out, 0);
+    Some(out.trim_end().to_string())
+}
+
+/// Writes `toks[range]`; `broken` is the indent of the enclosing multi-line object or array
+/// (its commas break lines), `None` inside parentheses, at the top or on one line.
+fn write_js(toks: &[(Tok, bool)], close: &[usize], range: std::ops::Range<usize>, broken: Option<usize>, out: &mut String, ind: usize) {
+    let nl = |out: &mut String, ind: usize| {
+        out.truncate(out.trim_end_matches(' ').len());
+        out.push('\n');
+        out.push_str(&"  ".repeat(ind));
+    };
+    let mut k = range.start;
+    while k < range.end {
+        let (t, space) = toks[k];
+        match t {
+            Tok::Punct(o @ (b'{' | b'[')) => {
+                let m = close[k];
+                let mut flat = String::new();
+                let has_comment = toks[k..m].iter().any(|(t, _)| matches!(t, Tok::Comment(_)));
+                if !has_comment {
+                    write_js(toks, close, k + 1..m, None, &mut flat, 0);
+                }
+                let pad = if o == b'{' && !flat.is_empty() { " " } else { "" };
+                let c = if o == b'{' { '}' } else { ']' };
+                if !has_comment && !flat.contains('\n') && flat.len() <= INLINE_WIDTH {
+                    out.push(o as char);
+                    out.push_str(pad);
+                    out.push_str(&flat);
+                    out.push_str(pad);
+                    out.push(c);
+                } else {
+                    out.push(o as char);
+                    nl(out, ind + 1);
+                    write_js(toks, close, k + 1..m, Some(ind + 1), out, ind + 1);
+                    nl(out, ind);
+                    out.push(c);
+                }
+                k = m;
+            }
+            Tok::Punct(b'(') => {
+                out.push('(');
+                write_js(toks, close, k + 1..close[k], None, out, ind);
+                out.push(')');
+                k = close[k];
+            }
+            Tok::Punct(b',') => match broken {
+                Some(i) => {
+                    out.push(',');
+                    nl(out, i);
+                }
+                None => out.push_str(", "),
+            },
+            Tok::Punct(b':') => out.push_str(": "),
+            Tok::Punct(c) => out.push(c as char),
+            Tok::Atom(a) => {
+                if space && k > range.start && matches!(toks[k - 1].0, Tok::Atom(_)) {
+                    out.push(' ');
+                }
+                out.push_str(a);
+            }
+            Tok::Comment(c) => {
+                if !out.is_empty() && !out.ends_with([' ', '\n']) {
+                    out.push(' ');
+                }
+                out.push_str(c);
+                if c.starts_with("//") {
+                    nl(out, broken.unwrap_or(ind));
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_sql_file() {
+        let src = "-- @connection dev\n-- @database app\nselect a, b from t where x = 1 and y in (select id from u);\n\n\n-- name: second\nupdate t set a = 'x;y' where id = $1;\nSELECT $$ a ; b $$, arr[1] FROM t";
+        let out = format_file(src, Dialect::Postgres);
+        assert!(out.starts_with("-- @connection dev\n-- @database app\nselect\n  a,\n  b\nfrom\n  t\nwhere"), "{out}");
+        assert!(out.contains("\n\n\n-- name: second\nupdate\n") && out.contains("id = $1;\nSELECT $$ a ; b $$, arr[1] FROM t"), "{out}");
+        assert_eq!(sql_split::split(&out, Dialect::Postgres).statements.len(), 3);
+        assert_eq!(format_file(&out, Dialect::Postgres), out, "stable");
+    }
+
+    #[test]
+    fn format_es_file() {
+        let src = "# @connection es\nGET /i/_search\n{\"query\":{\"bool\":{\"must\":[{\"match\":{\"name\":\"a, b: {c}\"}},{\"range\":{\"age\":{\"gte\":40,\"lte\":50}}}]}},\"size\":5}\n\nPOST /_bulk\n{\"index\":{}}\n{\"a\":1}\n\nGET /_cat/indices\n";
+        let out = format_file(src, Dialect::Elastic);
+        let want = "# @connection es\nGET /i/_search\n{\n  \"query\": {\n    \"bool\": {\n      \"must\": [\n        { \"match\": { \"name\": \"a, b: {c}\" } },\n        { \"range\": { \"age\": { \"gte\": 40, \"lte\": 50 } } }\n      ]\n    }\n  },\n  \"size\": 5\n}\n\nPOST /_bulk\n{\"index\":{}}\n{\"a\":1}\n\nGET /_cat/indices\n";
+        assert_eq!(out, want);
+        assert_eq!(format_file(&out, Dialect::Elastic), out, "stable");
+    }
+
+    #[test]
+    fn format_mongo_file() {
+        let src = "// @connection m\ndb.users.find({name:'x, y',re:/a,b\\/[/]/i,age:{$gt:40},tags:{$in:['a','b','c','d','e','f','g','h','i','j','k','l']}} , {_id:0})\n  .sort({age:-1}) // newest\n  .limit(5)\n\ndb.users.aggregate([{$match:{a:1}},{$group:{_id:'$b',n:{$sum:1}}}]);\nshow collections\n";
+        let out = format_file(src, Dialect::Mongo);
+        let want = "// @connection m\ndb.users.find({\n  name: 'x, y',\n  re: /a,b\\/[/]/i,\n  age: { $gt: 40 },\n  tags: { $in: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'] }\n}, { _id: 0 }).sort({ age: -1 }) // newest\n.limit(5)\n\ndb.users.aggregate([{ $match: { a: 1 } }, { $group: { _id: '$b', n: { $sum: 1 } } }]);\nshow collections\n";
+        assert_eq!(out, want);
+        assert_eq!(format_file(&out, Dialect::Mongo), out, "stable");
+    }
 
     fn col(n: &str) -> Column {
         Column { name: n.into(), type_name: "text".into() }

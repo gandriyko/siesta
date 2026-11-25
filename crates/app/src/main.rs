@@ -49,7 +49,7 @@ actions!(
     [
         RunStatement, RunAll, RepeatLast, CancelRun, SaveFile, CloseTab, ToggleSidebar, NextTab, OpenSettings, OpenConnections, AddFiles, Import, Quit,
         PickConnection, ToggleResult, ToggleSplit, GoToFile, GoToStatement, GoToWorkspaceStatement, CommandPalette, PrevStatement,
-        NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory, RenameFile,
+        NextStatement, FocusEditor, ToggleFilters, RefreshSchema, ToggleHistory, RenameFile, FormatFile,
         // In the result table ("ResultTable" context) and the value dialog ("ValuePopup").
         CopyCells, OpenCell, OpenRow, NextPage, PrevPage, PopupPrev, PopupNext
     ]
@@ -911,6 +911,30 @@ impl Siesta {
         self.docs[ix].reparse(cx);
     }
 
+    /// The Format button and Shift+Alt+F: formats the selection (Cmd+A first for the whole
+    /// file), or else the statement under the cursor (the one Cmd+Enter runs).
+    fn format_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.current.filter(|&ix| self.docs[ix].sql) else { return };
+        let d = &self.docs[ix];
+        let sel = d.editor.read(cx).selected_range();
+        let range = if sel.is_empty() { d.active_statement().map(|s| s.range.clone()) } else { Some(sel) };
+        if let Some(range) = range {
+            self.format_range(ix, range, window, cx);
+        }
+    }
+
+    /// Lays out the statements in `range` of doc `ix` with `format::format_file`, as one
+    /// undoable edit.
+    fn format_range(&mut self, ix: usize, range: std::ops::Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.docs[ix].editor.read(cx).value().to_string();
+        let Some(part) = old.get(range.clone()) else { return };
+        let new = format!("{}{}{}", &old[..range.start], format::format_file(part, self.docs[ix].dialect), &old[range.end..]);
+        if new != old {
+            self.replace_text(ix, &old, &new, window, cx);
+            cx.notify();
+        }
+    }
+
     /// Connections were renamed (`renames`: `(old, new)`): every file whose `-- @connection old`
     /// line would now name an unknown connection is rewritten right away (open tabs as an undoable
     /// edit, other listed files on disk), then one notification says how many files were updated
@@ -1302,6 +1326,14 @@ impl Siesta {
             .px_1()
             .pb_1()
             .child(div().id("docs").flex_1().min_w_0().flex().gap_1().overflow_x_scroll().children(tabs))
+            .children(self.doc().filter(|d| d.sql).map(|_| {
+                Button::new("format-file")
+                    .icon(Icon::default().data(include_bytes!("../assets/wand-sparkles.svg")))
+                    .ghost()
+                    .small()
+                    .tooltip("Format the statement or the selection (Shift+Alt+F)")
+                    .on_click(cx.listener(|this, _, window, cx| this.format_current(window, cx)))
+            }))
             .children(self.connection_picker(cx))
             .children(self.database_picker(cx))
             .into_any_element()
@@ -1512,6 +1544,7 @@ impl Render for Siesta {
                     this.rename(path, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &FormatFile, window, cx| this.format_current(window, cx)))
             .on_action(cx.listener(|this, _: &AddFiles, window, cx| this.add_files(window, cx)))
             .on_action(cx.listener(|this, _: &Import, window, cx| this.import(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
@@ -1569,6 +1602,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::action("Find", Search),
+            MenuItem::action("Format", FormatFile),
         ]),
         Menu::new("Run").items([
             MenuItem::action("Run Statement", RunStatement),
@@ -1624,6 +1658,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Next Tab", Box::new(NextTab)),
         ("Save", Box::new(SaveFile)),
         ("Rename File…", Box::new(RenameFile)),
+        ("Format", Box::new(FormatFile)),
         ("Close Tab", Box::new(CloseTab)),
         ("Add Files…", Box::new(AddFiles)),
         ("Import…", Box::new(Import)),

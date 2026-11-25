@@ -56,6 +56,7 @@ Every run is stored: statement, connection, time, duration, rows or error. Never
 | <kbd>⌘</kbd> <kbd>P</kbd> / <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>O</kbd> | Go to file / statement |
 | <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>P</kbd> | Command palette |
 | <kbd>⌥</kbd> <kbd>↑</kbd> / <kbd>⌥</kbd> <kbd>↓</kbd> | Previous / next statement |
+| <kbd>⇧</kbd> <kbd>⌥</kbd> <kbd>F</kbd> | Format the statement under the cursor, or the selection (<kbd>⌘</kbd> <kbd>A</kbd> first for the whole file); also the button next to the connection picker |
 | <kbd>⌘</kbd> <kbd>J</kbd> | Toggle the result panel |
 | <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>F</kbd> | Column filters |
 | <kbd>⌘</kbd> <kbd>[</kbd> / <kbd>⌘</kbd> <kbd>]</kbd> | Previous / next page of results |
